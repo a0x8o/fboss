@@ -1,0 +1,204 @@
+/*
+ *  Copyright (c) 2004-present, Facebook, Inc.
+ *  All rights reserved.
+ *
+ *  This source code is licensed under the BSD-style license found in the
+ *  LICENSE file in the root directory of this source tree. An additional grant
+ *  of patent rights can be found in the PATENTS file in the same directory.
+ *
+ */
+#pragma once
+
+#include "fboss/agent/SwSwitch.h"
+#include "fboss/agent/NeighborCacheImpl-defs.h"
+#include "fboss/agent/NeighborCacheEntry.h"
+
+#include <chrono>
+#include <folly/Memory.h>
+#include <folly/MacAddress.h>
+#include <folly/IPAddress.h>
+#include <folly/io/async/EventBase.h>
+#include <list>
+#include <string>
+
+namespace facebook { namespace fboss {
+
+/*
+ * This class manages the sw state of the neighbor tables. All of the
+ * actual work is done by NeighborCacheImpl. This class is used to
+ * provide the locking for those calls. All calls into the cache should
+ * go through this class and SHOULD NOT call into the NeighborCacheImpl
+ * directly. NeighborCacheImpl assumes that it does not need to worry
+ * about synchronization because of this.
+ *
+ * This class wraps the common logic for a NeighborCache. It is meant to be
+ * extended for ARP/NDP specific caches.
+ */
+template <typename NTable>
+class NeighborCache {
+  friend class NeighborCacheEntry<NTable>;
+ public:
+  typedef typename NTable::Entry::AddressType AddressType;
+
+  virtual ~NeighborCache() {}
+
+  bool flushEntryBlocking (AddressType ip) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    return impl_->flushEntryBlocking(ip);
+  }
+
+  void repopulate(std::shared_ptr<NTable> table) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    impl_->repopulate(table);
+  }
+
+  void setIntfID(const InterfaceID intfID) {
+    impl_->setIntfID(intfID);
+  }
+
+  void setVlanName(const std::string& vlanName) {
+    impl_->setVlanName(vlanName);
+  }
+
+  void portDown(PortID port) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    impl_->portDown(port);
+  }
+
+  template <typename NeighborEntryThrift>
+  std::list<NeighborEntryThrift> getCacheData() {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    return impl_->template getCacheData<NeighborEntryThrift>();
+  }
+
+  void setTimeout(std::chrono::seconds timeout) {
+    timeout_ = timeout;
+  }
+
+  void setMaxNeighborProbes(uint32_t maxNeighborProbes) {
+    maxNeighborProbes_ = maxNeighborProbes;
+  }
+
+  void setStaleEntryInterval(std::chrono::seconds staleEntryInterval) {
+    staleEntryInterval_ = staleEntryInterval;
+  }
+
+  void clearEntries() {
+    impl_->clearEntries();
+  }
+ protected:
+  // protected constructor since this is only meant to be inherited from
+  NeighborCache(SwSwitch* sw,
+                VlanID vlanID,
+                std::string vlanName,
+                InterfaceID intfID,
+                std::chrono::seconds timeout,
+                uint32_t maxNeighborProbes,
+                std::chrono::seconds staleEntryInterval)
+      : sw_(sw),
+        timeout_(timeout),
+        maxNeighborProbes_(maxNeighborProbes),
+        staleEntryInterval_(staleEntryInterval),
+        impl_(folly::make_unique<NeighborCacheImpl<NTable>>(
+            this, sw, vlanID, vlanName, intfID)) {}
+
+  // Methods useful for subclasses
+  void setPendingEntry(AddressType ip) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    impl_->setPendingEntry(ip);
+  }
+
+  void setExistingEntry(AddressType ip,
+                        folly::MacAddress mac,
+                        PortID port,
+                        NeighborEntryState state) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    impl_->setExistingEntry(ip, mac, port, state);
+  }
+
+  void setEntry(AddressType ip,
+                folly::MacAddress mac,
+                PortID port,
+                NeighborEntryState state) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    impl_->setEntry(ip, mac, port, state);
+  }
+
+  void updateEntryState(AddressType ip,
+                         NeighborEntryState state) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    impl_->updateEntryState(ip, state);
+  }
+
+  std::unique_ptr<typename NeighborCacheImpl<NTable>::EntryFields>
+  cloneEntryFields(AddressType ip) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    // this intentionally makes a copy so that callers do not have a
+    // reference to memory that could be deleted.
+    return impl_->cloneEntryFields(ip);
+  }
+
+
+  SwSwitch* getSw() const {
+    return sw_;
+  }
+
+  InterfaceID getIntfID() const {
+    return impl_->getIntfID();
+  }
+
+  VlanID getVlanID() const {
+    return impl_->getVlanID();
+  }
+
+  std::string getVlanName() const {
+    return impl_->getVlanName();
+  }
+
+  std::chrono::seconds getBaseTimeout() const {
+    return timeout_;
+  }
+
+  std::chrono::seconds getStaleEntryInterval() const {
+    return staleEntryInterval_;
+  }
+
+  uint32_t getMaxNeighborProbes() const {
+    return maxNeighborProbes_;
+  }
+
+
+ private:
+  // This should only be called by a NeighborCacheEntry
+  virtual void probeFor(AddressType ip) const {
+    LOG(DFATAL) << " Only derived class probeFor should ever be called";
+  }
+
+  void flushEntry(AddressType ip) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    return impl_->flushEntry(ip);
+  }
+
+  void processEntry(AddressType ip) {
+    std::lock_guard<std::mutex> g(cacheLock_);
+    return impl_->processEntry(ip);
+  }
+
+  // Has the entry corresponding to ip has been hit in hw
+  bool isHit(AddressType ip) {
+    return sw_->getAndClearNeighborHit(RouterID(0), ip);
+  }
+
+  // Forbidden copy constructor and assignment operator
+  NeighborCache(NeighborCache const &) = delete;
+  NeighborCache& operator=(NeighborCache const &) = delete;
+
+  SwSwitch* sw_;
+  std::chrono::seconds timeout_;
+  uint32_t maxNeighborProbes_{0};
+  std::chrono::seconds staleEntryInterval_;
+  std::unique_ptr<NeighborCacheImpl<NTable>> impl_;
+  std::mutex cacheLock_;
+};
+
+}} // facebook::fboss

@@ -15,14 +15,20 @@
 
 #include <folly/MacAddress.h>
 #include <folly/Range.h>
+#include <folly/Optional.h>
+
 #include "fboss/agent/hw/mock/MockHwSwitch.h"
 #include "fboss/agent/FbossError.h"
+#include "fboss/agent/SwSwitch.h"
+#include "fboss/agent/state/RouteNextHopEntry.h"
 
 namespace facebook { namespace fboss {
 
 class MockHwSwitch;
 class MockPlatform;
+class MockTunManager;
 class Platform;
+class RxPacket;
 class SwitchState;
 class SwSwitch;
 class TxPacket;
@@ -62,15 +68,19 @@ std::shared_ptr<SwitchState> publishAndApplyConfigFile(
  * specified initial state.  The returned SwSwitch will have already been
  * initialized.
  */
-std::unique_ptr<SwSwitch> createMockSw(const std::shared_ptr<SwitchState>&);
-std::unique_ptr<SwSwitch> createMockSw(const std::shared_ptr<SwitchState>&,
-                                       const folly::MacAddress&);
+std::unique_ptr<SwSwitch> createMockSw(
+  const std::shared_ptr<SwitchState>& = nullptr,
+  const folly::Optional<folly::MacAddress>& = nullptr,
+  SwitchFlags flags = DEFAULT);
 
-std::unique_ptr<SwSwitch> createMockSw(cfg::SwitchConfig* cfg,
-                                       folly::MacAddress mac,
-                                       uint32_t maxPorts = 0);
-std::unique_ptr<SwSwitch> createMockSw(cfg::SwitchConfig* cfg,
-                                       uint32_t maxPorts = 0);
+std::unique_ptr<SwSwitch> createMockSw(
+    cfg::SwitchConfig* cfg,
+    folly::MacAddress mac,
+    SwitchFlags flags = DEFAULT);
+std::unique_ptr<SwSwitch> createMockSw(
+    cfg::SwitchConfig* cfg,
+    SwitchFlags flags = DEFAULT);
+std::unique_ptr<MockPlatform> createMockPlatform();
 
 /*
  * Get the MockHwSwitch from a SwSwitch.
@@ -131,6 +141,12 @@ void checkField(const ExpectedType& expected, const ActualType& actual,
 std::shared_ptr<SwitchState> testStateA();
 
 /*
+ * The returned configuration object, if applied to a SwitchState with ports
+ * 1-20, will yield the same SwitchState as that returned by testStateA().
+ */
+cfg::SwitchConfig testConfigA();
+
+/*
  * Create a SwitchState for testing.
  *
  * Profile B:
@@ -170,6 +186,31 @@ std::string fbossHexDump(folly::ByteRange buf);
 std::string fbossHexDump(folly::StringPiece buf);
 std::string fbossHexDump(const std::string& buf);
 
+RouteNextHops makeNextHops(std::vector<std::string> ipStrs);
+
+RoutePrefixV4 makePrefixV4(std::string str);
+
+RoutePrefixV6 makePrefixV6(std::string str);
+
+std::shared_ptr<Route<folly::IPAddressV4>>
+GET_ROUTE_V4(const std::shared_ptr<RouteTableMap>& tables,
+             RouterID rid, RoutePrefixV4 prefix);
+
+std::shared_ptr<Route<folly::IPAddressV4>>
+GET_ROUTE_V4(const std::shared_ptr<RouteTableMap>& tables,
+             RouterID rid, std::string prefixStr);
+
+std::shared_ptr<Route<folly::IPAddressV6>>
+GET_ROUTE_V6(const std::shared_ptr<RouteTableMap>& tables,
+             RouterID rid, RoutePrefixV6 prefix);
+
+std::shared_ptr<Route<folly::IPAddressV6>>
+GET_ROUTE_V6(const std::shared_ptr<RouteTableMap>& tables,
+             RouterID rid, std::string prefixStr);
+
+void EXPECT_NO_ROUTE(const std::shared_ptr<RouteTableMap>& tables,
+                     RouterID rid, std::string prefixStr);
+
 /*
  * Convenience macro for expecting a packet to be transmitted by the switch
  *
@@ -192,31 +233,76 @@ std::string fbossHexDump(const std::string& buf);
  */
 #define EXPECT_PKT(sw, name, matchFn) \
   EXPECT_HW_CALL(sw, sendPacketSwitched_( \
-                 TxPacketMatcher::createMatcher(name, matchFn)));
+                 TxPacketMatcher::createMatcher(name, matchFn)))
 
-typedef std::function<void(const TxPacket* pkt)> TxMatchFn;
+/**
+ * Convenience macro for expecting RxPacket to be transmitted by TunManager.
+ * usage:
+ *  EXPECT_TUN_PKT(tunMgr, "Unicast Packet", packetChecker).Times(1)
+ */
+#define EXPECT_TUN_PKT(tun, name, dstIfID, matchFn) \
+  EXPECT_CALL( \
+    *tun, \
+    sendPacketToHost_( \
+      RxPacketMatcher::createMatcher(name, dstIfID, matchFn)))
+
+/**
+ * Templatized version of Matching function for Tx/Rx packet.
+ */
+template <typename T>
+using MatchFn = std::function<void(const T* pkt)>;
+using RxMatchFn = MatchFn<RxPacket>;
+using TxMatchFn = MatchFn<TxPacket>;
 
 /*
  * A gmock MatcherInterface for matching TxPacket objects.
  */
-class TxPacketMatcher :
-  public ::testing::MatcherInterface<std::shared_ptr<TxPacket>> {
+using TxPacketPtr = TxPacket*;
+class TxPacketMatcher
+  : public ::testing::MatcherInterface<TxPacketPtr> {
  public:
   TxPacketMatcher(folly::StringPiece name, TxMatchFn fn);
 
-  static ::testing::Matcher<std::shared_ptr<TxPacket>> createMatcher(
+  static ::testing::Matcher<TxPacket*> createMatcher(
       folly::StringPiece name,
       TxMatchFn&& fn);
 
-  bool MatchAndExplain(std::shared_ptr<TxPacket> pkt,
-                       ::testing::MatchResultListener* l) const override;
+  bool MatchAndExplain(
+      const TxPacketPtr& pkt,
+      ::testing::MatchResultListener* l) const override;
 
   void DescribeTo(std::ostream* os) const override;
   void DescribeNegationTo(std::ostream* os) const override;
 
  private:
-  std::string name_;
-  TxMatchFn fn_;
+  const std::string name_;
+  const TxMatchFn fn_;
+};
+
+/*
+ * A gmock MatcherInterface for matching RxPacket objects.
+ */
+using RxMatchFnArgs = std::tuple<InterfaceID, std::shared_ptr<RxPacket>>;
+class RxPacketMatcher : public ::testing::MatcherInterface<RxMatchFnArgs> {
+ public:
+  RxPacketMatcher(folly::StringPiece name, InterfaceID dstIfID, RxMatchFn fn);
+
+  static ::testing::Matcher<RxMatchFnArgs> createMatcher(
+      folly::StringPiece name,
+      InterfaceID dstIfID,
+      RxMatchFn&& fn);
+
+  bool MatchAndExplain(
+      const RxMatchFnArgs& args,
+      ::testing::MatchResultListener* l) const override;
+
+  void DescribeTo(std::ostream* os) const override;
+  void DescribeNegationTo(std::ostream* os) const override;
+
+ private:
+  const std::string name_;
+  const InterfaceID dstIfID_;
+  const RxMatchFn fn_;
 };
 
 }} // facebook::fboss

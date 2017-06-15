@@ -157,7 +157,7 @@ void NeighborCacheImpl<NTable>::clearEntries() {
    * to destroy themselves.
    */
   std::vector<folly::Future<folly::Unit>> stopTasks;
-  for (auto item : entries_) {
+  for (const auto& item : entries_) {
     auto addr = item.first;
     auto entry = item.second;
     stopTasks.push_back(
@@ -184,10 +184,10 @@ void NeighborCacheImpl<NTable>::repopulate(std::shared_ptr<NTable> table) {
 template <typename NTable>
 void NeighborCacheImpl<NTable>::setEntry(AddressType ip,
                                          folly::MacAddress mac,
-                                         PortID portID,
+                                         PortDescriptor port,
                                          NeighborEntryState state) {
   auto entry = setEntryInternal(
-    EntryFields(ip, mac, portID, intfID_), state);
+    EntryFields(ip, mac, port, intfID_), state);
   if (entry) {
     programEntry(entry);
   }
@@ -196,10 +196,10 @@ void NeighborCacheImpl<NTable>::setEntry(AddressType ip,
 template <typename NTable>
 void NeighborCacheImpl<NTable>::setExistingEntry(AddressType ip,
                                                  folly::MacAddress mac,
-                                                 PortID portID,
+                                                 PortDescriptor port,
                                                  NeighborEntryState state) {
   auto entry = setEntryInternal(
-    EntryFields(ip, mac, portID, intfID_), state, false);
+    EntryFields(ip, mac, port, intfID_), state, false);
   if (entry) {
     // only program an entry if one exists
     programEntry(entry);
@@ -277,7 +277,8 @@ NeighborCacheEntry<NTable>* NeighborCacheImpl<NTable>::getCacheEntry(
 
 template <typename NTable>
 void NeighborCacheImpl<NTable>::setCacheEntry(std::shared_ptr<Entry> entry) {
-  entries_[entry->getIP()] = std::move(entry);
+  const auto& ip = entry->getIP();
+  entries_[ip] = std::move(entry);
 }
 
 template <typename NTable>
@@ -360,7 +361,7 @@ std::unique_ptr<typename NeighborCacheImpl<NTable>::EntryFields>
 NeighborCacheImpl<NTable>::cloneEntryFields(AddressType ip) {
   auto entry = getCacheEntry(ip);
   if (entry) {
-    return folly::make_unique<EntryFields>(entry->getFields());
+    return std::make_unique<EntryFields>(entry->getFields());
   }
   return nullptr;
 }
@@ -368,7 +369,7 @@ NeighborCacheImpl<NTable>::cloneEntryFields(AddressType ip) {
 template <typename NTable>
 void NeighborCacheImpl<NTable>::portDown(PortID port) {
   for (auto item : entries_) {
-    if (item.second->getPortID() != port) {
+    if (item.second->getPort() != port) {
       continue;
     }
 

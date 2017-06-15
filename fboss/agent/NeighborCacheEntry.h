@@ -14,6 +14,7 @@
 #include "fboss/agent/FbossError.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/state/NeighborEntry.h"
+#include "fboss/agent/state/PortDescriptor.h"
 
 #include <chrono>
 #include <folly/MacAddress.h>
@@ -97,7 +98,7 @@ class NeighborCacheEntry : private folly::AsyncTimeout {
 
   NeighborCacheEntry(AddressType ip,
                      folly::MacAddress mac,
-                     PortID port,
+                     PortDescriptor port,
                      InterfaceID intf,
                      folly::EventBase* evb,
                      Cache* cache,
@@ -113,7 +114,7 @@ class NeighborCacheEntry : private folly::AsyncTimeout {
       : NeighborCacheEntry(EntryFields(ip, intf, ignored),
                            evb, cache, NeighborEntryState::INCOMPLETE) {}
 
-  ~NeighborCacheEntry() {}
+  ~NeighborCacheEntry() override {}
 
   /*
    * Main entry point for handling the entries. Since entries may be
@@ -154,7 +155,7 @@ class NeighborCacheEntry : private folly::AsyncTimeout {
     return fields_.ip;
   }
 
-  PortID getPortID() const {
+  PortDescriptor getPort() const {
     return fields_.port;
   }
 
@@ -182,7 +183,7 @@ class NeighborCacheEntry : private folly::AsyncTimeout {
     return getIP() == fields.ip &&
       getMac() == fields.mac &&
       getIntfID() == fields.interfaceID &&
-      getPortID() == fields.port &&
+      getPort() == fields.port &&
       getProgrammedState() == fields.state;
   }
 
@@ -207,7 +208,7 @@ class NeighborCacheEntry : private folly::AsyncTimeout {
   void populateThriftEntry(NeighborEntryThrift& entry) const {
     entry.ip = facebook::network::toBinaryAddress(getIP());
     entry.mac = getMac().toString();
-    entry.port = getPortID();
+    entry.port = getPort().asThriftPort();
     entry.vlanName = cache_->getVlanName();
     entry.vlanID = cache_->getVlanID();
     entry.state = getStateName();
@@ -220,7 +221,7 @@ class NeighborCacheEntry : private folly::AsyncTimeout {
    * responsible for serializing this with other flush or rx events to prevent
    * races.
    */
-  virtual void timeoutExpired() noexcept {
+  void timeoutExpired() noexcept override {
     cache_->processEntry(getIP());
   }
 

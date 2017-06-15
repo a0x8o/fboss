@@ -30,8 +30,18 @@ public:
   class TLHistogram {
   public:
     TLHistogram(ThreadLocalStatsMap*, folly::StringPiece, int, int, int) {}
+    TLHistogram(
+        ThreadLocalStatsMap*, folly::StringPiece, int, int, int,
+        facebook::stats::ExportType, int, int) {}
     void addValue(int64_t) {}
     void addRepeatedValue(int64_t /*value*/, int64_t /*nsamples*/) {}
+  };
+
+  class TLCounter {
+    public:
+      TLCounter(ThreadLocalStatsMap*, folly::StringPiece) {}
+      void incrementValue(int64_t) {}
+
   };
 
   static ThreadCachedServiceData* get() {

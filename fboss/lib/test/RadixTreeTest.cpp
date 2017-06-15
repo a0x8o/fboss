@@ -153,6 +153,7 @@ IPAddressV4 ip48_0_0_0("48.0.0.0");
 IPAddressV4 ip64_0_0_0("64.0.0.0");
 IPAddressV4 ip72_0_0_0("72.0.0.0");
 IPAddressV4 ip80_0_0_0("80.0.0.0");
+IPAddressV4 ip80_0_0_1("80.0.0.1");
 IPAddressV4 ip128_0_0_0("128.0.0.0");
 IPAddressV4 ip160_0_0_0("160.0.0.0");
 
@@ -162,6 +163,7 @@ IPAddressV6 ip6_48("3000::");
 IPAddressV6 ip6_64("4000::");
 IPAddressV6 ip6_72("4800::");
 IPAddressV6 ip6_80("5000::");
+IPAddressV6 ip6_80_1("5000::1");
 IPAddressV6 ip6_128("8000::");
 IPAddressV6 ip6_160("A000::");
 
@@ -576,6 +578,14 @@ TEST(RadixTree, Inserts4) {
   EXPECT_EQ(expectedTrail, trailStr(trail));
   EXPECT_EQ(expectedTrail, trailStr(pathFromRoot(matchItr, true)));
   trail.clear();
+
+  // exact match should succeed, even if IPAddress is not properly masked
+  matchItr = rtree.exactMatchWithTrail(ip80_0_0_1, 4, trail, true);
+  expectedTrail = "0.0.0.0/0(*), 0.0.0.0/1(6), 64.0.0.0/3(4), 80.0.0.0/4(3)";
+  EXPECT_EQ(expectedTrail, trailStr(trail));
+  EXPECT_EQ(expectedTrail, trailStr(pathFromRoot(matchItr, true)));
+  trail.clear();
+
   // clear the tree
   auto sizeBefore = rtree.size();
   rtree.clear();
@@ -929,6 +939,14 @@ TEST(RadixTree, Inserts6) {
   EXPECT_EQ(expectedTrail, trailStr(trail));
   EXPECT_EQ(expectedTrail, trailStr(pathFromRoot(matchItr, true)));
   trail.clear();
+
+  // Exact match should still succeed if IPAddress is not masked correctly
+  matchItr = rtree.exactMatchWithTrail(ip6_80_1, 4, trail, true);
+  expectedTrail = "::/0(*), ::/1(6), 4000::/3(4), 5000::/4(3)";
+  EXPECT_EQ(expectedTrail, trailStr(trail));
+  EXPECT_EQ(expectedTrail, trailStr(pathFromRoot(matchItr, true)));
+  trail.clear();
+
   // clear the tree
   auto sizeBefore = rtree.size();
   rtree.clear();
@@ -1237,8 +1255,8 @@ TEST(RadixTree, MoveConstructible) {
     }
     prefixesSeen.insert(Prefix4(ip, mask));
     ++i;
-    rtree.insert(ip, mask, folly::make_unique<int>(i));
-    ipRtree.insert(IPAddress(ip), mask, folly::make_unique<int>(i));
+    rtree.insert(ip, mask, std::make_unique<int>(i));
+    ipRtree.insert(IPAddress(ip), mask, std::make_unique<int>(i));
     inserted.emplace_back(std::make_pair(ip, mask));
   }
   EXPECT_EQ(kInsertCount, rtree.size());
@@ -1247,9 +1265,9 @@ TEST(RadixTree, MoveConstructible) {
 
   // Set value via iterator
   rtree.exactMatch(inserted[0].first, inserted[0].second)->setValue(
-      folly::make_unique<int>(42));
+      std::make_unique<int>(42));
   ipRtree.exactMatch(IPAddress(inserted[0].first), inserted[0].second)
-    ->setValue(folly::make_unique<int>(42));
+    ->setValue(std::make_unique<int>(42));
 
   auto const kEraseCount = 20;
   // Delete kEraseCount (randomly selected) prefixes

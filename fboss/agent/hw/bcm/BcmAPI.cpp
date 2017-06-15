@@ -13,7 +13,6 @@
 #include "fboss/agent/hw/bcm/BcmUnit.h"
 
 #include <folly/Memory.h>
-#include <folly/ScopeGuard.h>
 #include <folly/String.h>
 #include <folly/io/Cursor.h>
 #include <glog/logging.h>
@@ -21,7 +20,7 @@
 #include <atomic>
 #include <unordered_map>
 
-using folly::make_unique;
+using std::make_unique;
 using folly::StringPiece;
 using std::string;
 

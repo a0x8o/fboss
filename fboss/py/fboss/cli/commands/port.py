@@ -14,14 +14,16 @@ import time
 from fboss.cli.utils import utils
 from fboss.cli.commands import commands as cmds
 from math import log10
-from neteng.fboss.optic import ttypes as optic_ttypes
+from neteng.fboss.transceiver import ttypes as transceiver_ttypes
 from neteng.fboss.ttypes import FbossBaseError
 from thrift.Thrift import TApplicationException
+from thrift.transport.TTransport import TTransportException
+
 
 class PortDetailsCmd(cmds.FbossCmd):
     def run(self, ports):
         try:
-            self._client = self._create_ctrl_client()
+            self._client = self._create_agent_client()
             # No ports specified, get all ports
             if not ports:
                 resp = self._client.getAllPortInfo()
@@ -62,7 +64,7 @@ class PortDetailsCmd(cmds.FbossCmd):
             value /= 1000
 
         assert bps_per_unit is not None and suffix, (
-                'Unable to convert bps to human readable format')
+            'Unable to convert bps to human readable format')
 
         return bps_per_unit, suffix
 
@@ -82,6 +84,13 @@ class PortDetailsCmd(cmds.FbossCmd):
         speed, suffix = self._convert_bps(port_info.speedMbps * (10 ** 6))
         vlans = ' '.join(str(vlan) for vlan in (port_info.vlans or []))
 
+        if not hasattr(port_info, 'fecEnabled'):
+            fec_status = "N/A"  # many ports don't implement FEC
+        elif port_info.fecEnabled:
+            fec_status = "ENABLED"
+        else:
+            fec_status = "DISABLED"
+
         fmt = '{:.<50}{}'
         lines = [
             ('Name', port_info.name.strip()),
@@ -89,7 +98,8 @@ class PortDetailsCmd(cmds.FbossCmd):
             ('Admin State', admin_status),
             ('Link State', oper_status),
             ('Speed', '{:.0f} {}'.format(speed, suffix)),
-            ('VLANs', vlans)
+            ('VLANs', vlans),
+            ('Forward Error Correction', fec_status),
         ]
 
         print()
@@ -108,7 +118,7 @@ class PortFlapCmd(cmds.FbossCmd):
             raise SystemExit('Fboss Error: ' + e)
 
     def flap_ports(self, ports):
-        self._client = self._create_ctrl_client()
+        self._client = self._create_agent_client()
         resp = self._client.getPortStatus(ports)
         for port, status in resp.items():
             if not status.enabled:
@@ -124,44 +134,159 @@ class PortFlapCmd(cmds.FbossCmd):
                 self._client.setPortState(port, True)
 
 
+class PortSetStatusCmd(cmds.FbossCmd):
+    def run(self, ports, status):
+        try:
+            self.set_status(ports, status)
+        except FbossBaseError as e:
+            raise SystemExit('Fboss Error: ' + e)
+
+    def set_status(self, ports, status):
+        self._client = self._create_agent_client()
+        for port in ports:
+            status_str = 'Enabling' if status else 'Disabling'
+            print("{} port {}".format(status_str, port))
+            self._client.setPortState(port, status)
+
+
+class PortStatsCmd(cmds.FbossCmd):
+    def run(self, details, ports):
+        try:
+            self.show_stats(details, ports)
+        except FbossBaseError as e:
+            raise SystemExit('Fboss Error: ' + e)
+
+    def show_stats(self, details, ports):
+        with self._create_agent_client() as client:
+            if not ports:
+                stats = client.getAllPortStats()
+            else:
+                stats = {}
+                for port in ports:
+                    stats[port] = client.getPortStats(port)
+            neighbors = client.getLldpNeighbors()
+        n2ports = {}
+        # collect up the neighbors by port
+        for neighbor in neighbors:
+            n2ports.setdefault(neighbor.localPort, []).append(neighbor)
+        # Port Name
+        field_fmt = '{:<11} {:>3} {:>} {:<} {:>} {:<} {:<}'
+        hosts = "Hosts" if details else ""
+
+        print(field_fmt.format("Port Name", "+Id", "In",
+                               self._get_counter_string(None),
+                               "Out", self._get_counter_string(None), hosts))
+        for port_id, port in stats.items():
+            print(field_fmt.format(port.name, port_id, "In",
+                                   self._get_counter_string(port.input),
+                                   "Out", self._get_counter_string(port.output),
+                                   self._get_lldp_string(port_id, n2ports, details)))
+
+    def _get_counter_string(self, counters):
+        # bytes uPts mPts bPts err disc
+        field_fmt = '{:>15} {:>15} {:>10} {:>10} {:>10} {:>10}'
+        if counters is None:
+            return field_fmt.format("bytes", "uPkts", "mcPkts", "bcPkts",
+                                    "errs", "disc")
+        else:
+            return field_fmt.format(counters.bytes, counters.ucastPkts,
+                                    counters.multicastPkts,
+                                    counters.broadcastPkts,
+                                    counters.errors.errors,
+                                    counters.errors.discards)
+
+    def _get_lldp_string(self, port_id, n2ports, details):
+        ret = ""
+        if details and port_id in n2ports:
+            for n in n2ports[port_id]:
+                ret += " {}".format(n.systemName)
+        return ret
+
+
 class PortStatusCmd(cmds.FbossCmd):
-    def run(self, detail, ports, verbose):
-        self._client = self._create_ctrl_client()
+    def run(self, detail, ports, verbose, internal):
+        self._client = self._create_agent_client()
+        try:
+            self._qsfp_client = self._create_qsfp_client()
+        except TTransportException:
+            self._qsfp_client = None
         if detail or verbose:
             PortStatusDetailCmd(
-                    self._client, ports, verbose).get_detail_status()
+                self._client, ports, self._qsfp_client, verbose
+            ).get_detail_status()
+        elif internal:
+            self.list_ports(ports, internal_port=True)
         else:
             self.list_ports(ports)
 
-    def list_ports(self, ports):
-        try:
-            field_fmt = '{:>10}  {:>12}  {}{:>10}  {:>12}  {:>6}'
+    def _get_field_format(self, internal_port):
+        if internal_port:
+            field_fmt = '{:>6} {:<11} {:>12}  {}{:>10}  {:>12}  {:>6}'
+            print(field_fmt.format('Port ID', 'Port Name', 'Admin State', '',
+                                   'Link State', 'Transceiver', 'Speed'))
+            print('-' * 68)
+        else:
+            field_fmt = '{:<11} {:>12}  {}{:>10}  {:>12}  {:>6}'
             print(field_fmt.format('Port', 'Admin State', '', 'Link State',
                                    'Transceiver', 'Speed'))
             print('-' * 59)
-            resp = self._client.getPortStatus(ports)
-            port_info = self._client.getAllPortInfo()
+        return field_fmt
 
-            for port_data in sorted(port_info.values(), key=utils.port_sort_fn):
-                port = port_data.portId
-                if port not in resp:
-                    continue
-                status = resp[port]
-                attrs = utils.get_status_strs(status)
-                if status.enabled:
-                    name = port_data.name if port_data.name else port
-                    print(field_fmt.format(
-                        name, attrs['admin_status'], attrs['color_align'],
-                        attrs['link_status'], attrs['present'], attrs['speed']))
+    def list_ports(self, ports, internal_port=False):
+        field_fmt = self._get_field_format(internal_port)
+        port_status_map = self._client.getPortStatus(ports)
+        qsfp_info_map = utils.get_qsfp_info_map(
+            self._qsfp_client, None, continue_on_error=True)
+        port_info_map = self._client.getAllPortInfo()
+        missing_port_status = []
+        for port_info in sorted(port_info_map.values(), key=utils.port_sort_fn):
+            port_id = port_info.portId
+            if ports and (port_id not in ports):
+                continue
+            status = port_status_map.get(port_id)
+            if not status:
+                missing_port_status.append(port_id)
+                continue
+            # The transceiver id can be derived from port name
+            # e.g. port name eth1/4/1 -> transceiver_id is 4-1 = 3
+            # (-1 because we start counting transceivers at 0)
+            transceiver_id = utils.port_sort_fn(port_info)[2] - 1
+            qsfp_info = qsfp_info_map.get(transceiver_id)
+            qsfp_present = qsfp_info.present if self._qsfp_client else None
+            attrs = utils.get_status_strs(status, qsfp_present)
+            if internal_port:
+                speed = attrs['speed']
+                if not speed:
+                    speed = '-'
+                print(field_fmt.format(
+                    port_id,
+                    port_info.name,
+                    attrs['admin_status'],
+                    attrs['color_align'],
+                    attrs['link_status'],
+                    attrs['present'],
+                    speed))
+            elif status.enabled:
+                name = port_info.name if port_info.name else port_id
+                print(field_fmt.format(
+                    name,
+                    attrs['admin_status'],
+                    attrs['color_align'],
+                    attrs['link_status'],
+                    attrs['present'],
+                    attrs['speed']))
+        if missing_port_status:
+            print(utils.make_error_string(
+                "Could not get status of ports {}".format(missing_port_status)))
 
-        except KeyError as e:
-            print("Invalid port", e)
+
 
 class PortStatusDetailCmd(object):
     ''' Print detailed/verbose port status '''
 
-    def __init__(self, client, ports, verbose):
+    def __init__(self, client, ports, qsfp_client, verbose):
         self._client = client
+        self._qsfp_client = qsfp_client
         self._ports = ports
         self._port_speeds = self._get_port_speeds()
         self._info_resp = None
@@ -199,7 +324,7 @@ class PortStatusDetailCmd(object):
         channels = status.transceiverIdx.channels
         if not channels:
             channels = self._get_port_channels(
-                        port, status.transceiverIdx)
+                port, status.transceiverIdx)
 
         tid = status.transceiverIdx.transceiverId
         for ch in channels:
@@ -214,112 +339,6 @@ class PortStatusDetailCmd(object):
         else:
             return (10 * log10(mw))
 
-    def _print_port_details_sfpdom(self, port, dom):
-        status = self._status_resp[port]
-        print("Port %d: %s" % (port, dom.name))
-
-        attrs = utils.get_status_strs(status)
-        admin_status = attrs['admin_status']
-        link_status = attrs['link_status']
-
-        print("  Admin Status: %s" % admin_status)
-        print("  Oper Status: %s" % link_status)
-
-        print("  Module Present: %s" % dom.sfpPresent)
-
-        if dom.sfpPresent and dom.vendor is not None:
-            print("  Vendor Name: %s" % dom.vendor.name)
-            print("  Part Number: %s" % dom.vendor.partNumber)
-            print("  Revision: %s" % dom.vendor.rev)
-            print("  Serial Number: %s" % dom.vendor.serialNumber)
-            print("  Date Code: %s" % dom.vendor.dateCode)
-
-        print("  Monitoring Information:")
-        if not dom.domSupported:
-            print("    DOM Not Supported")
-            return
-
-        print("    Values:")
-        print("      {:<15} {:0.4}".format("Temperature", dom.value.temp))
-        print("      {:<15} {:0.4}".format("Vcc", dom.value.vcc))
-        print("      {:<15} {:0.4}".format("Tx Bias", dom.value.txBias))
-        print("      {:<15} {:0.4}".format("Tx Power(dBm)",
-                self._mw_to_dbm(dom.value.txPwr)))
-        print("      {:<15} {:0.4}".format("Rx Power(dBm)",
-                self._mw_to_dbm(dom.value.rxPwr)))
-
-        print("    {:<14}   {:>15} {:>15} {:>15} {:>15}".format(
-                'Flags:',
-                'Alarm Low', 'Warning Low', 'Warning High', 'Alarm High'))
-        print("      {:<14} {:>15} {:>15} {:>15} {:>15}".format(
-                'Temperature:',
-                dom.flags.tempAlarmLow, dom.flags.tempWarnLow,
-                dom.flags.tempWarnHigh, dom.flags.tempAlarmHigh))
-        print("      {:<14} {:>15} {:>15} {:>15} {:>15}".format(
-                'Vcc:',
-                dom.flags.vccAlarmLow, dom.flags.vccWarnLow,
-                dom.flags.vccWarnHigh, dom.flags.vccAlarmHigh))
-        print("      {:<14} {:>15} {:>15} {:>15} {:>15}".format(
-                'Tx Bias:',
-                dom.flags.txBiasAlarmLow, dom.flags.txBiasWarnLow,
-                dom.flags.txBiasWarnHigh, dom.flags.txBiasAlarmHigh))
-        print("      {:<14} {:>15} {:>15} {:>15} {:>15}".format(
-                'Tx Power(dBm):',
-                self._mw_to_dbm(dom.flags.txPwrAlarmLow),
-                self._mw_to_dbm(dom.flags.txPwrWarnLow),
-                self._mw_to_dbm(dom.flags.txPwrWarnHigh),
-                self._mw_to_dbm(dom.flags.txPwrAlarmHigh)))
-        print("      {:<14} {:>15} {:>15} {:>15} {:>15}".format(
-                'Rx Power(dBm):',
-                self._mw_to_dbm(dom.flags.rxPwrAlarmLow),
-                self._mw_to_dbm(dom.flags.rxPwrWarnLow),
-                self._mw_to_dbm(dom.flags.rxPwrWarnHigh),
-                self._mw_to_dbm(dom.flags.rxPwrAlarmHigh)))
-
-        thresh = dom.threshValue
-        print("  {:<16}   {:>15} {:>15} {:>15} {:>15}".format(
-                'Thresholds:',
-                'Alarm Low', 'Warning Low', 'Warning High', 'Alarm High'))
-        print("      {:<14} {:>15.4} {:>15.4} {:>15.4} {:>15.4}".format(
-                'Temperature:',
-                thresh.tempAlarmLow, thresh.tempWarnLow,
-                thresh.tempWarnHigh, thresh.tempAlarmHigh))
-        print("      {:<14} {:>15.4} {:>15.4} {:>15.4} {:>15.4}".format(
-                'Vcc:',
-                thresh.vccAlarmLow, thresh.vccWarnLow,
-                thresh.vccWarnHigh, thresh.vccAlarmHigh))
-        print("      {:<14} {:>15.4} {:>15.4} {:>15.4} {:>15.4}".format(
-                'Tx Bias:',
-                thresh.txBiasAlarmLow, thresh.txBiasWarnLow,
-                thresh.txBiasWarnHigh, thresh.txBiasAlarmHigh))
-        print("      {:<14} {:>15.4} {:>15.4} {:>15.4} {:>15.4}".format(
-                'Tx Power(dBm):',
-                self._mw_to_dbm(thresh.txPwrAlarmLow),
-                self._mw_to_dbm(thresh.txPwrWarnLow),
-                self._mw_to_dbm(thresh.txPwrWarnHigh),
-                self._mw_to_dbm(thresh.txPwrAlarmHigh)))
-        print("      {:<14} {:>15.4} {:>15.4} {:>15.4} {:>15.4}".format(
-                'Rx Power(dBm):',
-                self._mw_to_dbm(thresh.rxPwrAlarmLow),
-                self._mw_to_dbm(thresh.rxPwrWarnLow),
-                self._mw_to_dbm(thresh.rxPwrWarnHigh),
-                self._mw_to_dbm(thresh.rxPwrAlarmHigh)))
-
-    def _list_ports_detail_sfpdom(self):
-        ''' Print ports detail based on Sfp DOM info '''
-
-        dom_resp = self._client.getSfpDomInfo(self._ports)
-        for port in self._status_resp.keys():
-            if port not in dom_resp:
-                sfp_dom = optic_ttypes.SfpDom()
-                sfp_dom.name = 'Ethernet%d' % port
-                sfp_dom.sfpPresent = False
-                sfp_dom.domSupported = False
-                dom_resp[port] = sfp_dom
-
-        for port in self._status_resp.keys():
-            self._print_port_details_sfpdom(port, dom_resp[port])
-
     def _get_dummy_status(self):
         ''' Get dummy status for ports without data '''
 
@@ -327,18 +346,20 @@ class PortStatusDetailCmd(object):
             if status.transceiverIdx:
                 tid = status.transceiverIdx.transceiverId
                 if tid not in self._info_resp.keys():
-                    info = optic_ttypes.TransceiverInfo()
+                    info = transceiver_ttypes.TransceiverInfo()
                     info.port = port
                     info.present = False
                     self._info_resp[port] = info
 
-    def _print_transceiver_ports(self, ch_to_port, info):
+    def _print_transceiver_ports(self, ports, info):
         # Print port info if the transceiver doesn't have any
-        for port in ch_to_port.values():
-            attrs = utils.get_status_strs(self._status_resp[port])
-            print("Port: {:>2}  Status: {:<8}  Link: {:<4}  Transceiver: {}"
-              .format(port, attrs['admin_status'], attrs['link_status'],
-                        attrs['present']))
+        present = info.present if info else None
+
+        for port in ports:
+            attrs = utils.get_status_strs(self._status_resp[port], present)
+            print("Port: {:>2}  Status: {:<8}  Link: {:<4}  Transceiver: {}".
+                    format(port, attrs['admin_status'], attrs['link_status'],
+                            attrs['present']))
 
     def _print_vendor_details(self, info):
         ''' print vendor details '''
@@ -352,19 +373,21 @@ class PortStatusDetailCmd(object):
     def _print_settings_details(self, info):
         ''' print setting details'''
         print("CDR Tx: {}\tCDR Rx: {}".format(
-            optic_ttypes.FeatureState._VALUES_TO_NAMES[info.settings.cdrTx],
-            optic_ttypes.FeatureState._VALUES_TO_NAMES[info.settings.cdrRx]))
+            transceiver_ttypes.FeatureState._VALUES_TO_NAMES[
+                info.settings.cdrTx],
+            transceiver_ttypes.FeatureState._VALUES_TO_NAMES[
+                info.settings.cdrRx]))
         print("Rate select: {}".format(
-              optic_ttypes.RateSelectState._VALUES_TO_NAMES[
+              transceiver_ttypes.RateSelectState._VALUES_TO_NAMES[
                   info.settings.rateSelect]))
         print("\tOptimised for: {}".format(
-              optic_ttypes.RateSelectSetting._VALUES_TO_NAMES[
+              transceiver_ttypes.RateSelectSetting._VALUES_TO_NAMES[
                   info.settings.rateSelectSetting]))
         print("Power measurement: {}".format(
-            optic_ttypes.FeatureState._VALUES_TO_NAMES[
+            transceiver_ttypes.FeatureState._VALUES_TO_NAMES[
                 info.settings.powerMeasurement]))
         print("Power control: {}".format(
-            optic_ttypes.PowerControlState._VALUES_TO_NAMES[
+            transceiver_ttypes.PowerControlState._VALUES_TO_NAMES[
                 info.settings.powerControl]))
 
     def _print_cable_details(self, info):
@@ -391,33 +414,45 @@ class PortStatusDetailCmd(object):
         ''' print threshold details '''
 
         print("  {:<16}   {:>10} {:>15} {:>15} {:>10}".format(
-                'Thresholds:',
-                'Alarm Low', 'Warning Low', 'Warning High', 'Alarm High'))
+            'Thresholds:', 'Alarm Low', 'Warning Low', 'Warning High',
+            'Alarm High'))
         print("    {:<14} {:>9.4}C {:>14.4}C {:>14.4}C {:>9.4}C".format(
-                'Temp:',
-                thresh.temp.alarm.low, thresh.temp.warn.low,
-                thresh.temp.warn.high, thresh.temp.alarm.high))
+            'Temp:',
+            thresh.temp.alarm.low, thresh.temp.warn.low,
+            thresh.temp.warn.high, thresh.temp.alarm.high))
         print("    {:<14} {:>10.4} {:>15.4} {:>15.4} {:>10.4}".format(
-                'Vcc:',
-                thresh.vcc.alarm.low, thresh.vcc.warn.low,
-                thresh.vcc.warn.high, thresh.vcc.alarm.high))
+            'Vcc:',
+            thresh.vcc.alarm.low, thresh.vcc.warn.low,
+            thresh.vcc.warn.high, thresh.vcc.alarm.high))
         print("    {:<14} {:>10.4} {:>15.4} {:>15.4} {:>10.4}".format(
-                'Tx Bias:',
-                thresh.txBias.alarm.low, thresh.txBias.warn.low,
-                thresh.txBias.warn.high, thresh.txBias.alarm.high))
+            'Tx Bias:',
+            thresh.txBias.alarm.low, thresh.txBias.warn.low,
+            thresh.txBias.warn.high, thresh.txBias.alarm.high))
         if thresh.txPwr:
             print("    {:<14} {:>10.4} {:>15.4} {:>15.4} {:>10.4}".format(
-                    'Tx Power(dBm):',
-                    self._mw_to_dbm(thresh.txPwr.alarm.low),
-                    self._mw_to_dbm(thresh.txPwr.warn.low),
-                    self._mw_to_dbm(thresh.txPwr.warn.high),
-                    self._mw_to_dbm(thresh.txPwr.alarm.high)))
+                'Tx Power(dBm):',
+                self._mw_to_dbm(thresh.txPwr.alarm.low),
+                self._mw_to_dbm(thresh.txPwr.warn.low),
+                self._mw_to_dbm(thresh.txPwr.warn.high),
+                self._mw_to_dbm(thresh.txPwr.alarm.high)))
+            print("    {:<14} {:>10.4} {:>15.4} {:>15.4} {:>10.4}".format(
+                'Tx Power(mW):',
+                thresh.txPwr.alarm.low,
+                thresh.txPwr.warn.low,
+                thresh.txPwr.warn.high,
+                thresh.txPwr.alarm.high))
         print("    {:<14} {:>10.4} {:>15.4} {:>15.4} {:>10.4}".format(
-                'Rx Power(dBm):',
-                self._mw_to_dbm(thresh.rxPwr.alarm.low),
-                self._mw_to_dbm(thresh.rxPwr.warn.low),
-                self._mw_to_dbm(thresh.rxPwr.warn.high),
-                self._mw_to_dbm(thresh.rxPwr.alarm.high)))
+            'Rx Power(dBm):',
+            self._mw_to_dbm(thresh.rxPwr.alarm.low),
+            self._mw_to_dbm(thresh.rxPwr.warn.low),
+            self._mw_to_dbm(thresh.rxPwr.warn.high),
+            self._mw_to_dbm(thresh.rxPwr.alarm.high)))
+        print("    {:<14} {:>10.4} {:>15.4} {:>15.4} {:>10.4}".format(
+            'Rx Power(mW):',
+            thresh.rxPwr.alarm.low,
+            thresh.rxPwr.warn.low,
+            thresh.rxPwr.warn.high,
+            thresh.rxPwr.alarm.high))
 
     def _print_sensor_flags(self, sensor):
         ''' print details about sensor flags '''
@@ -448,45 +483,58 @@ class PortStatusDetailCmd(object):
         if channel.sensors.txPwr:
             print("  {:<15} {:0.4}  ".format("Tx Power(dBm)",
                   self._mw_to_dbm(channel.sensors.txPwr.value)), end="")
+            print("  {:<15} {:0.4}  ".format("Tx Power(mW)",
+                  channel.sensors.txPwr.value), end="")
         print("  {:<15} {:0.4}  ".format("Rx Power(dBm)",
               self._mw_to_dbm(channel.sensors.rxPwr.value)))
+        print("  {:<15} {:0.4}  ".format("Rx Power(mW)",
+              channel.sensors.rxPwr.value))
 
         if not self._verbose:
             return
 
         print("  {:<14}   {:>10} {:>15} {:>15} {:>10}".format(
-                'Flags:',
-                'Alarm Low', 'Warning Low', 'Warning High', 'Alarm High'))
+            'Flags:', 'Alarm Low', 'Warning Low', 'Warning High', 'Alarm High'))
 
         print("    {:<14} {:>10} {:>15} {:>15} {:>10}".format(
-                'Tx Bias(mA):',
-                channel.sensors.txBias.flags.alarm.low,
-                channel.sensors.txBias.flags.warn.low,
-                channel.sensors.txBias.flags.warn.high,
-                channel.sensors.txBias.flags.alarm.high))
+            'Tx Bias(mA):',
+            channel.sensors.txBias.flags.alarm.low,
+            channel.sensors.txBias.flags.warn.low,
+            channel.sensors.txBias.flags.warn.high,
+            channel.sensors.txBias.flags.alarm.high))
 
         if channel.sensors.txPwr:
             print("    {:<14} {:>10} {:>15} {:>15} {:>10}".format(
-                    'Tx Power(dBm):',
-                    self._mw_to_dbm(channel.sensors.txPwr.flags.alarm.low),
-                    self._mw_to_dbm(channel.sensors.txPwr.flags.warn.low),
-                    self._mw_to_dbm(channel.sensors.txPwr.flags.warn.high),
-                    self._mw_to_dbm(channel.sensors.txPwr.flags.alarm.high)))
-
+                'Tx Power(dBm):',
+                self._mw_to_dbm(channel.sensors.txPwr.flags.alarm.low),
+                self._mw_to_dbm(channel.sensors.txPwr.flags.warn.low),
+                self._mw_to_dbm(channel.sensors.txPwr.flags.warn.high),
+                self._mw_to_dbm(channel.sensors.txPwr.flags.alarm.high)))
+            print("    {:<14} {:>10} {:>15} {:>15} {:>10}".format(
+                'Tx Power(mW):',
+                channel.sensors.txPwr.flags.alarm.low,
+                channel.sensors.txPwr.flags.warn.low,
+                channel.sensors.txPwr.flags.warn.high,
+                channel.sensors.txPwr.flags.alarm.high))
         print("    {:<14} {:>10} {:>15} {:>15} {:>10}".format(
-                'Rx Power(dBm):',
-                self._mw_to_dbm(channel.sensors.rxPwr.flags.alarm.low),
-                self._mw_to_dbm(channel.sensors.rxPwr.flags.warn.low),
-                self._mw_to_dbm(channel.sensors.rxPwr.flags.warn.high),
-                self._mw_to_dbm(channel.sensors.rxPwr.flags.alarm.high)))
+            'Rx Power(dBm):',
+            self._mw_to_dbm(channel.sensors.rxPwr.flags.alarm.low),
+            self._mw_to_dbm(channel.sensors.rxPwr.flags.warn.low),
+            self._mw_to_dbm(channel.sensors.rxPwr.flags.warn.high),
+            self._mw_to_dbm(channel.sensors.rxPwr.flags.alarm.high)))
+        print("    {:<14} {:>10} {:>15} {:>15} {:>10}".format(
+            'Rx Power(mW):',
+            channel.sensors.rxPwr.flags.alarm.low,
+            channel.sensors.rxPwr.flags.warn.low,
+            channel.sensors.rxPwr.flags.warn.high,
+            channel.sensors.rxPwr.flags.alarm.high))
 
-    def _print_transceiver_details(self, tid):
+    def _print_transceiver_details(self, tid):  # noqa
         ''' Print details about transceiver '''
-
         info = self._info_resp[tid]
         ch_to_port = self._t_to_p[tid]
         if info.present is False:
-            self._print_transceiver_ports(ch_to_port, info)
+            self._print_transceiver_ports(ch_to_port.values(), info)
             return
 
         print("Transceiver:  {:>2}".format(info.port))
@@ -516,7 +564,7 @@ class PortStatusDetailCmd(object):
         for channel in info.channels:
             port = ch_to_port.get(channel.channel, None)
             if port:
-                attrs = utils.get_status_strs(self._status_resp[port])
+                attrs = utils.get_status_strs(self._status_resp[port], None)
                 print("  Channel: {}  Port: {:>2}  Status: {:<8}  Link: {:<4}"
                         .format(channel.channel, port, attrs['admin_status'],
                                 attrs['link_status']))
@@ -533,10 +581,14 @@ class PortStatusDetailCmd(object):
 
         # If we didn't print any channel info, print something useful
         if not info.channels:
-            self._print_transceiver_ports(ch_to_port, info)
+            self._print_transceiver_ports(ch_to_port.values(), info)
 
     def _print_port_detail(self):
         ''' print port details '''
+
+        if not self._qsfp_client:
+            self._print_transceiver_ports(self._status_resp.keys(), None)
+            return
 
         # If a port does not have a mapping to a transceiver, we should
         # still print it, lest we skip ports in the detail display.
@@ -548,7 +600,8 @@ class PortStatusDetailCmd(object):
                     self._print_transceiver_details(tid)
                 transceiver_printed.append(tid)
             else:
-                attrs = utils.get_status_strs(self._status_resp[port])
+                attrs = utils.get_status_strs(self._status_resp[port],
+                            self._info_resp[status.transceiverIdx].present)
                 print("Port: {:>2}  Status: {:<8}  Link: {:<4}  Transceiver: {}"
                       .format(port, attrs['admin_status'], attrs['link_status'],
                                 attrs['present']))
@@ -561,14 +614,16 @@ class PortStatusDetailCmd(object):
                 self._get_channel_detail(port, status)
 
         if not self._transceiver:
-            self._list_ports_detail_sfpdom()
             return
 
-        try:
-            self._info_resp = self._client.getTransceiverInfo(self._transceiver)
-        except TApplicationException:
-            self._list_ports_detail_sfpdom()
-            return
+        if not self._qsfp_client:
+            self._info_resp = {}
+        else:
+            try:
+                self._info_resp = \
+                    self._qsfp_client.getTransceiverInfo(self._transceiver)
+            except TApplicationException:
+                return
 
         self._get_dummy_status()
         self._print_port_detail()

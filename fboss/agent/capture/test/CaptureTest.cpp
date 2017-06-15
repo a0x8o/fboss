@@ -7,7 +7,7 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/ApplyThriftConfig.h"
 #include "fboss/agent/SwSwitch.h"
 #include "fboss/agent/capture/PktCapture.h"
@@ -21,10 +21,9 @@
 
 #include <folly/Memory.h>
 #include <gtest/gtest.h>
-#include <stdlib.h>
 
 using namespace facebook::fboss;
-using folly::make_unique;
+using std::make_unique;
 using folly::StringPiece;
 using std::make_shared;
 using std::shared_ptr;
@@ -90,8 +89,17 @@ TEST(CaptureTest, FullCapture) {
 
   // Start a packet capture
   auto* mgr = sw->getCaptureMgr();
-  auto capture = make_unique<PktCapture>("test", 100);
+  auto capture = make_unique<PktCapture>(
+      "test", 100, CaptureDirection::CAPTURE_TX_RX);
+  auto rx_capture = make_unique<PktCapture>(
+      "rx", 100, CaptureDirection::CAPTURE_ONLY_RX);
+  auto tx_capture = make_unique<PktCapture>(
+      "tx", 100, CaptureDirection::CAPTURE_ONLY_TX);
+
+  // start captures
   mgr->startCapture(std::move(capture));
+  mgr->startCapture(std::move(rx_capture));
+  mgr->startCapture(std::move(tx_capture));
 
   // Create an IP packet for 10.0.0.10
   auto ipPktData = PktUtil::parseHexData(
@@ -197,41 +205,57 @@ TEST(CaptureTest, FullCapture) {
   // This should trigger the switch to send an ARP request
   // and set a pending entry.
   EXPECT_HW_CALL(sw, sendPacketSwitched_(_)).Times(1);
-  EXPECT_HW_CALL(sw, stateChanged(_)).Times(1);
+  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(1);
   sw->packetReceived(ipPkt.clone());
   waitForStateUpdates(sw.get());
 
   // Receive an ARP reply for the desired IP. This should cause the
   // arp entry to change from pending to active
-  EXPECT_HW_CALL(sw, stateChanged(_)).Times(1);
+  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(1);
   sw->packetReceived(arpPkt.clone());
   waitForStateUpdates(sw.get());
 
   // Re-send the original packet now that the ARP table is populated.
   sw->packetReceived(ipPkt.clone());
 
-  // Stop the packet capture
+  // Stop the packet captures
   mgr->stopCapture("test");
+  mgr->stopCapture("rx");
+  mgr->stopCapture("tx");
 
   // Check the packet capture contents
   string captureDir = sw->getCaptureMgr()->getCaptureDir();
   string pcapPath = folly::to<string>(captureDir, "/test.pcap");
+  string rxPcapPath = folly::to<string>(captureDir, "/rx.pcap");
+  string txPcapPath = folly::to<string>(captureDir, "/tx.pcap");
   auto pcapPkts = readPcapFile(pcapPath.c_str());
+  auto rxPcapPkts = readPcapFile(rxPcapPath.c_str());
+  auto txPcapPkts = readPcapFile(txPcapPath.c_str());
 
-  // The capture should contain 4 packets
+  // The capture should contain 4 packets, 3 Rx, 1 Tx
   EXPECT_EQ(4, pcapPkts.size());
+  EXPECT_EQ(3, rxPcapPkts.size());
+  EXPECT_EQ(1, txPcapPkts.size());
 
-  // The first packet should be the initial IP packet
+  // The first packet should be the initial IP packet.
+  // Also the 1st Rx.
   EXPECT_BUF_EQ(ipPktData, pcapPkts.at(0).data);
+  EXPECT_BUF_EQ(ipPktData, rxPcapPkts.at(0).data);
 
-  // The second packet should be an ARP request from the switch
+  // The second packet should be an ARP request from the switch.
+  // Also the 1st Tx.
   EXPECT_BUF_EQ(arpReqData, pcapPkts.at(1).data);
+  EXPECT_BUF_EQ(arpReqData, txPcapPkts.at(0).data);
 
-  // The third packet should be the ARP reply
+  // The third packet should be the ARP reply.
+  // Also the 2nd Rx.
   EXPECT_BUF_EQ(arpPktData, pcapPkts.at(2).data);
+  EXPECT_BUF_EQ(arpPktData, rxPcapPkts.at(1).data);
 
-  // The fourth packet should be the re-sent IP packet
+  // The fourth packet should be the re-sent IP packet.
+  // Also the 3rd Rx.
   EXPECT_BUF_EQ(ipPktData, pcapPkts.at(3).data);
+  EXPECT_BUF_EQ(ipPktData, rxPcapPkts.at(2).data);
 
   // Ideally the fifth packet should be the forwarded IP packet,
   // with an updated destination MAC, source MAC, and TTL.

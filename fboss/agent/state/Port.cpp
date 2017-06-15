@@ -8,6 +8,7 @@
  *
  */
 #include "fboss/agent/state/Port.h"
+#include "fboss/agent/state/StateUtils.h"
 #include "fboss/agent/state/SwitchState.h"
 #include <folly/Conv.h>
 
@@ -21,6 +22,7 @@ constexpr auto kPortId = "portId";
 constexpr auto kPortName = "portName";
 constexpr auto kPortDescription = "portDescription";
 constexpr auto kPortState = "portState";
+constexpr auto kPortOperState = "portOperState";
 constexpr auto kIngressVlan = "ingressVlan";
 constexpr auto kPortSpeed = "portSpeed";
 constexpr auto kPortMaxSpeed = "portMaxSpeed";
@@ -51,12 +53,14 @@ folly::dynamic PortFields::toFollyDynamic() const {
   auto itr_state  = cfg::_PortState_VALUES_TO_NAMES.find(state);
   CHECK(itr_state != cfg::_PortState_VALUES_TO_NAMES.end());
   port[kPortState] = itr_state->second;
+  port[kPortOperState] = operState;
   port[kIngressVlan] = static_cast<uint16_t>(ingressVlan);
   auto itr_speed  = cfg::_PortSpeed_VALUES_TO_NAMES.find(speed);
   CHECK(itr_speed != cfg::_PortSpeed_VALUES_TO_NAMES.end());
   port[kPortSpeed] = itr_speed->second;
   auto itr_max_speed  = cfg::_PortSpeed_VALUES_TO_NAMES.find(maxSpeed);
-  CHECK(itr_max_speed != cfg::_PortSpeed_VALUES_TO_NAMES.end());
+  CHECK(itr_max_speed != cfg::_PortSpeed_VALUES_TO_NAMES.end())
+     << "Unexpected max speed: " << static_cast<int>(maxSpeed);
   port[kPortMaxSpeed] = itr_max_speed->second;
   port[kVlanMemberships] = folly::dynamic::object;
   for (const auto& vlan: vlans) {
@@ -71,16 +75,17 @@ PortFields PortFields::fromFollyDynamic(const folly::dynamic& portJson) {
       portJson[kPortName].asString());
   port.description = portJson[kPortDescription].asString();
   auto itr_state  = cfg::_PortState_NAMES_TO_VALUES.find(
-      portJson[kPortState].asString().c_str());
+      util::getCpp2EnumName(portJson[kPortState].asString()).c_str());
   CHECK(itr_state != cfg::_PortState_NAMES_TO_VALUES.end());
   port.state = cfg::PortState(itr_state->second);
+  port.operState = portJson.getDefault(kPortOperState, false).asBool();
   port.ingressVlan = VlanID(portJson[kIngressVlan].asInt());
   auto itr_speed  = cfg::_PortSpeed_NAMES_TO_VALUES.find(
-      portJson[kPortSpeed].asString().c_str());
+      util::getCpp2EnumName(portJson[kPortSpeed].asString()).c_str());
   CHECK(itr_speed != cfg::_PortSpeed_NAMES_TO_VALUES.end());
   port.speed = cfg::PortSpeed(itr_speed->second);
   auto itr_max_speed  = cfg::_PortSpeed_NAMES_TO_VALUES.find(
-      portJson[kPortMaxSpeed].asString().c_str());
+      util::getCpp2EnumName(portJson[kPortMaxSpeed].asString()).c_str());
   CHECK(itr_max_speed != cfg::_PortSpeed_NAMES_TO_VALUES.end());
   port.maxSpeed = cfg::PortSpeed(itr_max_speed->second);
   for (const auto& vlanInfo: portJson[kVlanMemberships].items()) {
@@ -94,9 +99,12 @@ Port::Port(PortID id, const std::string& name)
   : NodeBaseT(id, name) {
 }
 
-void Port::initDefaultConfig(cfg::Port* config) const {
+void Port::initDefaultConfigState(cfg::Port* config) const {
+  // Copy over port identifiers and reset to (default)
+  // admin disabled state.
   config->logicalID = getID();
-  config->state = cfg::PortState::DOWN;
+  config->name = getName();
+  config->state = cfg::PortState::POWER_DOWN;
 }
 
 Port* Port::modify(std::shared_ptr<SwitchState>* state) {

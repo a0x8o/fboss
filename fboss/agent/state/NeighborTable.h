@@ -10,10 +10,11 @@
 #pragma once
 
 #include <folly/MacAddress.h>
-#include "fboss/agent/state/NeighborEntry.h"
-#include "fboss/agent/state/NodeMap.h"
 #include <folly/dynamic.h>
 #include <folly/json.h>
+#include "fboss/agent/state/NeighborEntry.h"
+#include "fboss/agent/state/NodeMap.h"
+#include "fboss/agent/state/PortDescriptor.h"
 
 namespace {
 constexpr auto kNPending = "numPendingEntries";
@@ -54,7 +55,7 @@ class NeighborTable
 
   NeighborTable();
 
-  std::shared_ptr<Entry> getEntry(AddressType ip) const {
+  const std::shared_ptr<Entry>& getEntry(AddressType ip) const {
     return this->getNode(ip);
   }
   std::shared_ptr<Entry> getEntryIf(AddressType ip) const {
@@ -63,17 +64,27 @@ class NeighborTable
 
   SUBCLASS* modify(Vlan** vlan, std::shared_ptr<SwitchState>* state);
 
-  void addEntry(AddressType ip,
-                folly::MacAddress mac,
-                PortID port,
-                InterfaceID intfID,
-                NeighborState state = NeighborState::REACHABLE);
+  /**
+   * Return a modifiable version of current table. If the table is cloned, all
+   * nodes to the root are cloned, and cloned state is put in the output
+   * parameter.
+   */
+  SUBCLASS* modify(VlanID vlanId, std::shared_ptr<SwitchState>* state);
+
+  void addEntry(
+      AddressType ip,
+      folly::MacAddress mac,
+      PortDescriptor port,
+      InterfaceID intfID,
+      NeighborState state = NeighborState::REACHABLE);
   void addEntry(const NeighborEntryFields<AddressType>& fields);
-  void updateEntry(AddressType ip,
-                   folly::MacAddress mac,
-                   PortID port,
-                   InterfaceID intfID);
+  void updateEntry(
+      AddressType ip,
+      folly::MacAddress mac,
+      PortDescriptor port,
+      InterfaceID intfID);
   void updateEntry(const NeighborEntryFields<AddressType>& fields);
+  void updateEntry(AddressType ip, std::shared_ptr<ENTRY>);
   void addPendingEntry(AddressType ip,
                        InterfaceID intfID);
 

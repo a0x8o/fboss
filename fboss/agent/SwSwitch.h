@@ -11,11 +11,11 @@
 
 #include "fboss/agent/HighresCounterUtil.h"
 #include "fboss/agent/HwSwitch.h"
+#include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 #include "fboss/agent/state/StateUpdate.h"
 #include "fboss/agent/types.h"
-#include "fboss/agent/Transceiver.h"
-#include "fboss/agent/TransceiverMap.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/ThreadHeartbeat.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/Utils.h"
 
 #include <folly/SpinLock.h>
@@ -42,10 +42,6 @@ class PortStats;
 class RxPacket;
 class SwitchState;
 class SwitchStats;
-class SfpModule;
-class QsfpModule;
-class TransceiverMap;
-class TransceiverImpl;
 class StateDelta;
 class NeighborUpdater;
 class RouteUpdateLogger;
@@ -107,6 +103,10 @@ class SwSwitch : public HwSwitch::Callback {
   const Platform* getPlatform() const { return platform_.get(); }
   Platform* getPlatform() { return platform_.get(); }
 
+  TunManager* getTunManager() {
+    return tunMgr_.get();
+  }
+
   /**
    * Return the vlan where the CPU sits
    *
@@ -119,6 +119,7 @@ class SwSwitch : public HwSwitch::Callback {
   VlanID getCPUVlan() const {
     return VlanID(4095);
   }
+
   /*
    * Initialize the switch.
    *
@@ -128,16 +129,24 @@ class SwSwitch : public HwSwitch::Callback {
    * Note that this function is generally slow, and may take many seconds to
    * complete.
    *
-   * The function takes a SwitchFlags parameter, which has the following flags
-   * defined:
+   * Param TunManager can be passed to init method. It allows
+   * using any custom TunManager instead of default (useful in testing). This
+   * will be used only when ENABLE_TUN is present in flags param. Pass nullptr
+   * if you don't want custom behaviour for TunManager (default one will be
+   * created).
+   *
+   * Param optional SwitchFlags has has the following flags defined:
    *
    * ENABLE_TUN: enables interface sync to system.
    * ENABLE_LLDP: enables periodically sending LLDP packets
    * PUBLISH_STATS: if set, we will publish the boot type (graceful or
    *                   otherwise) after we initialize the hardware.
    * DEFAULT: None of the above flags are set.
+   *
    */
-  void init(SwitchFlags flags = SwitchFlags::DEFAULT);
+  void init(
+      std::unique_ptr<TunManager> tunMgr,
+      SwitchFlags flags = SwitchFlags::DEFAULT);
 
   bool isFullyInitialized() const;
 
@@ -154,6 +163,10 @@ class SwSwitch : public HwSwitch::Callback {
   /*
    * Get a pointer to the current switch state.
    *
+   * There are actually two states, applied and desired. By default, desired
+   * state is the one that clients should consider (and we return that), since
+   * sooner or later, that is what will become the actual applied state too.
+   *
    * This returns a pointer to the current state.  However, note that the state
    * may be modified by another thread immediately after getState() returns,
    * in which case the caller may now have an out-of-date copy of the state.
@@ -161,17 +174,19 @@ class SwSwitch : public HwSwitch::Callback {
    * semantics of SwitchState.
    */
   std::shared_ptr<SwitchState> getState() const {
-    folly::SpinLockGuard guard(stateLock_);
-    return stateDontUseDirectly_;
+    return getDesiredState();
   }
-
   /**
    * Schedule an update to the switch state.
+   *
+   *  @param  update
+   *          The update to be enqueued
    *
    * This schedules the specified StateUpdate to be invoked in the update
    * thread in order to update the SwitchState.
    */
-  void updateState(std::unique_ptr<StateUpdate> update);
+  void updateState(
+      std::unique_ptr<StateUpdate> update);
 
   /**
    * Schedule an update to the switch state.
@@ -184,7 +199,7 @@ class SwSwitch : public HwSwitch::Callback {
    * object to modify.  It should return a new SwitchState object, or null if
    * it decides that no update needs to be performed.
    *
-   * Note that the update function will not be called immediately--it wil be
+   * Note that the update function will not be called immediately--it will be
    * invoked later from the update thread.  Therefore if you supply a lambda
    * with bound arguments, make sure that any bound arguments will still be
    * valid later when the function is invoked.  (e.g., Don't capture local
@@ -198,7 +213,9 @@ class SwSwitch : public HwSwitch::Callback {
    * subscribers.  Therefore the StateUpdateFn may be called with an
    * unpublished SwitchState in some cases.
    */
-  void updateState(folly::StringPiece name, StateUpdateFn fn);
+  void updateState(
+      folly::StringPiece name,
+      StateUpdateFn fn);
 
   /**
    * Schedule an update to the switch state.
@@ -257,7 +274,7 @@ class SwSwitch : public HwSwitch::Callback {
    * which counters are even valid) is hardware-specific.
    */
   int getHighresSamplers(HighresSamplerList* samplers,
-                         const std::set<std::string>& counters);
+                         const std::set<CounterRequest>& counters);
 
   /*
    * Registers an observer of all state updates. An observer will be notified of
@@ -345,56 +362,9 @@ class SwSwitch : public HwSwitch::Callback {
   PortStatus getPortStatus(PortID port);
 
   /*
-   * Get the Sfp for the specified port.
-   */
-  SfpModule* getSfp(PortID port) const;
-
-  /*
-   * Get SfpDoms for all the ports.
-   */
-  std::map<int32_t, SfpDom> getSfpDoms() const;
-
-  /*
    * Get Product Information.
    */
   void getProductInfo(ProductInfo& productInfo) const;
-
-  /*
-   * Get SfpDom of the specified port.
-   */
-  SfpDom getSfpDom(PortID port) const;
-
-  /*
-   * Get the transceiver info for the specified module ID.
-   */
-  TransceiverIdx getTransceiverMapping(PortID port) const;
-  Transceiver* getTransceiver(TransceiverID idx) const;
-
-  /*
-   * Get a list of transceivers.
-   */
-  std::map<TransceiverID, TransceiverInfo> getTransceiversInfo() const;
-
-  /*
-   * Get TransceiverInfo of the specified port.
-   */
-  TransceiverInfo getTransceiverInfo(TransceiverID idx) const;
-
-  /*
-   * Create Transceiver mapping to a TransceiverID
-   */
-  void addTransceiver(TransceiverID, std::unique_ptr<Transceiver> trans);
-  void addTransceiverMapping(PortID portID, ChannelID channelID,
-                             TransceiverID module);
-  /*
-   * Check all possible transceiver modules for presence
-   */
-  void detectTransceiver();
-
-  /*
-   * This function is update the transceiver information cache values
-   */
-  void updateTransceiverInfoFields();
 
   /*
    * Get the PortStats for the ingress port of this packet.
@@ -456,6 +426,9 @@ class SwSwitch : public HwSwitch::Callback {
   void sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
                            PortID portID) noexcept;
 
+  void sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
+                           AggregatePortID aggPortID) noexcept;
+
   /*
    * Send a packet, using switching logic to send it out the correct port(s)
    * for the specified VLAN and destination MAC.
@@ -475,11 +448,16 @@ class SwSwitch : public HwSwitch::Callback {
    * If any of the above reuqirements is not met, the packet will be dropped.
    *
    * The function will prepend the L2 header to the L3 packet before it is
-   * sent out.
+   * sent out. All (ipv6) link-local unicast and multicast packets are forwarded
+   * onto VLAN corresponding to Host interface from which it is received.
+   * Link-local communication doesn't go through L3 table lookups, hence it will
+   * work regardless of L3 lookup tables state.
    *
    * @param pkt The packet that has L3 packet stored to send out
    */
-  void sendL3Packet(RouterID rid, std::unique_ptr<TxPacket> pkt) noexcept;
+  void sendL3Packet(
+      std::unique_ptr<TxPacket> pkt,
+      folly::Optional<InterfaceID> ifID = folly::none) noexcept;
 
   /**
    * method to send out a packet from HW to host.
@@ -487,7 +465,7 @@ class SwSwitch : public HwSwitch::Callback {
    * @return true The packet is sent to host
    *         false The packet is dropped due to errors
    */
-  bool sendPacketToHost(std::unique_ptr<RxPacket> pkt);
+  bool sendPacketToHost(InterfaceID dstIfID, std::unique_ptr<RxPacket> pkt);
 
   /**
    * Get the ArpHandler object.
@@ -572,11 +550,6 @@ class SwSwitch : public HwSwitch::Callback {
       const std::string& identifier);
 
   /*
-  * Get port operational state
-  */
-  bool isPortUp(PortID port) const;
-
-  /*
    * Register a function that will send notifications about the port status.
    * Only one port status listener is supported, and calling this multiple
    * times will overwrite the current listener.
@@ -595,8 +568,44 @@ class SwSwitch : public HwSwitch::Callback {
 
   const std::string& getConfigStr() const { return curConfigStr_; }
   const cfg::SwitchConfig& getConfig() const { return curConfig_; }
+  AdminDistance clientIdToAdminDistance(int clientId) const;
+  /*
+   * Applied state corresponds to what was successfully applied
+   * to h/w
+   */
+  std::shared_ptr<SwitchState> getAppliedState() const {
+    folly::SpinLockGuard guard(stateLock_);
+    return appliedStateDontUseDirectly_;
+  }
+
+  /*
+   * Desired state corresponds to what we desire the switch
+   * state to be. This is allowed to differ from desired switch
+   * state in a few select cases, where we deem it safe to
+   * let these states diverge. Currently the use case for this
+   * is when ASIC TCAM/CAM is full, we allow these s/w(desired) and
+   * h/w (applied) of switch states diverge. When this happens
+   * we keep trying to converge to this states becoming the
+   * same, by reapplying delta b/w applied and desired states
+   * along with other state updates.
+   * This however should be a pretty rare situation, where
+   * a large number of routes have leaked and caused a TCAM/CAM
+   * overflow. Allowing these states to differ, means we dont
+   * crash (and become non functional) in this situation. Reapplying
+   * deltas means that when leak is fixed we converge to
+   * normality (desired == applied)
+   *
+   */
+  std::shared_ptr<SwitchState> getDesiredState() const {
+    folly::SpinLockGuard guard(stateLock_);
+    return desiredStateDontUseDirectly_;
+  }
 
  private:
+  void queueStateUpdateForGettingHwInSync(
+      folly::StringPiece name,
+      StateUpdateFn fn);
+
   typedef folly::IntrusiveList<StateUpdate, &StateUpdate::listHook_>
     StateUpdateList;
 
@@ -604,20 +613,24 @@ class SwSwitch : public HwSwitch::Callback {
   SwSwitch(SwSwitch const &) = delete;
   SwSwitch& operator=(SwSwitch const &) = delete;
 
-  /*
-   * Update the current state pointer.
-   */
-  void setStateInternal(std::shared_ptr<SwitchState> newState);
+
+  std::pair<std::shared_ptr<SwitchState>, std::shared_ptr<SwitchState>>
+  getStates() const {
+    folly::SpinLockGuard guard(stateLock_);
+    return std::make_pair(
+        appliedStateDontUseDirectly_, desiredStateDontUseDirectly_);
+  }
 
   /*
-   * This function publishes the SFP Dom data (real time values
-   * and thresholds to the local in-memory ServiceData Structure
-   * along with the presence and dom supported status flags.
-   * These values are published by the fbagent to the ODS based
-   * on the Monitoring configuration.
+   * Update the current states.
    */
+  void setStateInternal(
+      std::shared_ptr<SwitchState> newAppliedState,
+      std::shared_ptr<SwitchState> newDesiredState);
+
+  void setDesiredState(std::shared_ptr<SwitchState> newDesiredState);
+
   void publishInitTimes(std::string name, const float& time);
-  void publishSfpInfo();
   void publishPortInfo();
   void publishRouteStats();
   void publishSwitchInfo(struct HwInitResult hwInitRet);
@@ -628,8 +641,9 @@ class SwSwitch : public HwSwitch::Callback {
 
   static void handlePendingUpdatesHelper(SwSwitch* sw);
   void handlePendingUpdates();
-  void applyUpdate(const std::shared_ptr<SwitchState>& oldState,
-                   const std::shared_ptr<SwitchState>& newState);
+  std::shared_ptr<SwitchState> applyUpdate(
+      const std::shared_ptr<SwitchState>& oldState,
+      const std::shared_ptr<SwitchState>& newState);
 
   void startThreads();
   void stopThreads();
@@ -657,8 +671,14 @@ class SwSwitch : public HwSwitch::Callback {
 
   void logLinkStateEvent(PortID port, bool up);
 
+  void logSwitchRunStateChange(
+      const SwitchRunState& oldState,
+      const SwitchRunState& newState);
+
   // Sets the counter that tracks port status
   void setPortStatusCounter(PortID port, bool up);
+
+  std::string switchRunStateStr(SwitchRunState runState) const;
 
   std::string curConfigStr_;
   cfg::SwitchConfig curConfig_;
@@ -681,17 +701,29 @@ class SwSwitch : public HwSwitch::Callback {
   StateUpdateList pendingUpdates_;
 
   /*
-   * The current switch state.
+   * The current switch state: modelled as two states:
    *
-   * BEWARE: You generally shouldn't access this directly, even internally
-   * within SwSwitch private methods.  This should only be accessed while
-   * holding stateLock_.  You almost certainly should call getState() or
-   * setStateInternal() instead of directly accessing this.
+   *  1. desiredState* is what we desire the SwSwitch and HwSwitch to be in.
+   *     But because of some errors, or lag, this state might not be what is
+   *     actually applied to HwSwitch.
+   *  2. appliedState* is what is actually applied in the hardware.
+   *
+   * In steady state without any errors, these state should differ only for
+   * short amounts of time when state is being applied, but otherwise should be
+   * the same.
+   *
+   * BEWARE: You generally shouldn't access these states directly, even
+   * internally within SwSwitch private methods.  These should only be accessed
+   * while holding stateLock_.
+   *
+   * You almost certainly should call getAppliedState() or getDesiredState() or
+   * setStateInternal() instead of directly accessing these.
    *
    * This intentionally has an awkward name so people won't forget and try to
    * directly access this pointer.
    */
-  std::shared_ptr<SwitchState> stateDontUseDirectly_;
+  std::shared_ptr<SwitchState> appliedStateDontUseDirectly_;
+  std::shared_ptr<SwitchState> desiredStateDontUseDirectly_;
   mutable folly::SpinLock stateLock_;
 
   /*
@@ -705,6 +737,14 @@ class SwSwitch : public HwSwitch::Callback {
    */
   std::unique_ptr<std::thread> updateThread_;
   folly::EventBase updateEventBase_;
+
+  /*
+   * A thread for processing packets received from
+   * host (linux) that may need to be sent out of
+   * ASIC front panel ports
+   */
+  std::unique_ptr<std::thread> fbossPktTxThread_;
+  folly::EventBase fbossPktTxEventBase_;
 
   /*
    * A callback for listening to neighbors coming and going.
@@ -731,10 +771,11 @@ class SwSwitch : public HwSwitch::Callback {
   std::unique_ptr<RouteUpdateLogger> routeUpdateLogger_;
   std::unique_ptr<UnresolvedNhopsProber> unresolvedNhopsProber_;
 
-  std::unique_ptr<TransceiverMap> transceiverMap_;
-
   BootType bootType_{BootType::UNINITIALIZED};
   std::unique_ptr<LldpManager> lldpManager_;
+  std::unique_ptr<ThreadHeartbeat> bgThreadHeartbeat_;
+  std::unique_ptr<ThreadHeartbeat> updThreadHeartbeat_;
+  std::unique_ptr<ThreadHeartbeat> fbossPktTxThreadHeartbeat_;
   SwitchFlags flags_{SwitchFlags::DEFAULT};
 };
 

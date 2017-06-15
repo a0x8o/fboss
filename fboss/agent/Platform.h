@@ -9,8 +9,11 @@
  */
 #pragma once
 
+#include <folly/io/async/EventBase.h>
 #include <folly/MacAddress.h>
 #include <memory>
+#include "fboss/agent/types.h"
+#include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 
 namespace facebook { namespace fboss {
 
@@ -62,6 +65,7 @@ class Platform {
    */
   virtual std::unique_ptr<ThriftHandler> createHandler(SwSwitch* sw) = 0;
 
+
   /*
    * Get the local MAC address for the switch.
    *
@@ -108,6 +112,18 @@ class Platform {
   }
 
   /*
+   * Methods to set and retrieve an event base
+   * for use by platform and ports
+   */
+  void setEventBase(folly::EventBase* evb) {
+    evb_ = evb;
+  }
+
+  folly::EventBase* getEventBase() {
+    return evb_;
+  }
+
+  /*
    * Get the directory where warm boot state is stored.
    */
   std::string getWarmBootDir() const {
@@ -121,11 +137,18 @@ class Platform {
    * Get filename for where we dump switch state on crash
    */
   std::string getCrashSwitchStateFile() const;
+  /*
+   * For a specific logical port, return the transceiver and channel
+   * it represents if available
+   */
+  virtual TransceiverIdxThrift getPortMapping(PortID port) const = 0;
 
  private:
   // Forbidden copy constructor and assignment operator
   Platform(Platform const &) = delete;
   Platform& operator=(Platform const &) = delete;
+ protected:
+  folly::EventBase* evb_{nullptr};
 };
 
 }} // facebook::fboss

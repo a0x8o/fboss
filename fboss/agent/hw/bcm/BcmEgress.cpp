@@ -63,6 +63,7 @@ void BcmEgress::program(opennsl_if_t intfId, opennsl_vrf_t vrf,
   eObj.intf = intfId;
   bool addOrUpdateEgress = false;
   const auto warmBootCache = hw_->getWarmBootCache();
+  CHECK(warmBootCache);
   auto egressId2EgressAndBoolCitr = warmBootCache->findEgress(vrf, ip);
   if (egressId2EgressAndBoolCitr !=
       warmBootCache->egressId2EgressAndBool_end()) {
@@ -134,7 +135,8 @@ void BcmEgress::program(opennsl_if_t intfId, opennsl_vrf_t vrf,
           " on unit ", hw_->getUnit());
       VLOG(3) << "programmed L3 egress object " << id_ << " for "
               << ((mac) ? mac->toString() : "to CPU") << " on unit "
-              << hw_->getUnit() << " for ip: " << ip;
+              << hw_->getUnit() << " for ip: " << ip << " flags " << eObj.flags
+              << " towards port " << eObj.port;
       if (mac != nullptr) {
         mac_ = *mac;
       }
@@ -263,9 +265,9 @@ folly::dynamic BcmEgress::toFollyDynamic() const {
 folly::dynamic BcmEcmpEgress::toFollyDynamic() const {
   folly::dynamic ecmpEgress = folly::dynamic::object;
   ecmpEgress[kEgressId] = getID();
-  std::vector<folly::dynamic> paths;
+  folly::dynamic paths = folly::dynamic::array;
   for (auto path: paths_) {
-    paths.emplace_back(path);
+    paths.push_back(path);
   }
   ecmpEgress[kPaths] = std::move(paths);
   return ecmpEgress;

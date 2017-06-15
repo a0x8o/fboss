@@ -2,7 +2,8 @@
 # Copyright 2004-present Facebook. All Rights Reserved.
 #
 namespace py neteng.fboss.switch_config
-namespace cpp facebook.fboss.cfg
+namespace py.asyncio neteng.fboss.asyncio.switch_config
+namespace cpp2 facebook.fboss.cfg
 
 /**
  * Port state
@@ -49,14 +50,6 @@ enum PortSpeed {
   FORTYG = 40000;               // 40G
   FIFTYG = 50000;               // 50G
   HUNDREDG = 100000;            // 100G
-}
-
-/**
- * The action for an access control entry
- */
-enum AclAction {
-  DENY = 0,
-  PERMIT = 1,
 }
 
 /**
@@ -112,6 +105,17 @@ struct Port {
    * An optional configurable string describing the port.
    */
   10: optional string description
+}
+
+struct AggregatePort {
+  1: i16 key
+  2: string name
+  3: string description
+  /**
+   * Physical ports are identified here according to their logicalID,
+   * as set in struct Port.
+   */
+  4: list<i32> physicalPorts
 }
 
 /**
@@ -258,6 +262,18 @@ struct Interface {
    * MTU size
    */
   8: optional i32 mtu
+  /**
+   * is_virtual is set to true for logical interfaces
+   * (e.g. loopbacks) which are associated with
+   * a reserver vlan. This VLAN has no ports in it
+   * and the interface is expected to always be up.
+   */
+  9: bool isVirtual = 0
+  /**
+  * this flag is set to true if we need to
+  * disable auto-state feature for SVI
+  */
+  10: optional bool isStateSyncDisabled = 0
 }
 
 struct StaticRouteWithNextHops {
@@ -274,6 +290,54 @@ struct StaticRouteNoNextHops {
   1: i32 routerID = 0
   /* Prefix in the format like 10.0.0.0/8 */
   2: string prefix
+}
+
+/**
+ *  A Range for L4 port range checker
+ *  Define a range bewteen [min, max]
+ */
+struct L4PortRange {
+  1: i32 min
+  2: i32 max
+}
+
+/**
+ *  A Range for packet length
+ *  Define a packet length range [min, max]
+ */
+struct PktLenRange {
+  1: i16 min
+  2: i16 max
+}
+
+enum IpFragMatch {
+  // not fragment
+  MATCH_NOT_FRAGMENTED = 0
+  // first fragment
+  MATCH_FIRST_FRAGMENT = 1
+  // not fragment or the first fragment
+  MATCH_NOT_FRAGMENTED_OR_FIRST_FRAGMENT = 2
+  // fragment but not the first frament
+  MATCH_NOT_FIRST_FRAGMENT = 3
+  // any fragment
+  MATCH_ANY_FRAGMENT = 4
+}
+
+/**
+ * The action for an access control entry
+ */
+enum AclActionType {
+  DENY = 0
+  PERMIT = 1
+  TO_PORT_QOS_QUEUE = 2,
+}
+
+struct AclAction {
+  1: AclActionType actionType = PERMIT
+
+  2: optional string portName
+
+  3: optional i16 qosQueueNum
 }
 
 /**
@@ -299,10 +363,10 @@ struct AclEntry {
   4: optional string dstIp
 
   /**
-   * L4 ports (TCP/UDP). Note that this is NOT the switch port.
+   * L4 port ranges (TCP/UDP)
    */
-  5: optional i16 l4SrcPort
-  6: optional i16 l4DstPort
+  5: optional L4PortRange srcL4PortRange
+  6: optional L4PortRange dstL4PortRange
 
   /**
    * IP Protocol. e.g, 6 for TCP
@@ -323,6 +387,24 @@ struct AclEntry {
    */
   10: optional i16 srcPort
   11: optional i16 dstPort
+
+  /**
+   * Packet length range
+   */
+  12: optional PktLenRange pktLenRange
+
+  /**
+   * Ip fragment
+   */
+  13: optional IpFragMatch ipFrag
+
+  /**
+   * Icmp type and code
+   * Code can only be set if type is set.
+   * "proto" field must be 1 (icmpv4) or 58 (icmpv6)
+   */
+  14: optional i16 icmpType
+  15: optional i16 icmpCode
 }
 
 /**
@@ -361,8 +443,38 @@ struct SwitchConfig {
   // Highest priority entry comes with smallest ID.
   15: optional list<AclEntry> acls = []
   // Set max number of probes to a sufficiently high value
-  // to allow for the case where we are probing and the
-  // agent on other end is restarting.
-  16: i32 maxNeighborProbes = 30
+  // to allow for the cases where
+  // a) We are probing and the agent on other end is restarting.
+  // b) The other end is having a hard time and responses to ARP/NDP
+  // packets are delayed. This is more of a protection mechanism. We
+  // saw a case where upstream switches were not able to respond to ARP
+  // in time. The underlying cause was that the upstream switch was getting
+  // flooded with control plane traffic while ARP traffic was set to goto a low
+  // priority queue. This lead to ARP responses to be delayed by upto 50
+  // seconds. We have since fixed the issues, but it was decided to add an extra
+  // safety measure here to avoid catastrophic failure if such a situation
+  // arises again.On vendor devices we set ARP expiry to be as high as 1500
+  // seconds.
+  16: i32 maxNeighborProbes = 300
   17: i32 staleEntryInterval = 10
+  18: list<AggregatePort> aggregatePorts = []
+  // What admin distance to use for each potential clientID
+  // These mappings map a StdClientIds to a AdminDistance
+  // Predefined values for these can be found at
+  // fboss/agent/if/ctrl.thrift
+  19: map<i32, i32> clientIdToAdminDistance = {
+        0: 20,
+        1: 1,
+      }
+  /* Override source IP for DHCP relay packet to the DHCP server */
+  20: optional string dhcpRelaySrcOverrideV4
+  21: optional string dhcpRelaySrcOverrideV6
+  /*
+   * Override source IP for DHCP reply packet to client host.
+   * This IP has to match one of interface IPs, as it is used to determines
+   * which interface/VLAN the client host MAC is searched against in order to
+   * send the reply to.
+   */
+  22: optional string dhcpReplySrcOverrideV4
+  23: optional string dhcpReplySrcOverrideV6
 }

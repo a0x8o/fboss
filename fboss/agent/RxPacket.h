@@ -28,6 +28,18 @@ class RxPacket : public Packet {
     return srcPort_;
   }
   /*
+   * Return True if and only if the packet ingressed on an aggregate port.
+   */
+  bool isFromAggregatePort() const {
+    return isFromAggregatePort_;
+  }
+  /*
+   * Get the aggregate port on which this packet was received.
+   */
+  AggregatePortID getSrcAggregatePort() const {
+    return srcAggregatePort_;
+  }
+  /*
    * Get the VLAN on which this packet was received.
    */
   VlanID getSrcVlan() const {
@@ -57,9 +69,16 @@ class RxPacket : public Packet {
   virtual std::string describeDetails() const {
     return "";
   }
+  /*
+   * Derived classes to override and provide CoS queue
+   * info (if available)
+   */
+  virtual int cosQueue() const { return -1; }
 
  protected:
   PortID srcPort_{0};
+  bool isFromAggregatePort_{false};
+  AggregatePortID srcAggregatePort_{0};
   VlanID srcVlan_{0};
   uint32_t len_{0};
 };

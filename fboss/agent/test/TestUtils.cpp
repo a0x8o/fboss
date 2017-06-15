@@ -10,27 +10,37 @@
 #include "fboss/agent/test/TestUtils.h"
 
 #include <boost/cast.hpp>
+#include <thrift/lib/cpp2/protocol/Serializer.h>
 
 #include "fboss/agent/ApplyThriftConfig.h"
-#include "fboss/agent/SwSwitch.h"
+#include "fboss/agent/RxPacket.h"
+#include "fboss/agent/TunManager.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
+#include "fboss/agent/hw/mock/MockableHwSwitch.h"
 #include "fboss/agent/hw/mock/MockHwSwitch.h"
 #include "fboss/agent/hw/mock/MockPlatform.h"
+#include "fboss/agent/hw/mock/MockablePlatform.h"
+#include "fboss/agent/platforms/wedge/WedgePlatformInit.h"
 #include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/state/Vlan.h"
 #include "fboss/agent/state/VlanMap.h"
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/Port.h"
 #include "fboss/agent/state/RouteUpdater.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/test/MockTunManager.h"
+
 #include <folly/Memory.h>
 #include <folly/json.h>
+#include <folly/Optional.h>
 
 using folly::MacAddress;
 using folly::IPAddress;
+using folly::IPAddressV4;
+using folly::IPAddressV6;
 using folly::ByteRange;
 using folly::IOBuf;
 using folly::io::Cursor;
-using folly::make_unique;
+using std::make_unique;
 using folly::StringPiece;
 using std::make_shared;
 using std::shared_ptr;
@@ -38,8 +48,83 @@ using std::string;
 using std::unique_ptr;
 using ::testing::_;
 using ::testing::Return;
+using ::testing::NiceMock;
+
+DEFINE_bool(switch_hw, false, "Run tests for actual hw");
 
 namespace facebook { namespace fboss {
+
+namespace {
+
+void initSwSwitchWithFlags(SwSwitch* sw, SwitchFlags flags) {
+  if (flags & ENABLE_TUN) {
+    // TODO(aeckert): I don't think this should be a first class
+    // argument to SwSwitch::init() as unit tests are the only place
+    // that pass in a TunManager to init(). Let's come up with a way
+    // to mock the TunManager initialization instead of passing it in
+    // like this.
+    //
+    // TODO(aeckert): Have MockTunManager hit the real TunManager
+    // implementation if testing on actual hw
+    auto mockTunMgr = new MockTunManager(sw, sw->getBackgroundEVB());
+    std::unique_ptr<TunManager> tunMgr(mockTunMgr);
+    sw->init(std::move(tunMgr), flags);
+  } else {
+    sw->init(nullptr, flags);
+  }
+}
+
+std::unique_ptr<SwSwitch> setupMockSwitchWithoutHW(
+    std::unique_ptr<MockPlatform> platform,
+    const std::shared_ptr<SwitchState>& state,
+    SwitchFlags flags) {
+  auto sw = make_unique<SwSwitch>(std::move(platform));
+  HwInitResult ret;
+  ret.switchState = state ? state : make_shared<SwitchState>();
+  ret.bootType = BootType::COLD_BOOT;
+  EXPECT_HW_CALL(sw, init(_)).WillOnce(Return(ret));
+  initSwSwitchWithFlags(sw.get(), flags);
+  waitForStateUpdates(sw.get());
+  return sw;
+}
+
+std::unique_ptr<SwSwitch> setupMockSwitchWithHW(
+    std::unique_ptr<MockPlatform> platform,
+    const std::shared_ptr<SwitchState>& state,
+    SwitchFlags flags) {
+  auto sw = make_unique<SwSwitch>(std::move(platform));
+  EXPECT_PLATFORM_CALL(sw, onHwInitialized(_)).Times(1);
+  initSwSwitchWithFlags(sw.get(), flags);
+  if (state) {
+    sw->updateState(
+      "Apply initial test state",
+      [state](const shared_ptr<SwitchState>& prev) -> shared_ptr<SwitchState> {
+        state->inheritGeneration(*prev);
+        shared_ptr<SwitchState> newState{state};
+
+        // A bit hacky, but fboss currently expects the sw port
+        // mapping to match what is in hardware. Instead of removing
+        // any ports not specified in the initial state altogether,
+        // just disable non-specified ports that exist in hw.
+        auto newPorts = newState->getPorts()->modify(&newState);
+        for (auto port : *prev->getPorts()) {
+          if (!newPorts->getPortIf(port->getID())) {
+            // port not in desired state, add it as a disabled port
+            auto newPort = port->clone();
+            newPort->setState(cfg::PortState::POWER_DOWN);
+            newPorts->addPort(newPort);
+          }
+        }
+
+        return newState;
+      });
+  }
+  sw->initialConfigApplied(std::chrono::steady_clock::now());
+  waitForStateUpdates(sw.get());
+  return sw;
+}
+
+}
 
 shared_ptr<SwitchState> publishAndApplyConfig(
     shared_ptr<SwitchState>& state,
@@ -59,62 +144,53 @@ shared_ptr<SwitchState> publishAndApplyConfigFile(
   // Parse the prev JSON config.
   cfg::SwitchConfig prevConfig;
   if (prevConfigStr.size()) {
-    prevConfig.readFromJson(prevConfigStr.c_str());
+    apache::thrift::SimpleJSONSerializer::deserialize<cfg::SwitchConfig>(
+        prevConfigStr.c_str(), prevConfig);
   }
   return applyThriftConfigFile(state, path, platform, &prevConfig).first;
 }
 
-unique_ptr<SwSwitch> createMockSw(const shared_ptr<SwitchState>& state) {
-  auto sw = make_unique<SwSwitch>(make_unique<MockPlatform>());
-  auto stateAndBootType = std::make_pair(state, BootType::COLD_BOOT);
-  HwInitResult ret;
-  ret.switchState = state;
-  ret.bootType = BootType::COLD_BOOT;
-  EXPECT_HW_CALL(sw, init(_)).WillOnce(Return(ret));
-  sw->init();
-  waitForStateUpdates(sw.get());
-  return sw;
+unique_ptr<MockPlatform> createMockPlatform() {
+  if (!FLAGS_switch_hw) {
+    return make_unique<testing::NiceMock<MockPlatform>>();
+  }
+
+  std::shared_ptr<Platform> platform(initWedgePlatform().release());
+  return make_unique<testing::NiceMock<MockablePlatform>>(platform);
 }
 
-unique_ptr<SwSwitch> createMockSw(const shared_ptr<SwitchState>& state,
-                                  const MacAddress& mac) {
-  auto platform = make_unique<MockPlatform>();
-  EXPECT_CALL(*platform.get(), getLocalMac()).WillRepeatedly(Return(mac));
-  auto sw = make_unique<SwSwitch>(std::move(platform));
-  auto stateAndBootType = std::make_pair(state, BootType::COLD_BOOT);
-  HwInitResult ret;
-  ret.switchState = state;
-  ret.bootType = BootType::COLD_BOOT;
-  EXPECT_HW_CALL(sw, init(_)).WillOnce(Return(ret));
-  sw->init();
-  waitForStateUpdates(sw.get());
-  return sw;
+unique_ptr<SwSwitch> createMockSw(
+    const shared_ptr<SwitchState>& state,
+    const folly::Optional<MacAddress>& mac,
+    SwitchFlags flags) {
+  auto platform = createMockPlatform();
+  if (mac) {
+    EXPECT_CALL(*platform.get(), getLocalMac()).WillRepeatedly(
+      Return(mac.value()));
+  }
+  if (FLAGS_switch_hw) {
+    return setupMockSwitchWithHW(std::move(platform), state, flags);
+  }
+  return setupMockSwitchWithoutHW(std::move(platform), state, flags);
 }
 
 unique_ptr<SwSwitch> createMockSw(cfg::SwitchConfig* config,
                                   MacAddress mac,
-                                  uint32_t maxPort) {
-  // Create the initial state, which only has ports
-  auto initialState = make_shared<SwitchState>();
-  if (maxPort == 0) {
+                                  SwitchFlags flags) {
+  shared_ptr<SwitchState> initialState{nullptr};
+  if (!FLAGS_switch_hw) {
+    // Create the initial state, which only has ports
+    initialState = make_shared<SwitchState>();
+    uint32_t maxPort{0};
     for (const auto& port : config->ports) {
       maxPort = std::max(static_cast<int32_t>(maxPort), port.logicalID);
     }
-  }
-  for (uint32_t idx = 1; idx <= maxPort; ++idx) {
-    initialState->registerPort(PortID(idx), folly::to<string>("port", idx));
+    for (uint32_t idx = 1; idx <= maxPort; ++idx) {
+      initialState->registerPort(PortID(idx), folly::to<string>("port", idx));
+    }
   }
 
-  // Create the SwSwitch
-  auto platform = make_unique<MockPlatform>();
-  EXPECT_CALL(*platform.get(), getLocalMac()).WillRepeatedly(Return(mac));
-  auto sw = make_unique<SwSwitch>(std::move(platform));
-  auto stateAndBootType = std::make_pair(initialState, BootType::COLD_BOOT);
-  HwInitResult ret;
-  ret.switchState = initialState;
-  ret.bootType = BootType::COLD_BOOT;
-  EXPECT_HW_CALL(sw, init(_)).WillOnce(Return(ret));
-  sw->init();
+  auto sw = createMockSw(initialState, mac, flags);
 
   // Apply the thrift config
   auto updateFn = [&](const shared_ptr<SwitchState>& state) {
@@ -125,8 +201,8 @@ unique_ptr<SwSwitch> createMockSw(cfg::SwitchConfig* config,
 }
 
 unique_ptr<SwSwitch> createMockSw(cfg::SwitchConfig* config,
-                                  uint32_t maxPort) {
-  return createMockSw(config, MacAddress("02:00:00:00:00:01"), maxPort);
+                                  SwitchFlags flags) {
+  return createMockSw(config, MacAddress("02:00:00:00:00:01"), flags);
 }
 
 MockHwSwitch* getMockHw(SwSwitch* sw) {
@@ -153,6 +229,56 @@ void waitForBackgroundThread(SwSwitch* sw) {
   evb->runInEventBaseThreadAndWait([]() { return; });
 }
 
+cfg::SwitchConfig testConfigA() {
+  cfg::SwitchConfig cfg;
+  static constexpr auto kPortCount = 20;
+
+  cfg.ports.resize(kPortCount);
+  for (int p = 0; p < kPortCount; ++p) {
+    cfg.ports[p].logicalID = p + 1;
+    cfg.ports[p].name = folly::to<string>("port", p + 1);
+  }
+
+  cfg.vlans.resize(2);
+  cfg.vlans[0].id = 1;
+  cfg.vlans[0].name = "Vlan1";
+  cfg.vlans[0].intfID = 1;
+  cfg.vlans[1].id = 55;
+  cfg.vlans[1].name = "Vlan55";
+  cfg.vlans[1].intfID = 55;
+
+  cfg.vlanPorts.resize(20);
+  for (int p = 0; p < kPortCount; ++p) {
+    cfg.vlanPorts[p].logicalPort = p + 1;
+    cfg.vlanPorts[p].vlanID = p < 11 ? 1 : 55;
+  }
+
+  cfg.interfaces.resize(2);
+  cfg.interfaces[0].intfID = 1;
+  cfg.interfaces[0].routerID = 0;
+  cfg.interfaces[0].vlanID = 1;
+  cfg.interfaces[0].name = "interface1";
+  cfg.interfaces[0].mac = "00:02:00:00:00:01";
+  cfg.interfaces[0].mtu = 9000;
+  cfg.interfaces[0].ipAddresses.resize(3);
+  cfg.interfaces[0].ipAddresses[0] = "10.0.0.1/24";
+  cfg.interfaces[0].ipAddresses[1] = "192.168.0.1/24";
+  cfg.interfaces[0].ipAddresses[2] = "2401:db00:2110:3001::0001/64";
+
+  cfg.interfaces[1].intfID = 55;
+  cfg.interfaces[1].routerID = 0;
+  cfg.interfaces[1].vlanID = 55;
+  cfg.interfaces[1].name = "interface55";
+  cfg.interfaces[1].mac = "00:02:00:00:00:55";
+  cfg.interfaces[1].mtu = 9000;
+  cfg.interfaces[1].ipAddresses.resize(3);
+  cfg.interfaces[1].ipAddresses[0] = "10.0.55.1/24";
+  cfg.interfaces[1].ipAddresses[1] = "192.168.55.1/24";
+  cfg.interfaces[1].ipAddresses[2] = "2401:db00:2110:3055::0001/64";
+
+  return cfg;
+}
+
 shared_ptr<SwitchState> testStateA() {
   // Setup a default state object
   auto state = make_shared<SwitchState>();
@@ -172,9 +298,15 @@ shared_ptr<SwitchState> testStateA() {
     vlan55->addPort(PortID(idx), false);
   }
   // Add Interface 1 to VLAN 1
-  auto intf1 = make_shared<Interface>
-    (InterfaceID(1), RouterID(0), VlanID(1),
-     "interface1", MacAddress("00:02:00:00:00:01"), 9000);
+  auto intf1 = make_shared<Interface>(
+      InterfaceID(1),
+      RouterID(0),
+      VlanID(1),
+      "interface1",
+      MacAddress("00:02:00:00:00:01"),
+      9000,
+      false, /* is virtual */
+      false  /* is state_sync disabled */);
   Interface::Addresses addrs1;
   addrs1.emplace(IPAddress("10.0.0.1"), 24);
   addrs1.emplace(IPAddress("192.168.0.1"), 24);
@@ -184,9 +316,15 @@ shared_ptr<SwitchState> testStateA() {
   vlan1->setInterfaceID(InterfaceID(1));
 
   // Add Interface 55 to VLAN 55
-  auto intf55 = make_shared<Interface>
-    (InterfaceID(55), RouterID(0), VlanID(55),
-     "interface55", MacAddress("00:02:00:00:00:55"), 9000);
+  auto intf55 = make_shared<Interface>(
+      InterfaceID(55),
+      RouterID(0),
+      VlanID(55),
+      "interface55",
+      MacAddress("00:02:00:00:00:55"),
+      9000,
+      false, /* is virtual */
+      false  /* is state_sync disabled */);
   Interface::Addresses addrs55;
   addrs55.emplace(IPAddress("10.0.55.1"), 24);
   addrs55.emplace(IPAddress("192.168.55.1"), 24);
@@ -200,11 +338,15 @@ shared_ptr<SwitchState> testStateA() {
   updater.addInterfaceAndLinkLocalRoutes(state->getInterfaces());
 
   RouteNextHops nexthops;
-  nexthops.emplace(IPAddress("10.0.0.22")); // resolved by intf 1
-  nexthops.emplace(IPAddress("10.0.0.23")); // resolved by intf 1
-  nexthops.emplace(IPAddress("1.1.2.10")); // un-resolvable
+  // resolved by intf 1
+  nexthops.emplace(RouteNextHop::createNextHop(IPAddress("10.0.0.22")));
+  // resolved by intf 1
+  nexthops.emplace(RouteNextHop::createNextHop(IPAddress("10.0.0.23")));
+  // un-resolvable
+  nexthops.emplace(RouteNextHop::createNextHop(IPAddress("1.1.2.10")));
 
-  updater.addRoute(RouterID(0), IPAddress("10.1.1.0"), 24, nexthops);
+  updater.addRoute(RouterID(0), IPAddress("10.1.1.0"), 24,
+                   ClientID(1001), RouteNextHopEntry(nexthops));
 
   auto newRt = updater.updateDone();
   state->resetRouteTables(newRt);
@@ -225,9 +367,15 @@ shared_ptr<SwitchState> testStateB() {
   }
 
   // Add Interface 1 to VLAN 1
-  auto intf1 = make_shared<Interface>
-    (InterfaceID(1), RouterID(0), VlanID(1),
-     "interface1", MacAddress("00:02:00:00:00:01"), 9000);
+  auto intf1 = make_shared<Interface>(
+      InterfaceID(1),
+      RouterID(0),
+      VlanID(1),
+      "interface1",
+      MacAddress("00:02:00:00:00:01"),
+      9000,
+      false, /* is virtual */
+      false  /* is state_sync disabled */);
   Interface::Addresses addrs1;
   addrs1.emplace(IPAddress("10.0.0.1"), 24);
   addrs1.emplace(IPAddress("192.168.0.1"), 24);
@@ -279,21 +427,18 @@ std::string fbossHexDump(const string& buf) {
 }
 
 TxPacketMatcher::TxPacketMatcher(StringPiece name, TxMatchFn fn)
-  : name_(name.str()),
-    fn_(std::move(fn)) {
-}
+  : name_(name.str()), fn_(std::move(fn)) {}
 
-::testing::Matcher<shared_ptr<TxPacket>> TxPacketMatcher::createMatcher(
+::testing::Matcher<TxPacketPtr> TxPacketMatcher::createMatcher(
     folly::StringPiece name,
     TxMatchFn&& fn) {
-  return ::testing::MakeMatcher(new TxPacketMatcher(name, fn));
+  return ::testing::MakeMatcher(new TxPacketMatcher(name, std::move(fn)));
 }
 
 bool TxPacketMatcher::MatchAndExplain(
-    shared_ptr<TxPacket> pkt,
-    ::testing::MatchResultListener* l) const {
+    const TxPacketPtr& pkt, ::testing::MatchResultListener* l) const {
   try {
-    fn_(pkt.get());
+    fn_(pkt);
     return true;
   } catch (const std::exception& ex) {
     *l << ex.what();
@@ -309,4 +454,132 @@ void TxPacketMatcher::DescribeNegationTo(std::ostream* os) const {
   *os << "not " << name_;
 }
 
-}} // facebook::fboss
+RxPacketMatcher::RxPacketMatcher(
+    StringPiece name, InterfaceID dstIfID, RxMatchFn fn)
+    : name_(name.str()), dstIfID_(dstIfID), fn_(std::move(fn)) {}
+
+::testing::Matcher<RxMatchFnArgs>
+RxPacketMatcher::createMatcher(
+    folly::StringPiece name,
+    InterfaceID dstIfID,
+    RxMatchFn&& fn) {
+  return ::testing::MakeMatcher(
+      new RxPacketMatcher(name, dstIfID, std::move(fn)));
+}
+
+bool RxPacketMatcher::MatchAndExplain(
+    const RxMatchFnArgs& args,
+    ::testing::MatchResultListener* l) const {
+  auto dstIfID = std::get<0>(args);
+  auto pkt = std::get<1>(args);
+
+  try {
+    if (dstIfID != dstIfID_) {
+      throw FbossError(
+          "Mismatching dstIfID. Expected ", dstIfID_,
+          " but received ", dstIfID);
+    }
+
+    fn_(pkt.get());
+    return true;
+  } catch (const std::exception& ex) {
+    *l << ex.what();
+    return false;
+  }
+}
+
+void RxPacketMatcher::DescribeTo(std::ostream* os) const {
+  *os << name_;
+}
+
+void RxPacketMatcher::DescribeNegationTo(std::ostream* os) const {
+  *os << "not " << name_;
+}
+
+RouteNextHops makeNextHops(std::vector<std::string> ipStrs) {
+  RouteNextHops nhops;
+  for (const std::string & ip : ipStrs) {
+    nhops.emplace(RouteNextHop::createNextHop(IPAddress(ip)));
+  }
+  return nhops;
+}
+
+RoutePrefixV4 makePrefixV4(std::string str) {
+  std::vector<std::string> vec;
+  folly::split("/", str, vec);
+  EXPECT_EQ(2, vec.size());
+  auto prefix = RoutePrefixV4{IPAddressV4(vec.at(0)),
+                              folly::to<uint8_t>(vec.at(1))};
+  return prefix;
+}
+
+RoutePrefixV6 makePrefixV6(std::string str) {
+  std::vector<std::string> vec;
+  folly::split("/", str, vec);
+  EXPECT_EQ(2, vec.size());
+  auto prefix = RoutePrefixV6{IPAddressV6(vec.at(0)),
+                              folly::to<uint8_t>(vec.at(1))};
+  return prefix;
+}
+
+std::shared_ptr<Route<IPAddressV4>>
+GET_ROUTE_V4(const std::shared_ptr<RouteTableMap>& tables,
+             RouterID rid, RoutePrefixV4 prefix) {
+  EXPECT_NE(nullptr, tables);
+  auto table = tables->getRouteTableIf(rid);
+  EXPECT_NE(nullptr, table);
+  auto rib4 = table->getRibV4();
+  EXPECT_NE(nullptr, rib4);
+  auto rt = rib4->exactMatch(prefix);
+  EXPECT_NE(nullptr, rt);
+  return rt;
+}
+
+std::shared_ptr<Route<IPAddressV4>>
+GET_ROUTE_V4(const std::shared_ptr<RouteTableMap>& tables,
+             RouterID rid, std::string prefixStr) {
+  return GET_ROUTE_V4(tables, rid, makePrefixV4(prefixStr));
+}
+
+std::shared_ptr<Route<IPAddressV6>>
+GET_ROUTE_V6(const std::shared_ptr<RouteTableMap>& tables,
+             RouterID rid, RoutePrefixV6 prefix) {
+  EXPECT_NE(nullptr, tables);
+  auto table = tables->getRouteTableIf(rid);
+  EXPECT_NE(nullptr, table);
+  auto rib6 = table->getRibV6();
+  EXPECT_NE(nullptr, rib6);
+  auto rt = rib6->exactMatch(prefix);
+  EXPECT_NE(nullptr, rt);
+  return rt;
+}
+
+std::shared_ptr<Route<IPAddressV6>>
+GET_ROUTE_V6(const std::shared_ptr<RouteTableMap>& tables,
+             RouterID rid, std::string prefixStr) {
+  return GET_ROUTE_V6(tables, rid, makePrefixV6(prefixStr));
+}
+
+
+void EXPECT_NO_ROUTE(const std::shared_ptr<RouteTableMap>& tables,
+                     RouterID rid, std::string prefixStr) {
+  // Figure out if it's v4 or v6
+  std::vector<std::string> vec;
+  folly::split("/", prefixStr, vec);
+  EXPECT_EQ(2, vec.size());
+  IPAddress ip(vec.at(0));
+
+  if (ip.isV4()) {
+    auto prefix = RoutePrefixV4{IPAddressV4(vec.at(0)),
+      folly::to<uint8_t>(vec.at(1))};
+    EXPECT_EQ(nullptr,
+              tables->getRouteTableIf(rid)->getRibV4()->exactMatch(prefix));
+  } else {
+    auto prefix = RoutePrefixV6{IPAddressV6(vec.at(0)),
+      folly::to<uint8_t>(vec.at(1))};
+    EXPECT_EQ(nullptr,
+              tables->getRouteTableIf(rid)->getRibV6()->exactMatch(prefix));
+  }
+}
+
+}} // namespace facebook::fboss

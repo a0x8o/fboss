@@ -17,7 +17,7 @@
 #include "fboss/agent/state/NodeMapDelta.h"
 #include "fboss/agent/state/StateDelta.h"
 #include "fboss/agent/state/SwitchState.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 #include <gtest/gtest.h>
 
@@ -29,7 +29,7 @@ using std::shared_ptr;
 using ::testing::Return;
 
 TEST(Interface, addrToReach) {
-  MockPlatform platform;
+  auto platform = createMockPlatform();
   cfg::SwitchConfig config;
   config.vlans.resize(2);
   config.vlans[0].id = 1;
@@ -61,7 +61,7 @@ TEST(Interface, addrToReach) {
 
   InterfaceID id(1);
   shared_ptr<SwitchState> oldState = make_shared<SwitchState>();
-  auto state = publishAndApplyConfig(oldState, &config, &platform);
+  auto state = publishAndApplyConfig(oldState, &config, platform.get());
   ASSERT_NE(nullptr, state);
   const auto& intfs = state->getInterfaces();
   const auto& intf1 = intfs->getInterface(InterfaceID(1));
@@ -89,7 +89,7 @@ TEST(Interface, addrToReach) {
 }
 
 TEST(Interface, applyConfig) {
-  MockPlatform platform;
+  auto platform = createMockPlatform();
   cfg::SwitchConfig config;
   config.vlans.resize(1);
   config.vlans[0].id = 1;
@@ -111,7 +111,7 @@ TEST(Interface, applyConfig) {
   auto updateState = [&]() {
     oldState = state;
     oldInterface = interface;
-    state = publishAndApplyConfig(oldState, &config, &platform);
+    state = publishAndApplyConfig(oldState, &config, platform.get());
     EXPECT_NE(oldState, state);
     ASSERT_NE(nullptr, state);
     interface = state->getInterfaces()->getInterface(id);
@@ -127,12 +127,12 @@ TEST(Interface, applyConfig) {
   EXPECT_EQ(RouterID(0), interface->getRouterID());
   EXPECT_EQ("Interface 1", interface->getName());
   EXPECT_EQ(MacAddress("00:02:00:11:22:33"), interface->getMac());
-  EXPECT_EQ(Interface::Addresses{}, interface->getAddresses());
+  EXPECT_EQ(1, interface->getAddresses().size()); // 1 ipv6 link local address
   EXPECT_EQ(0, interface->getNdpConfig().routerAdvertisementSeconds);
   auto vlan1 = state->getVlans()->getVlanIf(VlanID(1));
   EXPECT_EQ(InterfaceID(1),vlan1->getInterfaceID());
   // same configuration cause nothing changed
-  EXPECT_EQ(nullptr, publishAndApplyConfig(state, &config, &platform));
+  EXPECT_EQ(nullptr, publishAndApplyConfig(state, &config, platform.get()));
 
   // Change VlanID for intf + create new intf for existing vlan
   config.vlans.resize(2);
@@ -180,12 +180,11 @@ TEST(Interface, applyConfig) {
   EXPECT_EQ(RouterID(1), interface->getRouterID());
   EXPECT_EQ(oldInterface->getName(), interface->getName());
   EXPECT_EQ(MacAddress("00:02:00:12:34:56"), interface->getMac());
-  EXPECT_EQ(oldInterface->getAddresses(), interface->getAddresses());
   // Use the platform supplied MAC
   config.interfaces[0].mac = "";
   config.interfaces[0].__isset.mac = false;
   MacAddress platformMac("00:02:00:ab:cd:ef");
-  EXPECT_CALL(platform, getLocalMac()).WillRepeatedly(Return(platformMac));
+  EXPECT_CALL(*platform, getLocalMac()).WillRepeatedly(Return(platformMac));
   updateState();
   EXPECT_EQ(nodeID, interface->getNodeID());
   EXPECT_EQ(oldInterface->getGeneration() + 1, interface->getGeneration());
@@ -193,7 +192,8 @@ TEST(Interface, applyConfig) {
   EXPECT_EQ(oldInterface->getRouterID(), interface->getRouterID());
   EXPECT_EQ(oldInterface->getName(), interface->getName());
   EXPECT_EQ(platformMac, interface->getMac());
-  EXPECT_EQ(oldInterface->getAddresses(), interface->getAddresses());
+  // Interface will be updated based on new MAC Address
+  EXPECT_NE(oldInterface->getAddresses(), interface->getAddresses());
 
   // IP addresses change
   config.interfaces[0].ipAddresses.resize(4);
@@ -208,21 +208,24 @@ TEST(Interface, applyConfig) {
   EXPECT_EQ(RouterID(1), interface->getRouterID());
   EXPECT_EQ(oldInterface->getName(), interface->getName());
   EXPECT_EQ(oldInterface->getMac(), interface->getMac());
-  EXPECT_EQ(4, interface->getAddresses().size());
+  // Link-local addrs will be added automatically
+  EXPECT_EQ(5, interface->getAddresses().size());
 
   // change the order of IP address shall not change the interface
   config.interfaces[0].ipAddresses[0] = "10.1.1.1/24";
   config.interfaces[0].ipAddresses[1] = "::22:33:44/120";
   config.interfaces[0].ipAddresses[2] = "20.1.1.2/24";
   config.interfaces[0].ipAddresses[3] = "::11:11:11/120";
-  EXPECT_EQ(nullptr, publishAndApplyConfig(state, &config, &platform));
+  EXPECT_EQ(nullptr, publishAndApplyConfig(state, &config, platform.get()));
 
   // duplicate IP addresses causes throw
   config.interfaces[0].ipAddresses[1] = config.interfaces[0].ipAddresses[0];
-  EXPECT_THROW(publishAndApplyConfig(state, &config, &platform), FbossError);
+  EXPECT_THROW(
+    publishAndApplyConfig(state, &config, platform.get()), FbossError);
   // Should still throw even if the mask is different
   config.interfaces[0].ipAddresses[1] = "10.1.1.1/16";
-  EXPECT_THROW(publishAndApplyConfig(state, &config, &platform), FbossError);
+  EXPECT_THROW(
+    publishAndApplyConfig(state, &config, platform.get()), FbossError);
   config.interfaces[0].ipAddresses[1] = "::22:33:44/120";
 
   // Name change
@@ -332,7 +335,7 @@ void checkChangedIntfs(const shared_ptr<InterfaceMap>& oldIntfs,
 }
 
 TEST(InterfaceMap, applyConfig) {
-  MockPlatform platform;
+  auto platform = createMockPlatform();
   auto stateV0 = make_shared<SwitchState>();
   auto intfsV0 = stateV0->getInterfaces();
 
@@ -352,7 +355,7 @@ TEST(InterfaceMap, applyConfig) {
   config.interfaces[1].__isset.mac = true;
   config.interfaces[1].mac = "00:00:00:00:00:22";
 
-  auto stateV1 = publishAndApplyConfig(stateV0, &config, &platform);
+  auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
   ASSERT_NE(nullptr, stateV1);
   auto intfsV1 = stateV1->getInterfaces();
   EXPECT_NE(intfsV1, intfsV0);
@@ -375,20 +378,20 @@ TEST(InterfaceMap, applyConfig) {
   EXPECT_EQ(nullptr, intfsV1->getInterfaceIf(InterfaceID(99)));
 
   // applying the same configure results in no change
-  EXPECT_EQ(nullptr, publishAndApplyConfig(stateV1, &config, &platform));
+  EXPECT_EQ(nullptr, publishAndApplyConfig(stateV1, &config, platform.get()));
 
   // adding some IP addresses
   config.interfaces[1].ipAddresses.resize(2);
   config.interfaces[1].ipAddresses[0] = "192.168.1.1/16";
   config.interfaces[1].ipAddresses[1] = "::1/48";
-  auto stateV2 = publishAndApplyConfig(stateV1, &config, &platform);
+  auto stateV2 = publishAndApplyConfig(stateV1, &config, platform.get());
   ASSERT_NE(nullptr, stateV2);
   auto intfsV2 = stateV2->getInterfaces();
   EXPECT_NE(intfsV1, intfsV2);
   EXPECT_EQ(2, intfsV2->getGeneration());
   EXPECT_EQ(2, intfsV2->size());
   auto intf2 = intfsV2->getInterface(InterfaceID(2));
-  EXPECT_EQ(2, intf2->getAddresses().size());
+  EXPECT_EQ(3, intf2->getAddresses().size());   // v6 link-local is added
 
   checkChangedIntfs(intfsV1, intfsV2, {2}, {}, {});
 
@@ -407,14 +410,14 @@ TEST(InterfaceMap, applyConfig) {
   config.interfaces[2].mac = "00:00:00:00:00:55";
   config.vlans[0].intfID = 5;
 
-  auto stateV3 = publishAndApplyConfig(stateV2, &config, &platform);
+  auto stateV3 = publishAndApplyConfig(stateV2, &config, platform.get());
   ASSERT_NE(nullptr, stateV3);
   auto intfsV3 = stateV3->getInterfaces();
   EXPECT_NE(intfsV2, intfsV3);
   EXPECT_EQ(3, intfsV3->getGeneration());
   EXPECT_EQ(3, intfsV3->size());
   auto intf3 = intfsV3->getInterface(InterfaceID(3));
-  EXPECT_EQ(0, intf3->getAddresses().size());
+  EXPECT_EQ(1, intf3->getAddresses().size());
   EXPECT_EQ(config.interfaces[0].mac, intf3->getMac().toString());
   // intf 1 should not be there anymroe
   EXPECT_EQ(nullptr, intfsV3->getInterfaceIf(InterfaceID(1)));
@@ -429,7 +432,7 @@ TEST(InterfaceMap, applyConfig) {
   config.interfaces[0].mtu = 1337;
   config.interfaces[0].__isset.mtu = true;
   EXPECT_EQ(1500, intfsV3->getInterface(InterfaceID(3))->getMtu());
-  auto stateV4 = publishAndApplyConfig(stateV3, &config, &platform);
+  auto stateV4 = publishAndApplyConfig(stateV3, &config, platform.get());
   ASSERT_NE(nullptr, stateV4);
   auto intfsV4 = stateV4->getInterfaces();
   EXPECT_NE(intfsV3, intfsV4);

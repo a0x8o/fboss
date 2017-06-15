@@ -9,7 +9,7 @@
  */
 #include "fboss/agent/state/Interface.h"
 
-#include <thrift/lib/cpp/util/ThriftSerializer.h>
+#include <thrift/lib/cpp2/protocol/Serializer.h>
 #include "fboss/agent/state/InterfaceMap.h"
 #include "fboss/agent/state/NodeBase-defs.h"
 #include "fboss/agent/state/SwitchState.h"
@@ -18,7 +18,6 @@ using folly::IPAddress;
 using folly::MacAddress;
 using folly::to;
 using std::string;
-using apache::thrift::util::ThriftSerializerJson;
 
 namespace {
 constexpr auto kIntfId = "interfaceId";
@@ -29,6 +28,8 @@ constexpr auto kMac = "mac";
 constexpr auto kAddresses = "addresses";
 constexpr auto kNdpConfig = "ndpConfig";
 constexpr auto kMtu = "mtu";
+constexpr auto kIsVirtual = "isVirtual";
+constexpr auto kIsStateSyncDisabled = "isStateSyncDisabled";
 }
 
 namespace facebook { namespace fboss {
@@ -41,16 +42,17 @@ InterfaceFields InterfaceFields::fromFollyDynamic(const folly::dynamic& json) {
         VlanID(json[kVlanId].asInt()),
         json[kName].asString(),
         MacAddress(json[kMac].asString()),
-        json[kMtu].asInt());
-  ThriftSerializerJson<cfg::NdpConfig> serializer;
+        json[kMtu].asInt(),
+        json.getDefault(kIsVirtual, false).asBool(),
+        json.getDefault(kIsStateSyncDisabled, false).asBool());
   for (const auto& addr: json[kAddresses]) {
     auto cidr = IPAddress::createNetwork(addr.asString(),
           -1 /*use /32 for v4 and /128 for v6*/,
         false /*don't apply mask*/);
     intfFields.addrs[cidr.first] = cidr.second;
   }
-  serializer.deserialize(toJson(json[kNdpConfig]),
-      &intfFields.ndp);
+  apache::thrift::SimpleJSONSerializer::deserialize<cfg::NdpConfig>(
+      toJson(json[kNdpConfig]), intfFields.ndp);
   return intfFields;
 }
 
@@ -62,15 +64,16 @@ folly::dynamic InterfaceFields::toFollyDynamic() const {
   intf[kName] = name;
   intf[kMac] = to<string>(mac);
   intf[kMtu] = to<string>(mtu);
+  intf[kIsVirtual] = to<string>(isVirtual);
+  intf[kIsStateSyncDisabled] = to<string>(isStateSyncDisabled);
   std::vector<folly::dynamic> addresses;
   for (auto const& addrAndMask: addrs) {
     addresses.emplace_back(to<string>(addrAndMask.first) + "/" +
           to<string>(addrAndMask.second));
   }
   intf[kAddresses] = folly::dynamic(addresses.begin(), addresses.end());
-  ThriftSerializerJson<cfg::NdpConfig> serializer;
   string ndpCfgJson;
-  serializer.serialize(ndp, &ndpCfgJson);
+  apache::thrift::SimpleJSONSerializer::serialize(ndp, &ndpCfgJson);
   intf[kNdpConfig] = folly::parseJson(ndpCfgJson);
   return intf;
 }

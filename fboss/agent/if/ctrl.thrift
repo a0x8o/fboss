@@ -2,17 +2,29 @@ namespace cpp2 facebook.fboss
 namespace d neteng.fboss.ctrl
 namespace php fboss
 namespace py neteng.fboss.ctrl
+namespace py.asyncio neteng.fboss.asyncio.ctrl
 
 include "fboss/agent/if/fboss.thrift"
 include "common/fb303/if/fb303.thrift"
 include "common/network/if/Address.thrift"
 include "fboss/agent/if/optic.thrift"
 include "fboss/agent/if/highres.thrift"
+include "fboss/qsfp_service/if/transceiver.thrift"
 
 typedef binary (cpp2.type = "::folly::fbstring") fbbinary
 typedef string (cpp2.type = "::folly::fbstring") fbstring
 
 const i32 DEFAULT_CTRL_PORT = 5909
+
+// Using the defaults from here:
+// https://en.wikipedia.org/wiki/Administrative_distance#Cisco
+enum AdminDistance {
+  DIRECTLY_CONNECTED = 0,
+  STATIC_ROUTE = 1,
+  EBGP = 20,
+  IBGP = 200,
+  MAX_ADMIN_DISTANCE = 255
+}
 
 struct IpPrefix {
   1: required Address.BinaryAddress ip,
@@ -22,6 +34,26 @@ struct IpPrefix {
 struct UnicastRoute {
   1: required IpPrefix dest,
   2: required list<Address.BinaryAddress> nextHopAddrs,
+  3: optional AdminDistance adminDistance,
+}
+
+struct ClientAndNextHops {
+  1: required i32 clientId,
+  2: required list<Address.BinaryAddress> nextHopAddrs,
+}
+
+struct IfAndIP {
+  1: required i32 interfaceID,
+  2: required Address.BinaryAddress ip,
+}
+
+struct RouteDetails {
+  1: required IpPrefix dest,
+  2: required string action,
+  3: required list<IfAndIP> fwdInfo,
+  4: required list<ClientAndNextHops> nextHopMulti,
+  5: required bool isConnected,
+  6: optional AdminDistance adminDistance,
 }
 
 struct ArpEntryThrift {
@@ -117,6 +149,7 @@ struct PortInfoThrift {
   11: PortCounters input,
   12: string name,
   13: string description,
+  14: bool fecEnabled, // Forward Error Correction port setting
 }
 
 struct NdpEntryThrift {
@@ -144,9 +177,16 @@ struct TransceiverIdxThrift {
 struct PortStatus {
   1: bool enabled,
   2: bool up,
+  // Deprecated, this should be retrieved from the qsfp_service
   3: optional bool present,
   4: optional TransceiverIdxThrift transceiverIdx,
   5: i64 speedMbps,
+}
+
+enum CaptureDirection {
+  CAPTURE_ONLY_RX = 0,
+  CAPTURE_ONLY_TX = 1,
+  CAPTURE_TX_RX = 2
 }
 
 struct CaptureInfo {
@@ -161,6 +201,7 @@ struct CaptureInfo {
    * large number of packets.
    */
   2: i32 maxPackets
+  3: CaptureDirection direction = CAPTURE_TX_RX
 }
 
 struct RouteUpdateLoggingInfo {
@@ -194,6 +235,13 @@ struct LinkNeighborThrift {
   12: optional string systemName
   13: optional string systemDescription
   14: optional string portDescription
+}
+
+enum StdClientIds {
+  BGPD = 0,
+  STATIC_ROUTE = 1,
+  INTERFACE_ROUTE = 2,
+  LINKLOCAL_ROUTE = 3,
 }
 
 service FbossCtrl extends fb303.FacebookService {
@@ -296,8 +344,13 @@ service FbossCtrl extends fb303.FacebookService {
   /*
    * Returns a list of IP route as per the route table for the
    * given address
+   *
+   * TODO (allwync): get rid of getIpRoute after agent code with thrift
+   * implementation of getIpRouteDetails is pushed everywhere
    */
   UnicastRoute getIpRoute(1: Address.Address addr 2: i32 vrfId)
+    throws (1: fboss.FbossBaseError error)
+  RouteDetails getIpRouteDetails(1: Address.Address addr 2: i32 vrfId)
     throws (1: fboss.FbossBaseError error)
   map<i32, InterfaceDetail> getAllInterfaces()
     throws (1: fboss.FbossBaseError error)
@@ -305,7 +358,15 @@ service FbossCtrl extends fb303.FacebookService {
     throws (1: fboss.FbossBaseError error) (thread='eb')
   list<string> getInterfaceList()
     throws (1: fboss.FbossBaseError error)
+  /*
+   * TODO (allwync): get rid of getRouteTable after agent code with thrift
+   * implementation of getRouteTableDetails is pushed everywhere
+   */
   list<UnicastRoute> getRouteTable()
+    throws (1: fboss.FbossBaseError error)
+  list<UnicastRoute> getRouteTableByClient(1: i16 clientId)
+    throws (1: fboss.FbossBaseError error)
+  list<RouteDetails> getRouteTableDetails()
     throws (1: fboss.FbossBaseError error)
   InterfaceDetail getInterfaceDetail(1: i32 interfaceId)
     throws (1: fboss.FbossBaseError error)
@@ -352,17 +413,10 @@ service FbossCtrl extends fb303.FacebookService {
   list<L2EntryThrift> getL2Table()
     throws (1: fboss.FbossBaseError error)
 
-  /*
-   * Returns all the DOM information
-   */
+  // Deprecated - use the qsfp_service instead
   map<i32, optic.SfpDom> getSfpDomInfo(1: list<i32> port)
     throws (1: fboss.FbossBaseError error)
-
-  /*
-   * Returns all transceiver info (both QSFP and SFP, and hopefully
-   * future devices)
-   */
-  map<i32, optic.TransceiverInfo> getTransceiverInfo(1: list<i32> idx)
+  map<i32, transceiver.TransceiverInfo> getTransceiverInfo(1: list<i32> idx)
     throws (1: fboss.FbossBaseError error)
 
   /*

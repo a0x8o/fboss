@@ -17,14 +17,14 @@ extern "C" {
 #include <folly/IPAddressV4.h>
 #include <folly/IPAddressV6.h>
 #include "fboss/agent/Constants.h"
-#include "fboss/agent/state/Route.h"
-#include "fboss/agent/state/RouteTypes.h"
 #include "fboss/agent/hw/bcm/BcmError.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmHost.h"
 #include "fboss/agent/hw/bcm/BcmIntf.h"
 #include "fboss/agent/hw/bcm/BcmPlatform.h"
 #include "fboss/agent/hw/bcm/BcmWarmBootCache.h"
+
+#include "fboss/agent/state/RouteTypes.h"
 
 namespace facebook { namespace fboss {
 
@@ -35,6 +35,11 @@ auto constexpr kForwardInfo = "forwardInfo";
 auto constexpr kMaskLen = "maskLen";
 auto constexpr kNetwork = "network";
 auto constexpr kRoutes = "routes";
+
+// Needed if we're in ALPM mode
+// TODO: Assumes we have only one VRF
+auto constexpr kDefaultVrf = 0;
+auto constexpr kDefaultMask = 0;
 }
 
 BcmRoute::BcmRoute(const BcmSwitch* hw, opennsl_vrf_t vrf,
@@ -76,7 +81,7 @@ bool BcmRoute::canUseHostTable() const {
   return isHostRoute() && hw_->getPlatform()->canUseHostTableForHostRoutes();
 }
 
-void BcmRoute::program(const RouteForwardInfo& fwd) {
+void BcmRoute::program(const RouteNextHopEntry& fwd) {
   // if the route has been programmed to the HW, check if the forward info is
   // changed or not. If not, nothing to do.
   if (added_ && fwd == fwd_) {
@@ -84,7 +89,7 @@ void BcmRoute::program(const RouteForwardInfo& fwd) {
   }
 
   // function to clean up the host reference
-  auto cleanupHost = [&] (const RouteForwardNexthops& nhopsClean) noexcept {
+  auto cleanupHost = [&] (const RouteNextHopSet& nhopsClean) noexcept {
     if (nhopsClean.size()) {
       hw_->writableHostTable()->derefBcmEcmpHost(vrf_, nhopsClean);
     }
@@ -100,7 +105,7 @@ void BcmRoute::program(const RouteForwardInfo& fwd) {
   } else {
     CHECK(action == RouteForwardAction::NEXTHOPS);
     // need to get an entry from the host table for the forward info
-    const RouteForwardNexthops& nhops = fwd.getNexthops();
+    const RouteNextHopSet& nhops = fwd.getNextHopSet();
     CHECK_GT(nhops.size(), 0);
     auto host = hw_->writableHostTable()->incRefOrCreateBcmEcmpHost(
         vrf_, nhops);
@@ -112,7 +117,7 @@ void BcmRoute::program(const RouteForwardInfo& fwd) {
   // route table or host table (if this is a host route and use of
   // host table for host routes is allowed by the chip).
   SCOPE_FAIL {
-    cleanupHost(fwd.getNexthops());
+    cleanupHost(fwd.getNextHopSet());
   };
   if (canUseHostTable()) {
     if (added_) {
@@ -141,7 +146,7 @@ void BcmRoute::program(const RouteForwardInfo& fwd) {
   }
   if (added_) {
     // the route was added before, need to free the old nexthop(s)
-    cleanupHost(fwd_.getNexthops());
+    cleanupHost(fwd_.getNextHopSet());
   }
   egressId_ = egressId;
   fwd_ = fwd;
@@ -151,7 +156,7 @@ void BcmRoute::program(const RouteForwardInfo& fwd) {
 }
 
 void BcmRoute::programHostRoute(opennsl_if_t egressId,
-    const RouteForwardInfo& fwd, bool replace) {
+    const RouteNextHopEntry& fwd, bool replace) {
   auto hostRouteHost = hw_->writableHostTable()->incRefOrCreateBcmHost(
       vrf_, prefix_, egressId);
   auto cleanupHostRoute = [=]() noexcept {
@@ -160,15 +165,15 @@ void BcmRoute::programHostRoute(opennsl_if_t egressId,
   SCOPE_FAIL {
     cleanupHostRoute();
   };
-  hostRouteHost->addBcmHost(fwd.getNexthops().size() > 1, replace);
+  hostRouteHost->addBcmHost(fwd.getNextHopSet().size() > 1, replace);
 }
 
 void BcmRoute::programLpmRoute(opennsl_if_t egressId,
-    const RouteForwardInfo& fwd) {
+    const RouteNextHopEntry& fwd) {
   opennsl_l3_route_t rt;
   initL3RouteT(&rt);
   rt.l3a_intf = egressId;
-  if (fwd.getNexthops().size() > 1) {         // multipath
+  if (fwd.getNextHopSet().size() > 1) {         // multipath
     rt.l3a_flags |= OPENNSL_L3_MULTIPATH;
   }
 
@@ -245,7 +250,7 @@ folly::dynamic BcmRoute::toFollyDynamic() const {
   route[kAction] = forwardActionStr(fwd_.getAction());
   // if many next hops, put ecmpEgressId = egressId
   // else put egressId = egressId
-  if (fwd_.getNexthops().size() > 1) {
+  if (fwd_.getNextHopSet().size() > 1) {
     route[kEcmp] = true;
     route[kEcmpEgressId] = egressId_;
   } else {
@@ -269,7 +274,7 @@ BcmRoute::~BcmRoute() {
     deleteLpmRoute(hw_->getUnit(), vrf_, prefix_, len_);
   }
   // decrease reference counter of the host entry for next hops
-  const auto& nhops = fwd_.getNexthops();
+  const auto& nhops = fwd_.getNextHopSet();
   if (nhops.size()) {
     hw_->writableHostTable()->derefBcmEcmpHost(vrf_, nhops);
   }
@@ -293,6 +298,7 @@ BcmRouteTable::BcmRouteTable(const BcmSwitch* hw) : hw_(hw) {
 }
 
 BcmRouteTable::~BcmRouteTable() {
+
 }
 
 BcmRoute* BcmRouteTable::getBcmRouteIf(
@@ -315,6 +321,37 @@ BcmRoute* BcmRouteTable::getBcmRoute(
   return rt;
 }
 
+void BcmRouteTable::addDefaultRoutes(bool warmBooted) {
+  // If ALPM is enabled, the first route programmed must be the default route
+  // Since we have no way of guaranteeing this with actual routes, program in
+  // a 'fake' default of 0.0.0.0/0 and ::/0
+  // When an actual default gets added, we replace this fake route
+  // If the default gets deleted, we add it back in
+  alpmEnabled_ = true;
+
+  // If we've warm booted, we already have routes programmed
+  if (!warmBooted) {
+    addRoute<RouteV4>(kDefaultVrf, defaultV4_.get());
+    addRoute<RouteV6>(kDefaultVrf, defaultV6_.get());
+  }
+}
+
+bool BcmRouteTable::isDefaultRouteV4(const Key& key) {
+  return key.mask == 0 && key.network == defaultV4_->prefix().network;
+}
+
+bool BcmRouteTable::isDefaultRouteV6(const Key& key) {
+  return key.mask == 0 && key.network == defaultV6_->prefix().network;
+}
+
+template<typename AddrT>
+const Route<AddrT>* BcmRouteTable::createDefaultRoute(const AddrT& ip) {
+  const typename Route<AddrT>::Prefix prefix {ip, kDefaultMask};
+  return new Route<AddrT>(
+      prefix, StdClientIds2ClientID(StdClientIds::STATIC_ROUTE),
+      RouteNextHopEntry(RouteForwardAction::DROP));
+}
+
 template<typename RouteT>
 void BcmRouteTable::addRoute(opennsl_vrf_t vrf, const RouteT *route) {
   const auto& prefix = route->prefix();
@@ -328,6 +365,7 @@ void BcmRouteTable::addRoute(opennsl_vrf_t vrf, const RouteT *route) {
                                         folly::IPAddress(prefix.network),
                                         prefix.mask));
   }
+  CHECK(route->isResolved());
   ret.first->second->program(route->getForwardInfo());
 }
 
@@ -339,13 +377,21 @@ void BcmRouteTable::deleteRoute(opennsl_vrf_t vrf, const RouteT *route) {
   if (iter == fib_.end()) {
     throw FbossError("Failed to delete a non-existing route ", route->str());
   }
-  fib_.erase(iter);
+  // We want to always be left with a default route in ALPM mode
+  // so if we're deleting it, add the default DROP route back
+  if (alpmEnabled_ && isDefaultRouteV4(key)) {
+    addRoute<RouteV4>(kDefaultVrf, defaultV4_.get());
+  } else if (alpmEnabled_ && isDefaultRouteV6(key)) {
+    addRoute<RouteV6>(kDefaultVrf, defaultV6_.get());
+  } else {
+    fib_.erase(iter);
+  }
 }
 
 folly::dynamic BcmRouteTable::toFollyDynamic() const {
-  std::vector<folly::dynamic> routesJson;
+  folly::dynamic routesJson = folly::dynamic::array;
   for (const auto& route : fib_) {
-    routesJson.emplace_back(route.second->toFollyDynamic());
+    routesJson.push_back(route.second->toFollyDynamic());
   }
   folly::dynamic routeTable = folly::dynamic::object;
   routeTable[kRoutes] = std::move(routesJson);

@@ -504,9 +504,9 @@ class RadixTree {
   Iterator exactMatchWithTrail(const IPADDRTYPE& ipaddr,
       uint8_t masklen, VecConstIterators& trail,
       bool includeNonValueNodes = false) {
-      return traits_.itrConstCast(
-        const_cast<const RadixTree*>(this)->exactMatchWithTrail(
-          ipaddr, masklen, trail, includeNonValueNodes));
+    return traits_.itrConstCast(
+      const_cast<const RadixTree*>(this)->exactMatchWithTrail(
+        ipaddr, masklen, trail, includeNonValueNodes));
   }
 
   // Compare 2 radix (sub) trees
@@ -546,13 +546,13 @@ class RadixTree {
 
   std::unique_ptr<TreeNode> makeNode(const IPADDRTYPE& ip,
       uint8_t masklen) {
-    return folly::make_unique<TreeNode>(ip, masklen, nodeDeleteCallback_);
+    return std::make_unique<TreeNode>(ip, masklen, nodeDeleteCallback_);
   }
 
   template<typename VALUE>
   std::unique_ptr<TreeNode> makeNode(const IPADDRTYPE& ip,
       uint8_t masklen, VALUE&& value) {
-    return folly::make_unique<TreeNode>(ip, masklen,
+    return std::make_unique<TreeNode>(ip, masklen,
                                         std::forward<VALUE>(value),
                                         nodeDeleteCallback_);
   }
@@ -985,7 +985,7 @@ class RadixTree<folly::IPAddress, T> {
    * match this prefix exactly
    */
   ConstIterator exactMatch(const folly::IPAddress& ipaddr,
-      uint8_t  masklen) const {
+      uint8_t masklen) const {
     if (ipaddr.isV4()) {
       auto itr = ipv4Tree_.exactMatch(ipaddr.asV4(), masklen);
       return itr.node4() ? itr : ipv4Tree_.traits().

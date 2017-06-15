@@ -10,48 +10,38 @@
 #pragma once
 
 #include "fboss/agent/platforms/wedge/WedgePlatform.h"
+#include "fboss/lib/usb/GalaxyI2CBus.h"
 
 #include <folly/Range.h>
 #include <memory>
 #include <map>
-#include <vector>
 
 namespace facebook { namespace fboss {
 
 class WedgeProductInfo;
-class Wedge100Port;
 
 class GalaxyPlatform : public WedgePlatform {
  public:
-  explicit GalaxyPlatform(std::unique_ptr<WedgeProductInfo> productInfo);
+  explicit GalaxyPlatform(std::unique_ptr<WedgeProductInfo> productInfo) :
+      WedgePlatform(std::move(productInfo)) {}
 
-  InitPortMap initPorts() override;
+  ~GalaxyPlatform() override {}
+
+  bool isBufferStatsCollectionSupported() const override {
+    return true;
+  }
  private:
-  static constexpr auto kNumFrontPanelPorts = 16;
-
   GalaxyPlatform(GalaxyPlatform const &) = delete;
   GalaxyPlatform& operator=(GalaxyPlatform const &) = delete;
 
-  using FrontPanelMapping = std::map<TransceiverID, PortID>;
-  using BackplanePorts = std::vector<PortID>;
-
-  bool isLC() const { return getMode() == WedgePlatformMode::LC; }
-  bool isFC() const { return getMode() == WedgePlatformMode::FC; }
-  FrontPanelMapping getFrontPanelMapping() const;
-  FrontPanelMapping getLCFrontPanelMapping() const;
-  FrontPanelMapping getFCFrontPanelMapping() const;
-  BackplanePorts getBackplanePorts() const;
-  BackplanePorts getLCBackplanePorts() const;
-  BackplanePorts getFCBackplanePorts() const;
+  std::unique_ptr<BaseWedgeI2CBus> getI2CBus() override {
+    return std::make_unique<GalaxyI2CBus>();
+  }
 
   std::map<std::string, std::string> loadConfig() override;
 
-  PortID fbossPortForQsfpChannel(int transceiver, int channel) override;
   folly::ByteRange defaultLed0Code() override;
   folly::ByteRange defaultLed1Code() override;
-
-  FrontPanelMapping frontPanelMapping_;
-
 };
 
 }}

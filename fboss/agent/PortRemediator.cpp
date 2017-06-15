@@ -10,15 +10,73 @@
 
 #include "fboss/agent/PortRemediator.h"
 #include "fboss/agent/FbossError.h"
+#include "fboss/agent/state/PortMap.h"
+#include "fboss/agent/state/SwitchState.h"
 
 namespace {
-constexpr int kPortRemedyIntervalSec = 1;
+constexpr int kPortRemedyIntervalSec = 25;
 }
 
 namespace facebook { namespace fboss {
 
+void PortRemediator::updatePortState(
+    PortID portId,
+    cfg::PortState newPortState,
+    bool preventCoalescing) {
+  auto updateFn =
+      [=](const std::shared_ptr<SwitchState>& state) {
+        std::shared_ptr<SwitchState> newState{state};
+        auto port = state->getPorts()->getPortIf(portId);
+        if (!port) {
+          LOG(WARNING) << "Could not flap port " << portId
+                       << " not found in port map";
+          return newState;
+        }
+        const auto newPort = port->modify(&newState);
+        newPort->setState(newPortState);
+        return newState;
+      };
+  auto name = folly::sformat(
+      "PortRemediator: flap down but enabled port {} ({})",
+      static_cast<uint16_t>(portId),
+      newPortState == cfg::PortState::UP ? "up" : "down");
+  if (preventCoalescing) {
+    sw_->updateStateNoCoalescing(name, updateFn);
+  } else {
+    sw_->updateState(name, updateFn);
+  }
+}
+
+boost::container::flat_set<PortID>
+PortRemediator::getUnexpectedDownPorts() const {
+  // TODO - Post t17304538, if Port::state == POWER_DOWN reflects
+  // Admin down always, then just use SwitchState to to determine
+  // which ports to ignore.
+  boost::container::flat_set<PortID> unexpectedDownPorts;
+  boost::container::flat_set<int> configEnabledPorts;
+  for (const auto& cfgPort : sw_->getConfig().ports) {
+    if (cfgPort.state != cfg::PortState::POWER_DOWN &&
+        cfgPort.state != cfg::PortState::DOWN) {
+      configEnabledPorts.insert(cfgPort.logicalID);
+    }
+  }
+  const auto portMap = sw_->getState()->getPorts();
+  for (const auto& port : *portMap) {
+    if (port &&
+        configEnabledPorts.find(port->getID()) != configEnabledPorts.end() &&
+        !(port->getOperState())) {
+      unexpectedDownPorts.insert(port->getID());
+    }
+  }
+  return unexpectedDownPorts;
+}
+
 void PortRemediator::timeoutExpired() noexcept {
-  sw_->getHw()->remedyPorts();
+  auto unexpectedDownPorts = getUnexpectedDownPorts();
+  for (const auto& portId : unexpectedDownPorts) {
+    updatePortState(portId, cfg::PortState::DOWN, true);
+    updatePortState(portId, cfg::PortState::UP, true);
+  }
   scheduleTimeout(interval_);
 }
 
@@ -26,6 +84,9 @@ PortRemediator::PortRemediator(SwSwitch* swSwitch)
     : AsyncTimeout(swSwitch->getBackgroundEVB()),
       sw_(swSwitch),
       interval_(kPortRemedyIntervalSec) {
+};
+
+void PortRemediator::init() {
   // Schedule the port remedy handler to run
   bool ret = sw_->getBackgroundEVB()->runInEventBaseThread(
       PortRemediator::start, (void*)this);

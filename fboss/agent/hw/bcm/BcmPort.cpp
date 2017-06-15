@@ -9,8 +9,7 @@
  */
 #include "fboss/agent/hw/bcm/BcmPort.h"
 
-#include <cstdlib>
-#include <cstring>
+#include <map>
 
 #include "common/stats/MonotonicCounter.h"
 #include "common/stats/ServiceData.h"
@@ -24,6 +23,7 @@
 #include "fboss/agent/hw/bcm/BcmPlatformPort.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmPortGroup.h"
+#include "fboss/agent/hw/bcm/gen-cpp2/hardware_stats_constants.h"
 
 extern "C" {
 #include <opennsl/link.h>
@@ -36,6 +36,28 @@ using std::chrono::seconds;
 using std::chrono::system_clock;
 using std::string;
 using std::shared_ptr;
+
+namespace {
+
+const string kInBytes = "in_bytes";
+const string kInUnicastPkts = "in_unicast_pkts";
+const string kInMulticastPkts = "in_multicast_pkts";
+const string kInBroadcastPkts = "in_broadcast_pkts";
+const string kInDiscards = "in_discards";
+const string kInErrors = "in_errors";
+const string kInPause = "in_pause_frames";
+const string kInIpv4HdrErrors = "in_ipv4_header_errors";
+const string kInIpv6HdrErrors = "in_ipv6_header_errors";
+const string kInNonPauseDiscards = "in_non_pause_discards";
+const string kOutBytes = "out_bytes";
+const string kOutUnicastPkts = "out_unicast_pkts";
+const string kOutMulticastPkts = "out_multicast_pkts";
+const string kOutBroadcastPkts = "out_broadcast_pkts";
+const string kOutDiscards = "out_discards";
+const string kOutErrors = "out_errors";
+const string kOutPause = "out_pause_frames";
+
+}
 
 namespace facebook { namespace fboss {
 
@@ -64,6 +86,121 @@ static const std::vector<opennsl_stat_val_t> kOutPktLengthStats = {
   snmpOpenNSLTransmittedPkts9217to16383Octets,
 };
 
+// This allows mapping from a speed and port transmission technology
+// to a broadcom supported interface
+static const std::map<cfg::PortSpeed,
+  std::map<TransmitterTechnology, opennsl_port_if_t> > kPortTypeMapping = {
+    {cfg::PortSpeed::HUNDREDG, {
+      {TransmitterTechnology::COPPER, OPENNSL_PORT_IF_CR4},
+      {TransmitterTechnology::OPTICAL, OPENNSL_PORT_IF_CAUI},
+      // What to default to
+      {TransmitterTechnology::UNKNOWN, OPENNSL_PORT_IF_CAUI}
+    }},
+    {cfg::PortSpeed::FIFTYG, {
+      // TODO(aeckert): CR2 does not exist in opennsl 6.3.6.
+      // Remove this ifdef once fully on 6.4.6
+#if defined(OPENNSL_PORT_IF_CR2)
+      {TransmitterTechnology::COPPER, OPENNSL_PORT_IF_CR2},
+      // What to default to
+      {TransmitterTechnology::UNKNOWN, OPENNSL_PORT_IF_CR2},
+#endif
+      {TransmitterTechnology::OPTICAL, OPENNSL_PORT_IF_CAUI}
+    }},
+    {cfg::PortSpeed::FORTYG, {
+      {TransmitterTechnology::COPPER, OPENNSL_PORT_IF_CR4},
+      {TransmitterTechnology::OPTICAL, OPENNSL_PORT_IF_XLAUI},
+      // What to default to
+      {TransmitterTechnology::UNKNOWN, OPENNSL_PORT_IF_XLAUI}
+    }},
+    {cfg::PortSpeed::TWENTYFIVEG, {
+      {TransmitterTechnology::COPPER, OPENNSL_PORT_IF_CR},
+      {TransmitterTechnology::OPTICAL, OPENNSL_PORT_IF_CAUI},
+      // What to default to
+      {TransmitterTechnology::UNKNOWN, OPENNSL_PORT_IF_CR}
+    }},
+    {cfg::PortSpeed::TWENTYG, {
+      {TransmitterTechnology::COPPER, OPENNSL_PORT_IF_CR},
+      // We don't expect 20G optics
+      // What to default to
+      {TransmitterTechnology::UNKNOWN, OPENNSL_PORT_IF_CR}
+    }},
+    {cfg::PortSpeed::XG, {
+      {TransmitterTechnology::COPPER, OPENNSL_PORT_IF_CR},
+      {TransmitterTechnology::OPTICAL, OPENNSL_PORT_IF_SFI},
+      // What to default to
+      {TransmitterTechnology::UNKNOWN, OPENNSL_PORT_IF_CR}
+    }},
+    {cfg::PortSpeed::GIGE, {
+      {TransmitterTechnology::COPPER, OPENNSL_PORT_IF_GMII},
+      // We don't expect 1G optics
+      // What to default to
+      {TransmitterTechnology::UNKNOWN, OPENNSL_PORT_IF_GMII}
+    }}
+};
+
+
+void BcmPort::updateName(const std::string& newName) {
+  if (newName == portName_) {
+    return;
+  }
+  portName_ = newName;
+  reinitPortStats();
+}
+
+BcmPort::MonotonicCounter* BcmPort::getPortCounterIf(const string& statKey) {
+  auto pcitr = portCounters_.find(statKey);
+  return pcitr != portCounters_.end() ? &pcitr->second : nullptr;
+}
+
+void BcmPort::reinitPortStat(const string& statKey) {
+  auto stat = getPortCounterIf(statKey);
+  if (!stat) {
+    portCounters_.emplace(statKey, MonotonicCounter({statName(statKey)}));
+  } else {
+    MonotonicCounter newStat{statName(statKey)};
+    stat->swap(newStat);
+  }
+}
+
+void BcmPort::reinitPortStats() {
+  if (!shouldReportStats()) {
+    return;
+  }
+
+  reinitPortStat(kInBytes);
+  reinitPortStat(kInUnicastPkts);
+  reinitPortStat(kInMulticastPkts);
+  reinitPortStat(kInBroadcastPkts);
+  reinitPortStat(kInDiscards);
+  reinitPortStat(kInErrors);
+  reinitPortStat(kInPause);
+  reinitPortStat(kInIpv4HdrErrors);
+  reinitPortStat(kInIpv6HdrErrors);
+  reinitPortStat(kInNonPauseDiscards);
+
+  reinitPortStat(kOutBytes);
+  reinitPortStat(kOutUnicastPkts);
+  reinitPortStat(kOutMulticastPkts);
+  reinitPortStat(kOutBroadcastPkts);
+  reinitPortStat(kOutDiscards);
+  reinitPortStat(kOutErrors);
+  reinitPortStat(kOutPause);
+  reinitPortStat(kOutCongestionDiscards);
+
+  // (re) init out queue length
+  auto statMap = fbData->getStatMap();
+  const auto expType = stats::AVG;
+  outQueueLen_ = statMap->getLockableStat(statName("out_queue_length"),
+                                          &expType);
+  // (re) init histograms
+  auto histMap = fbData->getHistogramMap();
+  stats::ExportedHistogram pktLenHist(1, 0, kInPktLengthStats.size());
+  inPktLengths_ = histMap->getOrCreateLockableHistogram(
+      statName("in_pkt_lengths"), &pktLenHist);
+  outPktLengths_ = histMap->getOrCreateLockableHistogram(
+      statName("out_pkt_lengths"), &pktLenHist);
+}
+
 BcmPort::BcmPort(BcmSwitch* hw, opennsl_port_t port,
                  BcmPlatformPort* platformPort)
     : hw_(hw),
@@ -77,16 +214,7 @@ BcmPort::BcmPort(BcmSwitch* hw, opennsl_port_t port,
   disablePause();
 
   // Initialize our stats data structures
-  auto statMap = fbData->getStatMap();
-  const auto expType = stats::AVG;
-  outQueueLen_ = statMap->getLockableStat(statName("out_queue_length"),
-                                          &expType);
-  auto histMap = fbData->getHistogramMap();
-  stats::ExportedHistogram pktLenHist(1, 0, kInPktLengthStats.size());
-  inPktLengths_ = histMap->getOrCreateLockableHistogram(
-      statName("in_pkt_lengths"), &pktLenHist);
-  outPktLengths_ = histMap->getOrCreateLockableHistogram(
-      statName("out_pkt_lengths"), &pktLenHist);
+  reinitPortStats();
 
   setConfiguredMaxSpeed();
 
@@ -113,7 +241,9 @@ void BcmPort::init(bool warmBoot) {
     bcmCheckError(rv, "failed to set port to known state: ", port_);
   }
 
-  setPortStatus(up);
+  // Notify platform port of initial state/speed
+  getPlatformPort()->linkSpeedChanged(getSpeed());
+  getPlatformPort()->linkStatusChanged(up, isEnabled());
 
   // Linkscan should be enabled if the port is enabled already
   auto linkscan = isEnabled() ? OPENNSL_LINKSCAN_MODE_SW :
@@ -224,7 +354,13 @@ void BcmPort::enable(const std::shared_ptr<Port>& swPort) {
 void BcmPort::program(const shared_ptr<Port>& port) {
   setIngressVlan(port);
   setSpeed(port);
+  // Update FEC settings if needed. Note this is not only
+  // on speed change as the port's default speed (say on a
+  // cold boot) maybe what is desired by the config. But we
+  // may still need to enable FEC
   setFEC(port);
+  getPlatformPort()->linkStatusChanged(port->getOperState(),
+      !port->isAdminDisabled());
 }
 
 void BcmPort::setIngressVlan(const shared_ptr<Port>& swPort) {
@@ -243,47 +379,34 @@ void BcmPort::setIngressVlan(const shared_ptr<Port>& swPort) {
 opennsl_port_if_t BcmPort::getDesiredInterfaceMode(cfg::PortSpeed speed,
                                                    PortID id,
                                                    std::string name) {
-  static constexpr const char* sixPackLCFabricPortPrefix = "fab";
-  switch (speed) {
-  case cfg::PortSpeed::HUNDREDG:
-    return OPENNSL_PORT_IF_CR4;
-  case cfg::PortSpeed::FIFTYG:
-    // TODO(aeckert): CR2 does not exist in opennsl 6.3.6.
-    // Remove this ifdef once fully on 6.4.6
-#if defined(OPENNSL_PORT_IF_CR2)
-    return OPENNSL_PORT_IF_CR2;
-#else
+  TransmitterTechnology transmitterTech =
+    getPlatformPort()->getTransmitterTech();
+  // 6pack backplane ports will report tech as unknown because this
+  // information can't be retrieved via qsfp. These are actually copper,
+  // and so should use that instead of any potential default value
+  if (name.find("fab") == 0) {
+    transmitterTech = TransmitterTechnology::COPPER;
+  }
+
+  // If speed or transmitter type isn't in map
+  try {
+    return kPortTypeMapping.at(speed).at(transmitterTech);
+  } catch (const std::out_of_range& ex) {
     throw FbossError("Unsupported speed (", speed,
-                     ") setting on port ", id);
-#endif
-  case cfg::PortSpeed::FORTYG:
-    // TODO: Currently, we are finding if the port is backplane port or not by
-    // its name. A better way is to include this information in the config:
-    // t9112164.
-    if (name.find(sixPackLCFabricPortPrefix) == 0) {
-      return OPENNSL_PORT_IF_CR4;
-    } else {
-      return OPENNSL_PORT_IF_SR4;
-    }
-  case cfg::PortSpeed::TWENTYFIVEG:
-    return OPENNSL_PORT_IF_CR;
-  case cfg::PortSpeed::TWENTYG:
-  case cfg::PortSpeed::XG:
-    return OPENNSL_PORT_IF_SFI;
-  case cfg::PortSpeed::GIGE:
-    return OPENNSL_PORT_IF_GMII;
-  default:
-    throw FbossError("Unsupported speed (", speed,
+                     ") or transmitter technology (", transmitterTech,
                      ") setting on port ", id);
   }
 }
 
+cfg::PortSpeed BcmPort::getSpeed() {
+  int curSpeed{0};
+  auto rv = opennsl_port_speed_get(unit_, port_, &curSpeed);
+  bcmCheckError(
+    rv, "Failed to get current speed for port ", port_);
+  return cfg::PortSpeed(curSpeed);
+}
+
 void BcmPort::setSpeed(const shared_ptr<Port>& swPort) {
-  if (isEnabled()) {
-    LOG(ERROR) << "Cannot set port speed while the port is enabled. Port: "
-               << swPort->getName() << " id: " << swPort->getID();
-    return;
-  }
   int ret;
   cfg::PortSpeed desiredPortSpeed;
   if (swPort->getSpeed() == cfg::PortSpeed::DEFAULT) {
@@ -295,56 +418,76 @@ void BcmPort::setSpeed(const shared_ptr<Port>& swPort) {
     desiredPortSpeed = swPort->getSpeed();
   }
 
-  opennsl_port_if_t desiredMode = getDesiredInterfaceMode(desiredPortSpeed,
-                                                          swPort->getID(),
-                                                          swPort->getName());
-
-  opennsl_port_if_t curMode;
-  ret = opennsl_port_interface_get(unit_, port_, &curMode);
-  bcmCheckError(ret,
-                "Failed to get current interface setting for port ",
-                swPort->getID());
-
-  bool updateSpeed = false;
-
-  if (curMode != desiredMode) {
-    ret = opennsl_port_interface_set(unit_, port_, desiredMode);
-    bcmCheckError(
-        ret, "failed to set interface type for port ", swPort->getID());
-    // Changes to the interface setting only seem to take effect on the next
-    // call to opennsl_port_speed_set().  Therefore make sure we update the
-    // speed below, even if the speed is already at the desired setting.
-    updateSpeed = true;
-  }
-
   int desiredSpeed = static_cast<int>(desiredPortSpeed);
   // Unnecessarily updating BCM port speed actually causes
   // the port to flap, even if this should be a noop, so check current
   // speed before making speed related changes. Doing so fixes
   // the interface flaps we were seeing during warm boots
 
-  int curSpeed{0};
-  ret = opennsl_port_speed_get(unit_, port_, &curSpeed);
-  bcmCheckError(
-    ret, "Failed to get current speed for port ", swPort->getID());
+  int curSpeed = static_cast<int>(getSpeed());
 
-  if (!updateSpeed && desiredMode != OPENNSL_PORT_IF_KR4) {
-    updateSpeed |= (curSpeed != desiredSpeed);
-  }
+  // If the port is down or disabled its safe to update mode and speed to
+  // desired values
+  bool portDown = getState() != cfg::PortState::UP;
 
-  if (updateSpeed) {
-    if (desiredMode == OPENNSL_PORT_IF_KR4) {
-      // We don't need to set speed when mode is KR4, since ports in KR4 mode
-      // do autonegotiation to figure out the speed.
-      setKR4Ability();
-    } else {
-      ret = opennsl_port_speed_set(unit_, port_, desiredSpeed);
-      bcmCheckError(ret,
-                    "failed to set speed to ",
-                    desiredSpeed, " from ", curSpeed,
-                    ", on port ",
-                    swPort->getID());
+  // Update to correct mode and speed settings if the port is down/disabled
+  // or if the speed changed. Ideally we would like to always update to the
+  // desired mode and speed. However these changes are disruptive, in that
+  // they cause a port flap. So to avoid that, we don't update to desired
+  // mode if the port is UP and running at the desired speed. Speed changes
+  // though are applied to UP ports as well, since running at wrong (lower than
+  // desired) speed is pretty dangerous, and can trigger non obvious outages.
+  //
+  // Another practical reason for not updating to the desired mode on ports that
+  // are UP is that there is at least one bug whereby SDK thinks that the ports
+  // are in a different mode than they actually are. We are tracking that
+  // separately. Once that is resolved, we can do a audit to see that if all
+  // ports are in desired mode settings, we can make mode changes a first
+  // class citizen as well.
+  if (portDown || curSpeed != desiredSpeed) {
+    opennsl_port_if_t desiredMode = getDesiredInterfaceMode(desiredPortSpeed,
+                                                        swPort->getID(),
+                                                        swPort->getName());
+
+    // Check whether we have the correct interface set
+    opennsl_port_if_t curMode;
+    ret = opennsl_port_interface_get(unit_, port_, &curMode);
+    bcmCheckError(ret,
+                  "Failed to get current interface setting for port ",
+                  swPort->getID());
+
+    if (curMode != desiredMode) {
+      // Changes to the interface setting only seem to take effect on the next
+      // call to opennsl_port_speed_set()
+      ret = opennsl_port_interface_set(unit_, port_, desiredMode);
+      bcmCheckError(
+          ret, "failed to set interface type for port ", swPort->getID());
     }
+
+    if (!portDown) {
+      // Changing the port speed causes traffic disruptions, but not doing
+      // it would cause inconsistency.  Warn the user.
+      LOG(WARNING) << "Changing port speed on up port. This will "
+                   << "disrupt traffic. Port: " << swPort->getName()
+                   << " id: " << swPort->getID();
+    }
+
+    // Note that we call speed_set even if the speed is already set
+    // properly and port is down. This is because speed_set
+    // reinitializes the MAC layer of the port and allows us to pick
+    // up changes in interface mode and finalize flex port
+    // transitions. We ensure that the port is down for these
+    // potentially unnecessary calls, as otherwise this will cause
+    // port flaps on ports where link is up.
+    ret = opennsl_port_speed_set(unit_, port_, desiredSpeed);
+    bcmCheckError(
+      ret,
+      "failed to set speed to ",
+      desiredSpeed,
+      " from ",
+      curSpeed,
+      ", on port ",
+      swPort->getID());
     getPlatformPort()->linkSpeedChanged(desiredPortSpeed);
   }
 }
@@ -367,15 +510,6 @@ std::shared_ptr<Port> BcmPort::getSwitchStatePortIf(
   return state->getPorts()->getPortIf(getPortID());
 }
 
-void BcmPort::setPortStatus(bool up) {
-  int enabled = 1;
-  int rv = opennsl_port_enable_get(unit_, port_, &enabled);
-  // We ignore the return value.  If we fail to get the port status
-  // we just tell the platformPort_ that it is enabled.
-
-  platformPort_->linkStatusChanged(up, enabled);
-}
-
 void BcmPort::registerInPortGroup(BcmPortGroup* portGroup) {
   portGroup_ = portGroup;
   VLOG(2) << "Port " << getPortID() << " registered in PortGroup with "
@@ -383,29 +517,121 @@ void BcmPort::registerInPortGroup(BcmPortGroup* portGroup) {
 }
 
 std::string BcmPort::statName(folly::StringPiece name) const {
-  return folly::to<string>("port", platformPort_->getPortID(), ".", name);
+  if (portName_.empty()) {
+    return folly::to<string>("port", platformPort_->getPortID(), ".", name);
+  }
+  return folly::to<string>(portName_, ".", name);
 }
 
 void BcmPort::updateStats() {
   // TODO: It would be nicer to use a monotonic clock, but unfortunately
   // the ServiceData code currently expects everyone to use system time.
+  if (!shouldReportStats()) {
+    return;
+  }
   auto now = duration_cast<seconds>(system_clock::now().time_since_epoch());
+  HwPortStats curPortStats;
+  updateStat(
+      now, kInBytes, opennsl_spl_snmpIfHCInOctets, &curPortStats.inBytes_);
+  updateStat(
+      now,
+      kInUnicastPkts,
+      opennsl_spl_snmpIfHCInUcastPkts,
+      &curPortStats.inUnicastPkts_);
+  updateStat(
+      now,
+      kInMulticastPkts,
+      opennsl_spl_snmpIfHCInMulticastPkts,
+      &curPortStats.inMulticastPkts_);
+  updateStat(
+      now,
+      kInBroadcastPkts,
+      opennsl_spl_snmpIfHCInBroadcastPkts,
+      &curPortStats.inBroadcastPkts_);
+  updateStat(
+      now,
+      kInDiscards,
+      opennsl_spl_snmpIfInDiscards,
+      &curPortStats.inDiscards_);
+  updateStat(
+      now, kInErrors, opennsl_spl_snmpIfInErrors, &curPortStats.inErrors_);
+  updateStat(
+      now,
+      kInIpv4HdrErrors,
+      opennsl_spl_snmpIpInHdrErrors,
+      &curPortStats.inIpv4HdrErrors_);
+  updateStat(
+      now,
+      kInIpv6HdrErrors,
+      opennsl_spl_snmpIpv6IfStatsInHdrErrors,
+      &curPortStats.inIpv6HdrErrors_);
+  updateStat(
+      now,
+      kInPause,
+      opennsl_spl_snmpDot3InPauseFrames,
+      &curPortStats.inPause_);
+  // Egress Stats
+  updateStat(
+      now, kOutBytes, opennsl_spl_snmpIfHCOutOctets, &curPortStats.outBytes_);
+  updateStat(
+      now,
+      kOutUnicastPkts,
+      opennsl_spl_snmpIfHCOutUcastPkts,
+      &curPortStats.outUnicastPkts_);
+  updateStat(
+      now,
+      kOutMulticastPkts,
+      opennsl_spl_snmpIfHCOutMulticastPkts,
+      &curPortStats.outMulticastPkts_);
+  updateStat(
+      now,
+      kOutBroadcastPkts,
+      opennsl_spl_snmpIfHCOutBroadcastPckts,
+      &curPortStats.outBroadcastPkts_);
+  updateStat(
+      now,
+      kOutDiscards,
+      opennsl_spl_snmpIfOutDiscards,
+      &curPortStats.outDiscards_);
+  updateStat(
+      now, kOutErrors, opennsl_spl_snmpIfOutErrors, &curPortStats.outErrors_);
+  updateStat(
+      now,
+      kOutPause,
+      opennsl_spl_snmpDot3OutPauseFrames,
+      &curPortStats.outPause_);
 
-  updateStat(now, &inBytes_, opennsl_spl_snmpIfHCInOctets);
-  updateStat(now, &inUnicastPkts_, opennsl_spl_snmpIfHCInUcastPkts);
-  updateStat(now, &inMulticastPkts_, opennsl_spl_snmpIfHCInMulticastPkts);
-  updateStat(now, &inBroadcastPkts_, opennsl_spl_snmpIfHCInBroadcastPkts);
-  updateStat(now, &inDiscards_, opennsl_spl_snmpIfInDiscards);
-  updateStat(now, &inErrors_, opennsl_spl_snmpIfInErrors);
-
-  updateStat(now, &outBytes_, opennsl_spl_snmpIfHCOutOctets);
-  updateStat(now, &outUnicastPkts_, opennsl_spl_snmpIfHCOutUcastPkts);
-  updateStat(now, &outMulticastPkts_, opennsl_spl_snmpIfHCOutMulticastPkts);
-  updateStat(now, &outBroadcastPkts_, opennsl_spl_snmpIfHCOutBroadcastPckts);
-  updateStat(now, &outDiscards_, opennsl_spl_snmpIfOutDiscards);
-  updateStat(now, &outErrors_, opennsl_spl_snmpIfOutErrors);
-
-  setAdditionalStats(now);
+  setAdditionalStats(now, &curPortStats);
+  // Compute non pause discards
+  const auto kUninit = hardware_stats_constants::STAT_UNINITIALIZED();
+  if (isMmuLossy() && portStats_.inDiscards_ != kUninit &&
+      portStats_.inPause_ != kUninit) {
+    // If MMU setup as lossy, all incoming pause frames will be
+    // discarded and will count towards in discards. This makes in discards
+    // counter somewhat useless. So instead calculate "in_non_pause_discards",
+    // as std::max(0, (inDiscardsSincePrev - inPauseSincePrev)).
+    // std::max(..) is used, since stats from  h/w are synced non atomically,
+    // So depending on what get synced later # of pause maybe be slightly
+    // higher than # of discards.
+    auto inPauseSincePrev = curPortStats.inPause_ - portStats_.inPause_;
+    auto inDiscardsSincePrev =
+        curPortStats.inDiscards_ - portStats_.inDiscards_;
+    if (inPauseSincePrev >= 0 && inDiscardsSincePrev >=0) {
+      // Account for counter rollover.
+      auto inNonPauseDiscardsSincePrev =
+          std::max(0L, (inDiscardsSincePrev - inPauseSincePrev));
+      // Init current port stats from prev value or 0
+      curPortStats.inNonPauseDiscards_ =
+          (portStats_.inNonPauseDiscards_ == kUninit
+               ? 0
+               : portStats_.inNonPauseDiscards_);
+      // Counters are cumalative
+      curPortStats.inNonPauseDiscards_ += inNonPauseDiscardsSincePrev;
+      auto inNonPauseDiscards = getPortCounterIf(kInNonPauseDiscards);
+      inNonPauseDiscards->updateValue(now, curPortStats.inNonPauseDiscards_);
+    }
+  }
+  portStats_ = curPortStats;
 
   // Update the queue length stat
   uint32_t qlength;
@@ -426,20 +652,28 @@ void BcmPort::updateStats() {
   updatePktLenHist(now, &outPktLengths_, kOutPktLengthStats);
 };
 
-void BcmPort::updateStat(std::chrono::seconds now,
-                         stats::MonotonicCounter* stat,
-                         opennsl_stat_val_t type) {
+void BcmPort::updateStat(
+    std::chrono::seconds now,
+    const string& statKey,
+    opennsl_stat_val_t type,
+    int64_t* statVal) {
+  auto stat = getPortCounterIf(statKey);
   // Use the non-sync API to just get the values accumulated in software.
   // The Broadom SDK's counter thread syncs the HW counters to software every
   // 500000us (defined in config.bcm).
   uint64_t value;
   auto ret = opennsl_stat_get(unit_, port_, type, &value);
   if (OPENNSL_FAILURE(ret)) {
-    LOG(ERROR) << "Failed to get stat " << type << " for port " << port_
-               << " :" << opennsl_errmsg(ret);
+    LOG(ERROR) << "Failed to get stat " << type << " for port " << port_ << " :"
+               << opennsl_errmsg(ret);
     return;
   }
   stat->updateValue(now, value);
+  *statVal = value;
+}
+
+bool BcmPort::isMmuLossy() const {
+  return hw_->getMmuState() == BcmSwitch::MmuState::MMU_LOSSY;
 }
 
 void BcmPort::updatePktLenHist(
@@ -468,15 +702,12 @@ void BcmPort::updatePktLenHist(
 }
 
 cfg::PortState BcmPort::getState() {
-  int rv;
-  int enabled;
-  int linkStatus;
-  rv = opennsl_port_enable_get(hw_->getUnit(), port_, &enabled);
-  bcmCheckError(rv, "could not find if port ", port_, " is enabled or not...");
-  if (!enabled) {
+  if (!isEnabled()) {
     return cfg::PortState::POWER_DOWN;
   }
-  rv = opennsl_port_link_status_get(hw_->getUnit(), port_, &linkStatus);
+
+  int linkStatus;
+  auto rv = opennsl_port_link_status_get(hw_->getUnit(), port_, &linkStatus);
   bcmCheckError(rv, "could not find if the port ", port_, " is up or down...");
   if (linkStatus == OPENNSL_PORT_LINK_STATUS_UP) {
     return cfg::PortState::UP;
@@ -484,5 +715,21 @@ cfg::PortState BcmPort::getState() {
     return cfg::PortState::DOWN;
   }
 }
+
+/**
+  * TODO(rsher)
+  * comment back in when we move to the newer OpenNSL
+
+bool BcmPort::isFECEnabled() {
+  int value;
+  opennsl_port_phy_control_get(
+      unit_,
+      port_,
+      OPENNSL_PORT_PHY_CONTROL_FORWARD_ERROR_CORRECTION,
+      &value);
+  return (value == OPENNSL_PORT_PHY_CONTROL_FEC_ON);
+}
+
+*/
 
 }} // namespace facebook::fboss

@@ -8,7 +8,6 @@
  *
  */
 #include "BcmWarmBootCache.h"
-#include <limits>
 #include <string>
 #include <utility>
 
@@ -18,21 +17,22 @@
 #include <folly/json.h>
 
 #include "fboss/agent/Constants.h"
+#include "fboss/agent/SysError.h"
 #include "fboss/agent/hw/bcm/BcmEgress.h"
+#include "fboss/agent/hw/bcm/BcmError.h"
 #include "fboss/agent/hw/bcm/BcmPlatform.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
-#include "fboss/agent/hw/bcm/BcmError.h"
 #include "fboss/agent/hw/bcm/Utils.h"
-#include "fboss/agent/state/Interface.h"
-#include "fboss/agent/state/Port.h"
 #include "fboss/agent/state/ArpTable.h"
+#include "fboss/agent/state/Interface.h"
+#include "fboss/agent/state/InterfaceMap.h"
 #include "fboss/agent/state/NdpTable.h"
 #include "fboss/agent/state/NeighborEntry.h"
-#include "fboss/agent/state/InterfaceMap.h"
-#include "fboss/agent/SysError.h"
+#include "fboss/agent/state/Port.h"
+#include "fboss/agent/state/PortDescriptor.h"
+#include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/state/Vlan.h"
 #include "fboss/agent/state/VlanMap.h"
-#include "fboss/agent/state/SwitchState.h"
 
 using std::make_pair;
 using std::make_tuple;
@@ -73,7 +73,7 @@ folly::IPAddress getFullMaskIPv6Address() {
 
 namespace facebook { namespace fboss {
 
-BcmWarmBootCache::BcmWarmBootCache(const BcmSwitch* hw)
+BcmWarmBootCache::BcmWarmBootCache(const BcmSwitchIf* hw)
     : hw_(hw),
       dropEgressId_(BcmEgressBase::INVALID),
       toCPUEgressId_(BcmEgressBase::INVALID) {}
@@ -92,7 +92,9 @@ shared_ptr<InterfaceMap> BcmWarmBootCache::reconstructInterfaceMap() const {
                                                VlanID(bcmIntf.l3a_vid),
                                                dumpedInterfaceName,
                                                vlanMacAndIntf.first.second,
-                                               bcmIntf.l3a_mtu);
+                                               bcmIntf.l3a_mtu,
+                                               false, /* is virtual intf */
+                                               false  /* is state_sync off*/);
     newInterface->setAddresses(dumpedInterface->getAddresses());
     intfMap->addInterface(newInterface);
   }
@@ -155,26 +157,22 @@ shared_ptr<VlanMap> BcmWarmBootCache::reconstructVlanMap() const {
       titr = vlan2AddrTables.insert(make_pair(vlanId, AddrTables())).first;
     }
 
-    // If we have a drop entry programmed for an existing host, it is a
-    // pending entry
     if (ip.isV4()) {
       auto arpTable = titr->second.arpTable;
-      if (BcmEgress::programmedToDrop(bcmEgress)) {
-        arpTable->addPendingEntry(ip.asV4(), InterfaceID(bcmEgress.vlan));
-      } else {
-        arpTable->addEntry(ip.asV4(), macFromBcm(bcmEgress.mac_addr),
-                           PortID(bcmEgress.port), InterfaceID(bcmEgress.vlan),
-                           NeighborState::UNVERIFIED);
-      }
+      arpTable->addEntry(
+          ip.asV4(),
+          macFromBcm(bcmEgress.mac_addr),
+          PortDescriptor(PortID(bcmEgress.port)),
+          InterfaceID(bcmEgress.vlan),
+          NeighborState::UNVERIFIED);
     } else {
       auto ndpTable = titr->second.ndpTable;
-      if (BcmEgress::programmedToDrop(bcmEgress)) {
-        ndpTable->addPendingEntry(ip.asV6(), InterfaceID(bcmEgress.vlan));
-      } else {
-        ndpTable->addEntry(ip.asV6(), macFromBcm(bcmEgress.mac_addr),
-                           PortID(bcmEgress.port), InterfaceID(bcmEgress.vlan),
-                           NeighborState::UNVERIFIED);
-      }
+      ndpTable->addEntry(
+          ip.asV6(),
+          macFromBcm(bcmEgress.mac_addr),
+          PortDescriptor(PortID(bcmEgress.port)),
+          InterfaceID(bcmEgress.vlan),
+          NeighborState::UNVERIFIED);
     }
   }
   for (auto vlanAndAddrTable: vlan2AddrTables) {
@@ -222,16 +220,16 @@ folly::dynamic BcmWarmBootCache::toFollyDynamic() const {
   // For now we serialize only the hwSwitchEcmp2EgressIds_ table.
   // This is the only thing we need and may not be able to get
   // from HW in the case where we shut down before doing a FIB sync.
-  std::vector<folly::dynamic> ecmps;
+  folly::dynamic ecmps = folly::dynamic::array;
   for (auto& ecmpAndEgressIds : hwSwitchEcmp2EgressIds_) {
     folly::dynamic ecmp = folly::dynamic::object;
     ecmp[kEcmpEgressId] = ecmpAndEgressIds.first;
-    std::vector<folly::dynamic> paths;
+    folly::dynamic paths = folly::dynamic::array;
     for (auto path : ecmpAndEgressIds.second) {
-      paths.emplace_back(path);
+      paths.push_back(path);
     }
     ecmp[kPaths] = std::move(paths);
-    ecmps.emplace_back(std::move(ecmp));
+    ecmps.push_back(std::move(ecmp));
   }
   warmBootCache[kEcmpObjects] = std::move(ecmps);
   return warmBootCache;

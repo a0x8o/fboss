@@ -9,7 +9,7 @@
  */
 #pragma once
 
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/state/NodeBase.h"
 #include <folly/MacAddress.h>
@@ -26,15 +26,23 @@ class SwitchState;
 struct InterfaceFields {
   typedef boost::container::flat_map<folly::IPAddress, uint8_t> Addresses;
 
-  InterfaceFields(InterfaceID id, RouterID router, VlanID vlan,
-                  folly::StringPiece name, folly::MacAddress mac,
-                  int mtu)
-    : id(id),
-      routerID(router),
-      vlanID(vlan),
-      name(name.data(), name.size()),
-      mac(mac),
-      mtu(mtu) {}
+  InterfaceFields(
+      InterfaceID id,
+      RouterID router,
+      VlanID vlan,
+      folly::StringPiece name,
+      folly::MacAddress mac,
+      int mtu,
+      bool isVirtual,
+      bool isStateSyncDisabled)
+      : id(id),
+        routerID(router),
+        vlanID(vlan),
+        name(name.data(), name.size()),
+        mac(mac),
+        mtu(mtu),
+        isVirtual(isVirtual),
+        isStateSyncDisabled(isStateSyncDisabled) {}
 
   /*
    * Deserialize from a folly::dynamic object
@@ -56,6 +64,8 @@ struct InterfaceFields {
   Addresses addrs;
   cfg::NdpConfig ndp;
   int mtu;
+  bool isVirtual{false};
+  bool isStateSyncDisabled{false};
 };
 
 /*
@@ -65,10 +75,17 @@ class Interface : public NodeBaseT<Interface, InterfaceFields> {
  public:
   typedef InterfaceFields::Addresses Addresses;
 
-  Interface(InterfaceID id, RouterID router, VlanID vlan,
-            folly::StringPiece name, folly::MacAddress mac,
-            int mtu)
-    : NodeBaseT(id, router, vlan, name, mac, mtu) {}
+  Interface(
+      InterfaceID id,
+      RouterID router,
+      VlanID vlan,
+      folly::StringPiece name,
+      folly::MacAddress mac,
+      int mtu,
+      bool isVirtual,
+      bool isStateSyncDisabled)
+      : NodeBaseT(id, router, vlan, name, mac, mtu, isVirtual,
+                  isStateSyncDisabled) {}
 
   static std::shared_ptr<Interface>
   fromFollyDynamic(const folly::dynamic& json) {
@@ -122,6 +139,20 @@ class Interface : public NodeBaseT<Interface, InterfaceFields> {
   }
   void setMac(folly::MacAddress mac) {
     writableFields()->mac = mac;
+  }
+
+  bool isVirtual() const {
+    return getFields()->isVirtual;
+  }
+  void setIsVirtual(bool isVirtual) {
+    writableFields()->isVirtual = isVirtual;
+  }
+
+  bool isStateSyncDisabled() const {
+    return getFields()->isStateSyncDisabled;
+  }
+  void setIsStateSyncDisabled(bool isStateSyncDisabled) {
+    writableFields()->isStateSyncDisabled = isStateSyncDisabled;
   }
 
   const Addresses& getAddresses() const {

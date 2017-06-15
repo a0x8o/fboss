@@ -16,7 +16,8 @@ extern "C" {
 
 #include "fboss/agent/types.h"
 #include "fboss/agent/hw/bcm/BcmPort.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/state/Port.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 #include <mutex>
 #include <boost/container/flat_map.hpp>

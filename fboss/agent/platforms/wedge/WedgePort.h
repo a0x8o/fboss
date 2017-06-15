@@ -8,16 +8,23 @@
  *
  */
 #pragma once
+#include <folly/Optional.h>
 
 #include "fboss/agent/hw/bcm/BcmPlatformPort.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
-#include "fboss/agent/QsfpModule.h"
+#include "fboss/agent/hw/bcm/BcmPort.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 namespace facebook { namespace fboss {
 
+class WedgePlatform;
+
 class WedgePort : public BcmPlatformPort {
  protected:
-  explicit WedgePort(PortID id);
+  WedgePort(PortID id,
+            WedgePlatform* platform,
+            folly::Optional<TransceiverID> frontPanelPort,
+            folly::Optional<ChannelID> channel,
+            const XPEs& egressXPEs);
 
  public:
   PortID getPortID() const override { return id_; }
@@ -25,10 +32,6 @@ class WedgePort : public BcmPlatformPort {
   void setBcmPort(BcmPort* port) override;
   BcmPort* getBcmPort() const override {
     return bcmPort_;
-  }
-
-  void setQsfp(QsfpModule* qsfp) {
-    qsfp_= qsfp;
   }
 
   void preDisable(bool temporary) override;
@@ -40,16 +43,32 @@ class WedgePort : public BcmPlatformPort {
                         bool ingress, bool egress,
                         bool discards, bool errors) override;
   void linkSpeedChanged(const cfg::PortSpeed& speed) override;
+  void linkStatusChanged(bool up, bool adminUp) override;
+
+  virtual folly::Optional<TransceiverID> getTransceiverID() const {
+    return frontPanelPort_;
+  }
+  virtual folly::Optional<ChannelID> getChannel() const {
+    return channel_;
+  }
+  TransmitterTechnology getTransmitterTech() const override;
+
  private:
   // Forbidden copy constructor and assignment operator
   WedgePort(WedgePort const &) = delete;
   WedgePort& operator=(WedgePort const &) = delete;
 
  protected:
+  void customizeTransceiver();
+  bool isControllingPort() const;
+  bool shouldCustomizeTransceiver() const;
+
   PortID id_{0};
+  WedgePlatform* platform_{nullptr};
+  cfg::PortSpeed speed_{cfg::PortSpeed::DEFAULT};
+  folly::Optional<TransceiverID> frontPanelPort_;
+  folly::Optional<ChannelID> channel_;
   BcmPort* bcmPort_{nullptr};
-  // This is owned by SwSwitch
-  QsfpModule* qsfp_{nullptr};
 };
 
 }} // facebook::fboss

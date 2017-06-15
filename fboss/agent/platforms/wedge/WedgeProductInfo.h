@@ -16,8 +16,6 @@ namespace facebook { namespace fboss {
 
 enum class WedgePlatformMode {
   WEDGE,
-  LC,
-  FC,
   WEDGE100,
   GALAXY_LC,
   GALAXY_FC,
@@ -38,9 +36,11 @@ class WedgeProductInfo {
   WedgeProductInfo(WedgeProductInfo const &) = delete;
   WedgeProductInfo& operator=(WedgeProductInfo const &) = delete;
 
-  void initFromHostname();
+  void setFBSerial();
+  void initFromFbWhoAmI();
   void initMode();
   void parse(std::string data);
+
   ProductInfo productInfo_;
   folly::StringPiece path_;
   WedgePlatformMode mode_;

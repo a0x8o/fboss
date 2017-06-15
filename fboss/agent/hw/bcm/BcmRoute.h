@@ -17,7 +17,8 @@ extern "C" {
 #include <folly/dynamic.h>
 #include <folly/IPAddress.h>
 #include "fboss/agent/types.h"
-#include "fboss/agent/state/RouteForwardInfo.h"
+#include "fboss/agent/state/Route.h"
+#include "fboss/agent/state/RouteNextHopEntry.h"
 
 #include <boost/container/flat_map.hpp>
 
@@ -34,7 +35,7 @@ class BcmRoute {
   BcmRoute(const BcmSwitch* hw, opennsl_vrf_t vrf,
            const folly::IPAddress& addr, uint8_t len);
   ~BcmRoute();
-  void program(const RouteForwardInfo& fwd);
+  void program(const RouteNextHopEntry& fwd);
   static bool deleteLpmRoute(int unit,
                              opennsl_vrf_t vrf,
                              const folly::IPAddress& prefix,
@@ -47,9 +48,9 @@ class BcmRoute {
 
  private:
   void programHostRoute(opennsl_if_t egressId,
-                        const RouteForwardInfo& fwd,
+                        const RouteNextHopEntry& fwd,
                         bool replace);
-  void programLpmRoute(opennsl_if_t egressId, const RouteForwardInfo& fwd);
+  void programLpmRoute(opennsl_if_t egressId, const RouteNextHopEntry& fwd);
   /*
    * Check whether we can use the host route table. BCM platforms
    * support this from TD2 onwards
@@ -63,7 +64,7 @@ class BcmRoute {
   opennsl_vrf_t vrf_;
   folly::IPAddress prefix_;
   uint8_t len_;
-  RouteForwardInfo fwd_;
+  RouteNextHopEntry fwd_;
   bool added_{false};           // if the route added to HW or not
   opennsl_if_t egressId_{-1};
   void initL3RouteT(opennsl_l3_route_t* rt) const;
@@ -88,15 +89,30 @@ class BcmRouteTable {
   void addRoute(opennsl_vrf_t vrf, const RouteT *route);
   template<typename RouteT>
   void deleteRoute(opennsl_vrf_t vrf, const RouteT *route);
+  void addDefaultRoutes(bool warmBooted);
   folly::dynamic toFollyDynamic() const;
  private:
+  template<typename AddrT>
+  const Route<AddrT>* createDefaultRoute(const AddrT& ip);
+
   struct Key {
     folly::IPAddress network;
     uint8_t mask;
     opennsl_vrf_t vrf;
     bool operator<(const Key& k2) const;
   };
+
+  bool isDefaultRouteV4(const Key& key);
+  bool isDefaultRouteV6(const Key& key);
+
   const BcmSwitch *hw_;
+
+  const std::unique_ptr<RouteV4> defaultV4_ = std::make_unique<RouteV4>(
+      createDefaultRoute<folly::IPAddressV4>(folly::IPAddressV4("0.0.0.0")));
+  const std::unique_ptr<RouteV6> defaultV6_ = std::make_unique<RouteV6>(
+      createDefaultRoute<folly::IPAddressV6>(folly::IPAddressV6("::")));
+
+  bool alpmEnabled_{false};
   boost::container::flat_map<Key, std::unique_ptr<BcmRoute>> fib_;
 };
 

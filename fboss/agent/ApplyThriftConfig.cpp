@@ -10,10 +10,14 @@
 #include "fboss/agent/ApplyThriftConfig.h"
 
 #include <folly/FileUtil.h>
+#include <thrift/lib/cpp2/protocol/Serializer.h>
+
 #include "fboss/agent/FbossError.h"
 #include "fboss/agent/Platform.h"
 #include "fboss/agent/state/AclEntry.h"
 #include "fboss/agent/state/AclMap.h"
+#include "fboss/agent/state/AggregatePort.h"
+#include "fboss/agent/state/AggregatePortMap.h"
 #include "fboss/agent/state/ArpResponseTable.h"
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/InterfaceMap.h"
@@ -30,7 +34,10 @@
 #include "fboss/agent/state/RouteTableMap.h"
 #include "fboss/agent/state/RouteUpdater.h"
 
+#include <algorithm>
 #include <boost/container/flat_set.hpp>
+#include <folly/Range.h>
+#include <vector>
 
 using boost::container::flat_map;
 using boost::container::flat_set;
@@ -44,6 +51,11 @@ using folly::CIDRNetwork;
 using std::make_shared;
 using std::shared_ptr;
 
+namespace {
+
+const uint8_t kV6LinkLocalAddrMask{64};
+
+} // anonymous namespace
 
 namespace facebook { namespace fboss {
 
@@ -97,11 +109,48 @@ class ThriftConfigApplier {
   typedef boost::container::flat_map<RouterID, IntfRoute> IntfRouteTable;
   IntfRouteTable intfRouteTables_;
 
+  /* The ThriftConfigApplier object exposes a single, top-level method "run()".
+   * In this method, a previous SwitchState "orig_" is first cloned and the
+   * clone modified until it matches the specifications of the SwitchConfig
+   * "cfg_". The private methods of ThriftConfigApplier implement the logic
+   * necessary to perform these modifications.
+   *
+   * These methods generally follow a common scheme to do so based on each
+   * SwitchState node being uniquely identified by an ID within the set of nodes
+   * of the same type. For instance, a VLAN node is uniquely identified by
+   * its "const VlanID id" member variable. No other VLAN may have the same
+   * ID. But it is entirely possible for there to exist an Interface node with
+   * the same numerical ID (ignoring type incompatibility between VlanID and
+   * InterfaceID).
+   *
+   * There are 3 cases to consider:
+   *
+   * 1) cfg_ and orig_ both have a node with the same ID
+   *    If the specifications in cfg_ differ from those of orig_, then the
+   *    clone of the node is updated appropriately. This functionality is
+   *    provided by methods such as updateAggPort(), updateVlan(), etc.
+   * 2) cfg_ has a node with an ID that does not exist in orig_
+   *    A node with this ID is added to the cloned SwitchState. This
+   *    functionality is provided by methods such as createAggPort(),
+   *    createVlan(), etc.
+   * 3) orig_ has a node with an ID that does not exist in cfg_
+   *    This node is implicity deleted in the clone.
+   *
+   * Methods such as updateAggregatePorts(), updateVlans(), etc. encapsulate
+   * this logic for each type of NodeBase.
+   */
+
   void processVlanPorts();
   void updateVlanInterfaces(const Interface* intf);
   std::shared_ptr<PortMap> updatePorts();
   std::shared_ptr<Port> updatePort(const std::shared_ptr<Port>& orig,
                                    const cfg::Port* cfg);
+  std::shared_ptr<AggregatePortMap> updateAggregatePorts();
+  std::shared_ptr<AggregatePort> updateAggPort(
+      const std::shared_ptr<AggregatePort>& orig,
+      const cfg::AggregatePort& cfg);
+  std::shared_ptr<AggregatePort> createAggPort(const cfg::AggregatePort& cfg);
+  std::vector<PortID> getSubportsSorted(const cfg::AggregatePort& cfg);
   std::shared_ptr<VlanMap> updateVlans();
   std::shared_ptr<Vlan> createVlan(const cfg::Vlan* config);
   std::shared_ptr<Vlan> updateVlan(const std::shared_ptr<Vlan>& orig,
@@ -110,6 +159,8 @@ class ThriftConfigApplier {
   std::shared_ptr<AclEntry> createAcl(const cfg::AclEntry* config);
   std::shared_ptr<AclEntry> updateAcl(const std::shared_ptr<AclEntry>& orig,
                                       const cfg::AclEntry* config);
+  // check the acl provided by config is valid
+  void checkAcl(const cfg::AclEntry* config) const;
   bool updateNeighborResponseTables(Vlan* vlan, const cfg::Vlan* config);
   bool updateDhcpOverrides(Vlan* vlan, const cfg::Vlan* config);
   std::shared_ptr<InterfaceMap> updateInterfaces();
@@ -161,6 +212,14 @@ shared_ptr<SwitchState> ThriftConfigApplier::run() {
     auto newPorts = updatePorts();
     if (newPorts) {
       newState->resetPorts(std::move(newPorts));
+      changed = true;
+    }
+  }
+
+  {
+    auto newAggPorts = updateAggregatePorts();
+    if (newAggPorts) {
+      newState->resetAggregatePorts(std::move(newAggPorts));
       changed = true;
     }
   }
@@ -255,6 +314,38 @@ shared_ptr<SwitchState> ThriftConfigApplier::run() {
   uint32_t maxNeighborProbes(cfg_->maxNeighborProbes);
   if (orig_->getMaxNeighborProbes() != maxNeighborProbes) {
     newState->setMaxNeighborProbes(maxNeighborProbes);
+    changed = true;
+  }
+
+  auto oldDhcpV4RelaySrc = orig_->getDhcpV4RelaySrc();
+  auto newDhcpV4RelaySrc = cfg_->__isset.dhcpRelaySrcOverrideV4 ?
+    IPAddressV4(cfg_->dhcpRelaySrcOverrideV4) : IPAddressV4();
+  if (oldDhcpV4RelaySrc != newDhcpV4RelaySrc) {
+    newState->setDhcpV4RelaySrc(newDhcpV4RelaySrc);
+    changed = true;
+  }
+
+  auto oldDhcpV6RelaySrc = orig_->getDhcpV6RelaySrc();
+  auto newDhcpV6RelaySrc = cfg_->__isset.dhcpRelaySrcOverrideV6 ?
+    IPAddressV6(cfg_->dhcpRelaySrcOverrideV6) : IPAddressV6("::");
+  if (oldDhcpV6RelaySrc != newDhcpV6RelaySrc) {
+    newState->setDhcpV6RelaySrc(newDhcpV6RelaySrc);
+    changed = true;
+  }
+
+  auto oldDhcpV4ReplySrc = orig_->getDhcpV4ReplySrc();
+  auto newDhcpV4ReplySrc = cfg_->__isset.dhcpReplySrcOverrideV4 ?
+    IPAddressV4(cfg_->dhcpReplySrcOverrideV4) : IPAddressV4();
+  if (oldDhcpV4ReplySrc != newDhcpV4ReplySrc) {
+    newState->setDhcpV4ReplySrc(newDhcpV4ReplySrc);
+    changed = true;
+  }
+
+  auto oldDhcpV6ReplySrc = orig_->getDhcpV6ReplySrc();
+  auto newDhcpV6ReplySrc = cfg_->__isset.dhcpReplySrcOverrideV6 ?
+    IPAddressV6(cfg_->dhcpReplySrcOverrideV6) : IPAddressV6("::");
+  if (oldDhcpV6ReplySrc != newDhcpV6ReplySrc) {
+    newState->setDhcpV6ReplySrc(newDhcpV6ReplySrc);
     changed = true;
   }
 
@@ -369,7 +460,7 @@ shared_ptr<PortMap> ThriftConfigApplier::updatePorts() {
       continue;
     }
     cfg::Port defaultConfig;
-    origPort->initDefaultConfig(&defaultConfig);
+    origPort->initDefaultConfigState(&defaultConfig);
     auto newPort = updatePort(origPort, &defaultConfig);
     changed |= updateMap(&newPorts, origPort, newPort);
   }
@@ -403,6 +494,87 @@ shared_ptr<Port> ThriftConfigApplier::updatePort(const shared_ptr<Port>& orig,
   newPort->setName(cfg->name);
   newPort->setDescription(cfg->description);
   return newPort;
+}
+
+shared_ptr<AggregatePortMap> ThriftConfigApplier::updateAggregatePorts() {
+  auto origAggPorts = orig_->getAggregatePorts();
+  AggregatePortMap::NodeContainer newAggPorts;
+  bool changed = false;
+
+  size_t numExistingProcessed = 0;
+  for (const auto& portCfg : cfg_->aggregatePorts) {
+    AggregatePortID id(portCfg.key);
+    auto origAggPort = origAggPorts->getAggregatePortIf(id);
+
+    shared_ptr<AggregatePort> newAggPort;
+    if (origAggPort) {
+      newAggPort = updateAggPort(origAggPort, portCfg);
+      ++numExistingProcessed;
+    } else {
+      newAggPort = createAggPort(portCfg);
+    }
+
+    changed |= updateMap(&newAggPorts, origAggPort, newAggPort);
+  }
+
+  if (numExistingProcessed != origAggPorts->size()) {
+    // Some existing aggregate ports were removed.
+    CHECK_LE(numExistingProcessed, origAggPorts->size());
+    changed = true;
+  }
+
+  if (!changed) {
+    return nullptr;
+  }
+
+  return origAggPorts->clone(newAggPorts);
+}
+
+shared_ptr<AggregatePort> ThriftConfigApplier::updateAggPort(
+    const shared_ptr<AggregatePort>& origAggPort,
+    const cfg::AggregatePort& cfg) {
+  CHECK_EQ(origAggPort->getID(), cfg.key);
+
+  auto cfgSubports = getSubportsSorted(cfg);
+  auto origSubports = origAggPort->sortedSubports();
+
+  if (origAggPort->getName() == cfg.name &&
+      origAggPort->getDescription() == cfg.description &&
+      std::equal(
+          origSubports.begin(), origSubports.end(), cfgSubports.begin())) {
+    return nullptr;
+  }
+
+  auto newAggPort = origAggPort->clone();
+  newAggPort->setName(cfg.name);
+  newAggPort->setDescription(cfg.description);
+  newAggPort->setSubports(folly::range(cfgSubports.begin(), cfgSubports.end()));
+
+  return newAggPort;
+}
+
+shared_ptr<AggregatePort> ThriftConfigApplier::createAggPort(
+    const cfg::AggregatePort& cfg) {
+  auto subports = getSubportsSorted(cfg);
+  return AggregatePort::fromSubportRange(
+      AggregatePortID(cfg.key),
+      cfg.name,
+      cfg.description,
+      folly::range(subports.begin(), subports.end()));
+}
+
+std::vector<PortID> ThriftConfigApplier::getSubportsSorted(
+    const cfg::AggregatePort& cfg) {
+  std::vector<PortID> ids(
+      std::distance(cfg.physicalPorts.begin(), cfg.physicalPorts.end()));
+
+  for (int i = 0; i < ids.size(); ++i) {
+    ids[i] = PortID(cfg.physicalPorts[i]);
+  }
+
+  std::sort(ids.begin(), ids.end());
+
+  return ids;
 }
 
 shared_ptr<VlanMap> ThriftConfigApplier::updateVlans() {
@@ -444,6 +616,7 @@ shared_ptr<Vlan> ThriftConfigApplier::createVlan(const cfg::Vlan* config) {
   updateNeighborResponseTables(vlan.get(), config);
   updateDhcpOverrides(vlan.get(), config);
 
+
   /* TODO t7153326: Following code is added for backward compatibility
   Remove it once coop generates config with */
   if (config->__isset.intfID) {
@@ -473,7 +646,6 @@ shared_ptr<Vlan> ThriftConfigApplier::updateVlan(const shared_ptr<Vlan>& orig,
   auto oldDhcpV6Relay = orig->getDhcpV6Relay();
   auto newDhcpV6Relay = config->__isset.dhcpRelayAddressV6 ?
     IPAddressV6(config->dhcpRelayAddressV6) : IPAddressV6("::");
-
   /* TODO t7153326: Following code is added for backward compatibility
   Remove it once coop generates config with intfID */
   auto oldIntfID = orig->getInterfaceID();
@@ -537,8 +709,66 @@ shared_ptr<AclMap> ThriftConfigApplier::updateAcls() {
   return origAcls->clone(std::move(newAcls));
 }
 
+void ThriftConfigApplier::checkAcl(const cfg::AclEntry *config) const {
+  // check l4 port range
+  if (config->__isset.srcL4PortRange &&
+      (config->srcL4PortRange.min > AclL4PortRange::kMaxPort)) {
+    throw FbossError("src's L4 port range has a min value larger than 65535");
+  }
+  if (config->__isset.srcL4PortRange &&
+      (config->srcL4PortRange.max > AclL4PortRange::kMaxPort)) {
+    throw FbossError("src's L4 port range has a max value larger than 65535");
+  }
+  if (config->__isset.srcL4PortRange &&
+      (config->srcL4PortRange.min > config->srcL4PortRange.max)) {
+    throw FbossError("src's L4 port range has a min value larger than ",
+      "its max value");
+  }
+  if (config->__isset.dstL4PortRange &&
+      (config->dstL4PortRange.min > AclL4PortRange::kMaxPort)) {
+    throw FbossError("dst's L4 port range has a min value larger than 65535");
+  }
+  if (config->__isset.dstL4PortRange &&
+      (config->dstL4PortRange.max > AclL4PortRange::kMaxPort)) {
+    throw FbossError("dst's L4 port range has a max value larger than 65535");
+  }
+  if (config->__isset.dstL4PortRange &&
+      (config->dstL4PortRange.min > config->dstL4PortRange.max)) {
+    throw FbossError("dst's L4 port range has a min value larger than ",
+      "its max value");
+  }
+  if (config->__isset.pktLenRange &&
+      (config->pktLenRange.min > config->pktLenRange.max)) {
+    throw FbossError("the min. packet length cannot exceed"
+      " the max. packet length");
+  }
+  if (config->__isset.icmpCode && !config->__isset.icmpType) {
+    throw FbossError("icmp type must be set when icmp code is set");
+  }
+  if (config->__isset.icmpType &&
+      (config->icmpType < 0 ||
+        config->icmpType > AclEntryFields::kMaxIcmpType)) {
+    throw FbossError("icmp type value must be between 0 and ",
+      std::to_string(AclEntryFields::kMaxIcmpType));
+  }
+  if (config->__isset.icmpCode &&
+      (config->icmpCode < 0 ||
+        config->icmpCode > AclEntryFields::kMaxIcmpCode)) {
+    throw FbossError("icmp type value must be between 0 and ",
+      std::to_string(AclEntryFields::kMaxIcmpCode));
+  }
+  if (config->__isset.icmpType &&
+      (!config->__isset.proto ||
+        !(config->proto == AclEntryFields::kProtoIcmp ||
+          config->proto == AclEntryFields::kProtoIcmpv6))) {
+    throw FbossError("proto must be either icmp or icmpv6 ",
+      "if icmp type is set");
+  }
+}
+
 shared_ptr<AclEntry> ThriftConfigApplier::createAcl(
     const cfg::AclEntry* config) {
+  checkAcl(config);
   auto newAcl = make_shared<AclEntry>(AclEntryID(config->id));
   newAcl->setAction(config->action);
   if (config->__isset.srcIp) {
@@ -546,12 +776,6 @@ shared_ptr<AclEntry> ThriftConfigApplier::createAcl(
   }
   if (config->__isset.dstIp) {
     newAcl->setDstIp(IPAddress::createNetwork(config->dstIp));
-  }
-  if (config->__isset.l4SrcPort) {
-    newAcl->setL4SrcPort(config->l4SrcPort);
-  }
-  if (config->__isset.l4DstPort) {
-    newAcl->setL4DstPort(config->l4DstPort);
   }
   if (config->__isset.proto) {
     newAcl->setProto(config->proto);
@@ -568,9 +792,29 @@ shared_ptr<AclEntry> ThriftConfigApplier::createAcl(
   if (config->__isset.dstPort) {
     newAcl->setDstPort(config->dstPort);
   }
+  if (config->__isset.srcL4PortRange) {
+    newAcl->setSrcL4PortRange(AclL4PortRange(config->srcL4PortRange.min,
+      config->srcL4PortRange.max));
+  }
+  if (config->__isset.dstL4PortRange) {
+    newAcl->setDstL4PortRange(AclL4PortRange(config->dstL4PortRange.min,
+      config->dstL4PortRange.max));
+  }
+  if (config->__isset.pktLenRange) {
+    newAcl->setPktLenRange(AclPktLenRange(config->pktLenRange.min,
+      config->pktLenRange.max));
+  }
+  if (config->__isset.ipFrag) {
+    newAcl->setIpFrag(config->ipFrag);
+  }
+  if (config->__isset.icmpType) {
+    newAcl->setIcmpType(config->icmpType);
+  }
+  if (config->__isset.icmpCode) {
+    newAcl->setIcmpCode(config->icmpCode);
+  }
   return newAcl;
 }
-
 
 shared_ptr<AclEntry> ThriftConfigApplier::updateAcl(
     const shared_ptr<AclEntry>& orig,
@@ -578,15 +822,7 @@ shared_ptr<AclEntry> ThriftConfigApplier::updateAcl(
 
   auto newAcl = createAcl(config);
 
-  if (orig->getID() == newAcl->getID() &&
-      orig->getAction() == newAcl->getAction() &&
-      orig->getSrcIp() == newAcl->getSrcIp() &&
-      orig->getDstIp() == newAcl->getDstIp() &&
-      orig->getL4SrcPort() == newAcl->getL4SrcPort() &&
-      orig->getL4DstPort() == newAcl->getL4DstPort() &&
-      orig->getProto() == newAcl->getProto() &&
-      orig->getTcpFlags() == newAcl->getTcpFlags() &&
-      orig->getTcpFlagsMask() == newAcl->getTcpFlagsMask()) {
+  if (*orig == *newAcl) {
     return nullptr;
   }
 
@@ -671,12 +907,18 @@ shared_ptr<RouteTableMap> ThriftConfigApplier::updateInterfaceRoutes() {
   for (const auto& table : intfRouteTables_) {
     for (const auto& entry : table.second) {
       auto intf = entry.second.first;
-      auto& addr = entry.second.second;
+      const auto& addr = entry.second.second;
       auto len = entry.first.second;
-      updater.addRoute(table.first, intf, addr, len);
+      auto nhop = RouteNextHop::createInterfaceNextHop(addr, intf);
+      updater.addRoute(table.first,
+                       addr,
+                       len,
+                       StdClientIds2ClientID(StdClientIds::INTERFACE_ROUTE),
+                       RouteNextHopEntry(std::move(nhop)));
     }
     newToAddTables.insert(table.first);
   }
+
   // need to go through all existing connected routes and delete those
   // not there anymore
   for (const auto& intf : orig_->getInterfaces()->getAllNodes()) {
@@ -698,7 +940,10 @@ shared_ptr<RouteTableMap> ThriftConfigApplier::updateInterfaceRoutes() {
         }
       }
       if (!found) {
-        updater.delRoute(id, addr.first, addr.second);
+        updater.delRoute(id,
+                         addr.first,
+                         addr.second,
+                         StdClientIds2ClientID(StdClientIds::INTERFACE_ROUTE));
       }
     }
   }
@@ -768,7 +1013,9 @@ shared_ptr<Interface> ThriftConfigApplier::createInterface(
                                      VlanID(config->vlanID),
                                      name,
                                      mac,
-                                     mtu);
+                                     mtu,
+                                     config->isVirtual,
+                                     config->isStateSyncDisabled);
   intf->setAddresses(addrs);
   if (config->__isset.ndp) {
     intf->setNdpConfig(config->ndp);
@@ -795,7 +1042,9 @@ shared_ptr<Interface> ThriftConfigApplier::updateInterface(
       orig->getMac() == mac &&
       orig->getAddresses() == addrs &&
       orig->getNdpConfig() == ndp &&
-      orig->getMtu() == mtu) {
+      orig->getMtu() == mtu &&
+      orig->isVirtual() == config->isVirtual &&
+      orig->isStateSyncDisabled() == config->isStateSyncDisabled) {
     // No change
     return nullptr;
   }
@@ -808,6 +1057,8 @@ shared_ptr<Interface> ThriftConfigApplier::updateInterface(
   newIntf->setAddresses(addrs);
   newIntf->setNdpConfig(ndp);
   newIntf->setMtu(mtu);
+  newIntf->setIsVirtual(config->isVirtual);
+  newIntf->setIsStateSyncDisabled(config->isStateSyncDisabled);
   return newIntf;
 }
 
@@ -829,12 +1080,33 @@ MacAddress ThriftConfigApplier::getInterfaceMac(const cfg::Interface* config) {
 Interface::Addresses ThriftConfigApplier::getInterfaceAddresses(
     const cfg::Interface* config) {
   Interface::Addresses addrs;
+
+  // Assign auto-generate v6 link-local address to interface. Config can
+  // have more link-local addresses if needed.
+  folly::MacAddress macAddr;
+  if (config->__isset.mac) {
+    macAddr = folly::MacAddress(config->mac);
+  } else {
+    macAddr = platform_->getLocalMac();
+  }
+  const folly::IPAddressV6 v6llAddr(folly::IPAddressV6::LINK_LOCAL, macAddr);
+  addrs.emplace(v6llAddr, kV6LinkLocalAddrMask);
+
+  // Add all interface addresses from config
   for (const auto& addr : config->ipAddresses) {
     auto intfAddr = IPAddress::createNetwork(addr, -1, false);
     auto ret = addrs.insert(intfAddr);
     if (!ret.second) {
       throw FbossError("Duplicate network IP address ", addr,
                        " in interface ", config->intfID);
+    }
+
+    // NOTE: We do not want to leak link-local address into intfRouteTables_
+    // TODO: For now we are allowing v4 LLs to be programmed because they are
+    // used within Galaxy for LL routing. This hack should go away once we
+    // move BGP sessions over non LL addresses
+    if (intfAddr.first.isV6() and intfAddr.first.isLinkLocal()) {
+      continue;
     }
     auto ret2 = intfRouteTables_[RouterID(config->routerID)].emplace(
         IPAddress::createNetwork(addr),
@@ -855,6 +1127,7 @@ Interface::Addresses ThriftConfigApplier::getInterfaceAddresses(
           std::make_pair(InterfaceID(config->intfID), intfAddr.first));
     }
   }
+
   return addrs;
 }
 
@@ -883,7 +1156,8 @@ std::pair<std::shared_ptr<SwitchState>, std::string> applyThriftConfigFile(
   if (!folly::readFile(path.toString().c_str(), configStr)) {
     throw FbossError("unable to read ", path);
   }
-  config.readFromJson(configStr.c_str());
+  apache::thrift::SimpleJSONSerializer::deserialize<cfg::SwitchConfig>(
+      configStr.c_str(), config);
 
   return std::make_pair(
       applyThriftConfig(state, &config, platform, prevConfig), configStr);

@@ -34,7 +34,7 @@ using folly::IPAddress;
 using folly::IPAddressV4;
 using folly::MacAddress;
 using folly::io::Cursor;
-using folly::make_unique;
+using std::make_unique;
 using std::make_shared;
 using std::make_pair;
 using std::shared_ptr;
@@ -153,7 +153,7 @@ TEST(IPv4Test, Parse) {
   pkt->setSrcPort(portID);
   pkt->setSrcVlan(vlanID);
 
-  EXPECT_HW_CALL(sw, stateChanged(_)).Times(0);
+  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
   EXPECT_HW_CALL(sw, sendPacketSwitched_(_)).Times(0);
   sw->packetReceived(pkt->clone());
   counters.update();
@@ -189,7 +189,7 @@ TEST(IPv4Test, Parse) {
   pkt->setSrcPort(portID);
   pkt->setSrcVlan(vlanID);
 
-  EXPECT_HW_CALL(sw, stateChanged(_)).Times(0);
+  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
   EXPECT_HW_CALL(sw, sendPacketSwitched_(_)).Times(0);
   sw->packetReceived(pkt->clone());
   counters.update();

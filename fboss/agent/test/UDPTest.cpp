@@ -28,7 +28,7 @@ using namespace facebook::fboss;
 using folly::IOBuf;
 using folly::io::Cursor;
 using folly::io::Appender;
-using folly::make_unique;
+using std::make_unique;
 using std::make_shared;
 using std::shared_ptr;
 using std::string;
@@ -39,8 +39,8 @@ using ::testing::Return;
 TEST(UDPTest, Parse) {
 
   // setup a default state object
-  auto state = make_shared<SwitchState>();
-  auto sw = createMockSw(state);
+  auto sw = createMockSw();
+  auto state = sw->getState();
   PortID portID(1);
   VlanID vlanID(1);
 

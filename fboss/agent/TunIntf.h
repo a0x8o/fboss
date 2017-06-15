@@ -11,6 +11,7 @@
 
 #include "fboss/agent/types.h"
 #include "fboss/agent/state/Interface.h"
+#include "fboss/agent/state/StateUtils.h"
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventHandler.h>
 
@@ -22,7 +23,10 @@ class RxPacket;
 class TunIntf : private folly::EventHandler {
  public:
   /**
-   * Creates a TunIntf object of already existing linux interface.
+   * Creates a TunIntf object of already existing linux interface. Initial
+   * status is set to `false` for discovered interfaces because we do not
+   * have real port-status info. Once initial config is applied in TunManager
+   * their actual status will be reflected.
    */
   TunIntf(
       SwSwitch *sw,
@@ -38,17 +42,11 @@ class TunIntf : private folly::EventHandler {
       SwSwitch *sw,
       folly::EventBase *evb,
       InterfaceID ifID,   // Switch interface ID
+      bool status,
       const Interface::Addresses& addrs,
       int mtu);
 
   ~TunIntf() override;
-
-  /**
-   * Utility functions for InterfaceID <-> ifName (on host)
-   */
-  static std::string createTunIntfName(InterfaceID ifID);
-  static bool isTunIntfName(const std::string& ifName);
-  static InterfaceID getIDFromTunIntfName(const std::string& ifName);
 
   /**
    * Start/Stop packet forwarding on Tun interface.
@@ -62,6 +60,14 @@ class TunIntf : private folly::EventHandler {
    */
   void setDelete() {
     toDelete_ = true;
+  }
+
+  /**
+   * Change status of an interface UP/DOWN.
+   * NOTE: This only changes the SW state.
+   */
+  void setStatus(bool status) {
+    status_ = status;
   }
 
   /**
@@ -113,6 +119,10 @@ class TunIntf : private folly::EventHandler {
     return mtu_;
   }
 
+  bool getStatus() const {
+    return status_;
+  }
+
  private:
   /**
    * Callback for event on Tun interface's read socket-fd
@@ -127,6 +137,15 @@ class TunIntf : private folly::EventHandler {
   void openFD();
   void closeFD() noexcept;
 
+  /**
+   * In newer kernel an interface is automatically gets link-local IPv6 address
+   * because of IPv6 autoconf and FBOSS (we) assign one more.
+   *
+   * Here we disable address generation mode so that we don't end up assigning
+   * address to an interface.
+   */
+  static void disableIPv6AddrGenMode(int ifIndex);
+
   SwSwitch *sw_{nullptr};
 
   const std::string name_{""};  // The name in the host
@@ -134,6 +153,7 @@ class TunIntf : private folly::EventHandler {
 
   int ifIndex_{-1};             // The ifIndex of the interface on host
   bool toDelete_{false};        // Is the interface to be deleted from system
+  bool status_{false};          // Is interface UP(true)/DOWN(false)
 
   Interface::Addresses addrs_;  // The IP addresses assigned to this intf
 

@@ -12,7 +12,7 @@
 #include "fboss/agent/HighresCounterUtil.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/if/gen-cpp2/FbossCtrl.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 #include <folly/IPAddress.h>
 
@@ -33,6 +33,7 @@ class TxPacket;
 
 struct HwInitResult {
   std::shared_ptr<SwitchState> switchState{nullptr};
+  std::shared_ptr<SwitchState> switchStateDesired{nullptr};
   BootType bootType{BootType::UNINITIALIZED};
   float initializedTime{0.0};
   float bootTime{0.0};
@@ -117,15 +118,16 @@ class HwSwitch {
    */
   virtual void unregisterCallbacks() = 0;
 
-  virtual void remedyPorts() = 0;
-
   /*
    * Apply a state change to the hardware.
    *
    * stateChanged() is called whenever the switch state changes.
    * This is called immediately after updating the state variable in SwSwitch.
+   *
+   * @ret   The actual state that was applied in the hardware.
    */
-  virtual void stateChanged(const StateDelta& delta) = 0;
+  virtual std::shared_ptr<SwitchState> stateChanged(
+      const StateDelta& delta) = 0;
   /*
    * Check if a state update would be permissible on the HW,
    * without making any actual changes on the HW.
@@ -172,10 +174,10 @@ class HwSwitch {
    * @param[in]  counterSet       The set of requested counters within the
    *                              current namespace.
    */
-  virtual int getHighresSamplers(
-      HighresSamplerList* samplers,
-      const folly::StringPiece namespaceString,
-      const std::set<folly::StringPiece>& counterSet) = 0;
+  virtual int getHighresSamplers(HighresSamplerList* samplers,
+                                 const std::string& namespaceString,
+                                 const std::set<CounterRequest>& counterSet)
+                                 = 0;
 
   virtual void fetchL2Table(std::vector<L2EntryThrift> *l2Table) = 0;
 
@@ -227,6 +229,14 @@ class HwSwitch {
    * Get max port speed.
    */
   virtual cfg::PortSpeed getMaxPortSpeed(PortID port) const = 0;
+
+  /*
+   * Get whether the port has set FEC or not
+   * TODO(rsher) Consider refactoring this interface to expose
+   * ports as first class citizens (hwPort?) and then move all of these
+   * functions into the hwPort abstraction
+   */
+   virtual bool getPortFECConfig(PortID /* unused */ ) const { return false; }
 
   /*
    * Returns true if the arp/ndp entry for the passed in ip/intf has been hit

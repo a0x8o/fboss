@@ -183,6 +183,16 @@ class SwitchStats : public boost::noncopyable {
     delRouteV6_.addValue(1);
   }
 
+  void ipv4DstLookupFailure() {
+    dstLookupFailureV4_.addValue(1);
+    dstLookupFailure_.addValue(1);
+  }
+
+  void ipv6DstLookupFailure() {
+    dstLookupFailureV6_.addValue(1);
+    dstLookupFailure_.addValue(1);
+  }
+
   void stateUpdate(std::chrono::microseconds us) {
     updateState_.addValue(us.count());
   }
@@ -195,8 +205,40 @@ class SwitchStats : public boost::noncopyable {
     routeUpdate_.addRepeatedValue(us.count() / routes, routes);
   }
 
+  void bgHeartbeatDelay(int delay) {
+    bgHeartbeatDelay_.addValue(delay);
+  }
+
+  void updHeartbeatDelay(int delay) {
+    updHeartbeatDelay_.addValue(delay);
+  }
+
+  void  fbossPktTxHeartbeatDelay(int value) {
+    fbossPktTxHeartbeatDelay_.addValue(value);
+  }
+
+  void bgEventBacklog(int value) {
+    bgEventBacklog_.addValue(value);
+  }
+
+  void updEventBacklog(int value) {
+    updEventBacklog_.addValue(value);
+  }
+
+  void  fbossPktTxEventBacklog(int value) {
+    fbossPktTxEventBacklog_.addValue(value);
+  }
+
   void linkStateChange() {
     linkStateChange_.addValue(1);
+  }
+
+  void setHwOutOfSync() {
+    hwOutOfSync_.incrementValue(1);
+  }
+
+  void clearHwOutOfSync() {
+    hwOutOfSync_.incrementValue(-1);
   }
 
  private:
@@ -208,6 +250,7 @@ class SwitchStats : public boost::noncopyable {
   stats::ThreadCachedServiceData::ThreadLocalStatsMap ThreadLocalStatsMap;
   typedef stats::ThreadCachedServiceData::TLTimeseries TLTimeseries;
   typedef stats::ThreadCachedServiceData::TLHistogram TLHistogram;
+  typedef stats::ThreadCachedServiceData::TLCounter TLCounter;
 
   explicit SwitchStats(ThreadLocalStatsMap *map);
 
@@ -300,6 +343,10 @@ class SwitchStats : public boost::noncopyable {
   TLTimeseries delRouteV4_;
   TLTimeseries delRouteV6_;
 
+  TLTimeseries dstLookupFailureV4_;
+  TLTimeseries dstLookupFailureV6_;
+  TLTimeseries dstLookupFailure_;
+
   /**
    * Histogram for time used for SwSwitch::updateState() (in ms)
    */
@@ -311,9 +358,43 @@ class SwitchStats : public boost::noncopyable {
   TLHistogram routeUpdate_;
 
   /**
+   * Background thread heartbeat delay (ms)
+   */
+  TLHistogram bgHeartbeatDelay_;
+
+  /**
+   * Update thread heartbeat delay (ms)
+   */
+  TLHistogram updHeartbeatDelay_;
+  /**
+   * Fboss packet Tx thread heartbeat delay (ms)
+   */
+  TLHistogram fbossPktTxHeartbeatDelay_;
+
+  /**
+   * Number of events queued in background thread
+   */
+  TLHistogram bgEventBacklog_;
+
+  /**
+   * Number of events queued in update thread
+   */
+  TLHistogram updEventBacklog_;
+  /**
+   * Number of events queued in fboss packet TX thread
+   */
+  TLHistogram fbossPktTxEventBacklog_;
+
+  /**
    * Link state up/down change count
    */
   TLTimeseries linkStateChange_;
+
+  /**
+   * The counter is >0 if hardware state is out of sync from software state.
+   * Value of 0 would mean they are in sync.
+   */
+  TLCounter hwOutOfSync_;
 
   // Create a PortStats object for the given PortID
   PortStats* createPortStats(PortID portID);

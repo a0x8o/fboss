@@ -148,10 +148,32 @@ void IPv4Handler::handlePacket(unique_ptr<RxPacket> pkt,
     }
   }
 
-  auto dstIP = v4Hdr.dstAddr;
   // Handle packets destined for us
+  // Get the Interface to which this packet should be forwarded in host
   // TODO: assume vrf 0 now
-  if (state->getInterfaces()->getInterfaceIf(RouterID(0), IPAddress(dstIP))) {
+  std::shared_ptr<Interface> intf{nullptr};
+  auto interfaceMap = state->getInterfaces();
+  if (v4Hdr.dstAddr.isMulticast()) {
+    // Forward multicast packet directly to corresponding host interface
+    intf = interfaceMap->getInterfaceInVlanIf(pkt->getSrcVlan());
+  } else if (v4Hdr.dstAddr.isLinkLocal()) {
+    // XXX: Ideally we should scope the limit to Link only. However we are
+    // using v4 link locals in a special way on Galaxy/6pack which needs because
+    // of which we do not limit the scope.
+    //
+    // Forward link-local packet directly to corresponding host interface
+    // provided desAddr is assigned to that interface.
+    // intf = interfaceMap->getInterfaceInVlanIf(pkt->getSrcVlan());
+    // if (not intf->hasAddress(v4Hdr.dstAddr)) {
+    //   intf = nullptr;
+    // }
+    intf = interfaceMap->getInterfaceIf(RouterID(0), v4Hdr.dstAddr);
+  } else {
+    // Else loopup host interface based on destAddr
+    intf = interfaceMap->getInterfaceIf(RouterID(0), v4Hdr.dstAddr);
+  }
+
+  if (intf) {
     // TODO: Also check to see if this is the broadcast address for one of the
     // interfaces on this VLAN.  We should probably build up a more efficient
     // data structure to look up this information.
@@ -160,7 +182,7 @@ void IPv4Handler::handlePacket(unique_ptr<RxPacket> pkt,
     // i.e. ping, ssh, bgp...
     // FixME: will do another diff to set length in RxPacket, so that it
     // can be reused here.
-    if (sw_->sendPacketToHost(std::move(pkt))) {
+    if (sw_->sendPacketToHost(intf->getID(), std::move(pkt))) {
       stats->port(port)->pktToHost(l3Len);
     } else {
       stats->port(port)->pktDropped();
@@ -183,7 +205,7 @@ void IPv4Handler::handlePacket(unique_ptr<RxPacket> pkt,
   // TODO: Also check to see if this is the broadcast address for one of the
   // interfaces on this VLAN. We should probably build up a more efficient
   // data structure to look up this information.
-  if (dstIP.isLinkLocalBroadcast()) {
+  if (v4Hdr.dstAddr.isLinkLocalBroadcast()) {
     stats->port(port)->pktDropped();
     return;
   }
@@ -193,10 +215,10 @@ void IPv4Handler::handlePacket(unique_ptr<RxPacket> pkt,
   // We will need to manage the rate somehow. Either from HW
   // or a SW control here
   stats->port(port)->ipv4Nexthop();
-  if (!resolveMac(state.get(), dstIP)) {
+  if (!resolveMac(state.get(), port, v4Hdr.dstAddr)) {
     stats->port(port)->ipv4NoArp();
     VLOG(3) << "Cannot find the interface to send out ARP request for "
-      << dstIP.str();
+      << v4Hdr.dstAddr.str();
   }
   // TODO: ideally, we need to store this packet until the ARP is done and
   // then send this pkt out. For now, just drop it.
@@ -204,7 +226,10 @@ void IPv4Handler::handlePacket(unique_ptr<RxPacket> pkt,
 }
 
 // Return true if we successfully sent an ARP request, false otherwise
-bool IPv4Handler::resolveMac(SwitchState* state, IPAddressV4 dest) {
+bool IPv4Handler::resolveMac(
+    SwitchState* state,
+    PortID ingressPort,
+    IPAddressV4 dest) {
   // need to find out our own IP and MAC addresses so that we can send the
   // ARP request out. Since the request will be broadcast, there is no need to
   // worry about which port to send the packet out.
@@ -217,17 +242,18 @@ bool IPv4Handler::resolveMac(SwitchState* state, IPAddressV4 dest) {
 
   auto route = routeTable->getRibV4()->longestMatch(dest);
   if (!route || !route->isResolved()) {
+    sw_->stats()->port(ingressPort)->ipv4DstLookupFailure();
     // No way to reach dest
     return false;
   }
 
   auto intfs = state->getInterfaces();
-  auto nhs = route->getForwardInfo().getNexthops();
+  auto nhs = route->getForwardInfo().getNextHopSet();
   for (auto nh : nhs) {
-    auto intf = intfs->getInterfaceIf(nh.intf);
+    auto intf = intfs->getInterfaceIf(nh.intf());
     if (intf) {
-      auto source = intf->getAddressToReach(nh.nexthop)->first.asV4();
-      auto target = route->isConnected() ? dest : nh.nexthop.asV4();
+      auto source = intf->getAddressToReach(nh.addr())->first.asV4();
+      auto target = route->isConnected() ? dest : nh.addr().asV4();
       if (source == target) {
         // This packet is for us.  Don't send ARP requess for our own IP.
         continue;

@@ -15,15 +15,26 @@ namespace facebook { namespace fboss {
 
 class Wedge40Port : public WedgePort {
  public:
-  explicit Wedge40Port(PortID id) : WedgePort(id) {}
+  Wedge40Port(PortID id,
+             WedgePlatform* platform,
+             folly::Optional<TransceiverID> frontPanelPort,
+             folly::Optional<ChannelID> channel,
+             const XPEs& egressXPEs) :
+      WedgePort(id, platform, frontPanelPort, channel, egressXPEs) {}
 
   LaneSpeeds supportedLaneSpeeds() const override {
-    return {cfg::PortSpeed::GIGE, cfg::PortSpeed::XG};
+    LaneSpeeds speeds;
+    speeds.insert(cfg::PortSpeed::GIGE);
+    speeds.insert(cfg::PortSpeed::XG);
+    return speeds;
   }
 
-  void remedy() override;
+  void remedy();
   void prepareForGracefulExit() override;
   void linkStatusChanged(bool up, bool adminUp) override;
+  bool shouldDisableFEC() const override {
+    return false;
+  }
 };
 
 }} // facebook::fboss

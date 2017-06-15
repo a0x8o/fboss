@@ -9,138 +9,73 @@
  */
 #include "fboss/agent/platforms/wedge/Wedge100Platform.h"
 
-#include "fboss/agent/platforms/wedge/WedgePlatform.h"
-#include "fboss/agent/platforms/wedge/WedgeProductInfo.h"
+#include "fboss/agent/platforms/wedge/WedgePortMapping.h"
 #include "fboss/agent/platforms/wedge/Wedge100Port.h"
 #include "fboss/agent/FbossError.h"
 #include "fboss/lib/usb/Wedge100I2CBus.h"
-#include "fboss/agent/QsfpModule.h"
+#include "fboss/qsfp_service/platforms/wedge/WedgeI2CBusLock.h"
 
 #include <folly/Memory.h>
 
-namespace {
-constexpr auto kNumWedge100QsfpModules = 32;
-}
-
 namespace facebook { namespace fboss {
 
-Wedge100Platform::Wedge100Platform(
-  std::unique_ptr<WedgeProductInfo> productInfo
-) : WedgePlatform(std::move(productInfo), kNumWedge100QsfpModules),
-    frontPanelMapping_(getFrontPanelMapping()) {}
-
-Wedge100Platform::~Wedge100Platform() {}
-
-Wedge100Platform::InitPortMap Wedge100Platform::initPorts() {
-  InitPortMap ports;
-
-  auto add_quad = [&](int start, TransceiverID frontPanel) {
-    for (int i = 0; i < 4; i++) {
-      int num = start + i;
-      PortID portID(num);
-      opennsl_port_t bcmPortNum = num;
-
-      auto port = folly::make_unique<Wedge100Port>(portID, this, frontPanel,
-                                                   ChannelID(i));
-      ports.emplace(bcmPortNum, port.get());
-      ports_.emplace(portID, std::move(port));
-    }
-  };
-
-  for (auto mapping : frontPanelMapping_) {
-    add_quad(mapping.second, mapping.first);
-  }
-
-  return ports;
-}
-
 std::unique_ptr<BaseWedgeI2CBus> Wedge100Platform::getI2CBus() {
-  return folly::make_unique<Wedge100I2CBus>();
+  return std::make_unique<Wedge100I2CBus>();
 }
 
-PortID Wedge100Platform::fbossPortForQsfpChannel(int transceiver, int channel) {
-  // TODO(aeckert): remove this hack. Instead use the frontPanelMapping
-  // for initializing transceivers.
-  //
-  // This is needed due to Tomahawk port numbering limitations and the setup on
-  // wedge100. There are two things we need to adjust for:
-  //
-  // 1. The first four qsfp transceivers are in fact the last 4
-  //    logically on the tomahawk.
-  // 2. Each pipe (32 physical ports) has 33 allowed logical numbers and
-  //    a reserved loopback port, except the first pipe which skips 0 as
-  //    an allowed port.
-  //
-  CHECK(transceiver >= 0 && transceiver < kNumWedge100QsfpModules);
-  int th_quad = transceiver - 4;
-  if (th_quad < 0) {
-    // account for first 4 qsfps actually being connected to the last
-    // ports on the tomahawk.
-    th_quad += 32;
-  }
-
-  int pipe = th_quad / 8;
-  int local = th_quad % 8;
-  int port_num = pipe * 34 + local * QsfpModule::CHANNEL_COUNT + channel;
-  if (pipe == 0) {
-    // port 0 is reserved specially for the cpu port so increment one more.
-    ++port_num;
-  }
-
-  return PortID(port_num);
-}
-
-Wedge100Platform::FrontPanelMapping Wedge100Platform::getFrontPanelMapping() {
-  // TODO(aeckert): move this mechanism in to WedgePlatform so that we can
-  // initialize transceivers based on this for all wedge platforms.
-  return {
-    {TransceiverID(0), PortID(118)},
-    {TransceiverID(1), PortID(122)},
-    {TransceiverID(2), PortID(126)},
-    {TransceiverID(3), PortID(130)},
-    {TransceiverID(4), PortID(1)},
-    {TransceiverID(5), PortID(5)},
-    {TransceiverID(6), PortID(9)},
-    {TransceiverID(7), PortID(13)},
-    {TransceiverID(8), PortID(17)},
-    {TransceiverID(9), PortID(21)},
-    {TransceiverID(10), PortID(25)},
-    {TransceiverID(11), PortID(29)},
-    {TransceiverID(12), PortID(34)},
-    {TransceiverID(13), PortID(38)},
-    {TransceiverID(14), PortID(42)},
-    {TransceiverID(15), PortID(46)},
-    {TransceiverID(16), PortID(50)},
-    {TransceiverID(17), PortID(54)},
-    {TransceiverID(18), PortID(58)},
-    {TransceiverID(19), PortID(62)},
-    {TransceiverID(20), PortID(68)},
-    {TransceiverID(21), PortID(72)},
-    {TransceiverID(22), PortID(76)},
-    {TransceiverID(23), PortID(80)},
-    {TransceiverID(24), PortID(84)},
-    {TransceiverID(25), PortID(88)},
-    {TransceiverID(26), PortID(92)},
-    {TransceiverID(27), PortID(96)},
-    {TransceiverID(28), PortID(102)},
-    {TransceiverID(29), PortID(106)},
-    {TransceiverID(30), PortID(110)},
-    {TransceiverID(31), PortID(114)}
+std::unique_ptr<WedgePortMapping> Wedge100Platform::createPortMapping() {
+  // FC == Falcon Core
+  // Wedge100 is based on Tomahawk, which divides MMU buffer into 4
+  // sub buffers called XPEs. FC are then mapped, to each XPE like so
+  // Traffic egressing on FC0-15 use XPE 0, 2
+  // Traffic egressing on FC16-13 use XPE 1, 3
+  // Port to FC mappings are fixed for TH and are used as input to
+  // creating bcm.conf files.
+  WedgePortMapping::Port2TransceiverAndXPEs ports = {
+    {PortID(118), TransceiverAndXPEs(TransceiverID(0), {1, 3})}, // FC28
+    {PortID(122), TransceiverAndXPEs(TransceiverID(1), {1, 3})}, // FC29
+    {PortID(126), TransceiverAndXPEs(TransceiverID(2), {1, 3})}, // FC30
+    {PortID(130), TransceiverAndXPEs(TransceiverID(3), {1, 3})}, // FC31
+    {PortID(1), TransceiverAndXPEs(TransceiverID(4), {0, 2})}, // FC0
+    {PortID(5), TransceiverAndXPEs(TransceiverID(5), {0, 2})}, // FC1
+    {PortID(9), TransceiverAndXPEs(TransceiverID(6), {0, 2})}, // FC2
+    {PortID(13), TransceiverAndXPEs(TransceiverID(7), {0, 2})},// FC3
+    {PortID(17), TransceiverAndXPEs(TransceiverID(8), {0, 2})}, // FC4
+    {PortID(21), TransceiverAndXPEs(TransceiverID(9), {0, 2})}, // FC5
+    {PortID(25), TransceiverAndXPEs(TransceiverID(10), {0, 2})}, // FC6
+    {PortID(29), TransceiverAndXPEs(TransceiverID(11), {0, 2})}, // FC7
+    {PortID(34), TransceiverAndXPEs(TransceiverID(12), {0, 2})}, // FC8
+    {PortID(38), TransceiverAndXPEs(TransceiverID(13), {0, 2})}, // FC9
+    {PortID(42), TransceiverAndXPEs(TransceiverID(14), {0, 2})}, // FC10
+    {PortID(46), TransceiverAndXPEs(TransceiverID(15), {0, 2})}, // FC11
+    {PortID(50), TransceiverAndXPEs(TransceiverID(16), {0, 2})}, // FC12
+    {PortID(54), TransceiverAndXPEs(TransceiverID(17), {0, 2})}, // FC13
+    {PortID(58), TransceiverAndXPEs(TransceiverID(18), {0, 2})}, // FC14
+    {PortID(62), TransceiverAndXPEs(TransceiverID(19), {0, 2})}, // FC15
+    {PortID(68), TransceiverAndXPEs(TransceiverID(20), {1, 3})}, // FC16
+    {PortID(72), TransceiverAndXPEs(TransceiverID(21), {1, 3})}, // FC17
+    {PortID(76), TransceiverAndXPEs(TransceiverID(22), {1, 3})}, // FC18
+    {PortID(80), TransceiverAndXPEs(TransceiverID(23), {1, 3})}, // FC19
+    {PortID(84), TransceiverAndXPEs(TransceiverID(24), {1, 3})}, // FC20
+    {PortID(88), TransceiverAndXPEs(TransceiverID(25), {1, 3})}, // FC21
+    {PortID(92), TransceiverAndXPEs(TransceiverID(26), {1, 3})}, // FC22
+    {PortID(96), TransceiverAndXPEs(TransceiverID(27), {1, 3})}, // FC23
+    {PortID(102), TransceiverAndXPEs(TransceiverID(28), {1, 3})}, // FC24
+    {PortID(106), TransceiverAndXPEs(TransceiverID(29), {1, 3})}, // FC25
+    {PortID(110), TransceiverAndXPEs(TransceiverID(30), {1, 3})}, // FC26
+    {PortID(114), TransceiverAndXPEs(TransceiverID(31), {1, 3})}, // FC27
   };
-}
-
-Wedge100Port* Wedge100Platform::getPortFromFrontPanelNum(TransceiverID fpPort) {
-  auto iter = frontPanelMapping_.find(fpPort);
-  if (iter == frontPanelMapping_.end()) {
-    throw FbossError("Cannot find the port ID for front panel port ", fpPort);
-  }
-  // Could do a dynamic_cast, but we know the type is Wedge100Port*
-  return static_cast<Wedge100Port*>(getPort(iter->second));
+  return WedgePortMapping::create<WedgePortMappingT<Wedge100Port>>(this, ports);
 }
 
 void Wedge100Platform::enableLedMode() {
   uint8_t mode = TWELVE_BIT_MODE;
-  wedgeI2CBusLock_->write(ADDR_SYSCPLD, LED_MODE_REG, 1, &mode);
+  try {
+    WedgeI2CBusLock(getI2CBus()).write(ADDR_SYSCPLD, LED_MODE_REG, 1, &mode);
+  } catch (const std::exception& ex) {
+    LOG(ERROR) << __func__ << ": failed to change LED mode: "
+               << folly::exceptionStr(ex);
+  }
 }
 
 void Wedge100Platform::onHwInitialized(SwSwitch* sw) {

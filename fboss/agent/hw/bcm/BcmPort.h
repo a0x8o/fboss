@@ -20,7 +20,8 @@ extern "C" {
 #include "common/stats/ExportedHistogramMapImpl.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/hw/bcm/BcmPlatformPort.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
+#include "fboss/agent/hw/bcm/gen-cpp2/hardware_stats_types.h"
 
 #include <mutex>
 
@@ -50,7 +51,6 @@ class BcmPort {
   void enable(const std::shared_ptr<Port>& swPort);
   void disable(const std::shared_ptr<Port>& swPort);
   void program(const std::shared_ptr<Port>& swPort);
-  bool isEnabled();
 
   /*
    * Getters.
@@ -85,12 +85,13 @@ class BcmPort {
   LaneSpeeds supportedLaneSpeeds() const;
 
   bool supportsSpeed(cfg::PortSpeed speed);
+  bool isEnabled();
+  cfg::PortSpeed getSpeed();
 
   /*
    * Setters.
    */
   void registerInPortGroup(BcmPortGroup* portGroup);
-  void setPortStatus(bool up);
   void setIngressVlan(const std::shared_ptr<Port>& swPort);
   void setSpeed(const std::shared_ptr<Port>& swPort);
 
@@ -106,15 +107,18 @@ class BcmPort {
   cfg::PortState getState();
 
   /**
-   * Try to remedy this port if this is down.
-   */
-  void remedy();
-
-  /**
    * Take actions on this port (especially if it is up), so that it will not
    * flap on warm boot.
    */
   void prepareForGracefulExit();
+
+  /**
+   * return true iff the port has Forward Error Correction (FEC)
+   * enabled
+   */
+  bool isFECEnabled();
+
+  void updateName(const std::string& newName);
 
  private:
   class MonotonicCounter : public stats::MonotonicCounter {
@@ -131,16 +135,23 @@ class BcmPort {
   BcmPort(BcmPort const &) = delete;
   BcmPort& operator=(BcmPort const &) = delete;
 
+  MonotonicCounter* getPortCounterIf(const std::string& statName);
+  bool shouldReportStats() const;
+  void reinitPortStats();
+  void reinitPortStat(const std::string& newName);
   void updateStat(std::chrono::seconds now,
-                  stats::MonotonicCounter* stat,
-                  opennsl_stat_val_t type);
+                  const std::string& statName,
+                  opennsl_stat_val_t type,
+                  int64_t* portStatVal);
   void updatePktLenHist(std::chrono::seconds now,
                         stats::ExportedHistogramMapImpl::LockableHistogram* hist,
                         const std::vector<opennsl_stat_val_t>& stats);
+  // Set stats that are either FB specific, not available in
+  // open source opennsl release.
+  void setAdditionalStats(std::chrono::seconds now, HwPortStats* curPortStats);
   std::string statName(folly::StringPiece name) const;
 
   void disablePause();
-  void setAdditionalStats(std::chrono::seconds now);
   void setConfiguredMaxSpeed();
   opennsl_port_if_t getDesiredInterfaceMode(cfg::PortSpeed speed,
                                             PortID id,
@@ -150,6 +161,9 @@ class BcmPort {
 
   void setKR4Ability();
   void setFEC(const std::shared_ptr<Port>& swPort);
+  bool isMmuLossy() const;
+
+  static constexpr auto kOutCongestionDiscards = "out_congestion_discards";
 
   BcmSwitch* const hw_{nullptr};
   const opennsl_port_t port_;    // Broadcom physical port number
@@ -159,29 +173,17 @@ class BcmPort {
   cfg::PortSpeed configuredMaxSpeed_;
   BcmPlatformPort* const platformPort_{nullptr};
   int unit_{-1};
+  std::string portName_{""};
 
   // The port group this port is a part of
   BcmPortGroup* portGroup_{nullptr};
 
-  MonotonicCounter inBytes_{statName("in_bytes")};
-  MonotonicCounter inUnicastPkts_{statName("in_unicast_pkts")};
-  MonotonicCounter inMulticastPkts_{statName("in_multicast_pkts")};
-  MonotonicCounter inBroadcastPkts_{statName("in_broadcast_pkts")};
-  MonotonicCounter inDiscards_{statName("in_discards")};
-  MonotonicCounter inErrors_{statName("in_errors")};
-  MonotonicCounter inPause_{statName("in_pause_frames")};
-
-  MonotonicCounter outBytes_{statName("out_bytes")};
-  MonotonicCounter outUnicastPkts_{statName("out_unicast_pkts")};
-  MonotonicCounter outMulticastPkts_{statName("out_multicast_pkts")};
-  MonotonicCounter outBroadcastPkts_{statName("out_broadcast_pkts")};
-  MonotonicCounter outDiscards_{statName("out_discards")};
-  MonotonicCounter outErrors_{statName("out_errors")};
-  MonotonicCounter outPause_{statName("out_pause_frames")};
+  std::map<std::string, MonotonicCounter> portCounters_;
 
   stats::ExportedStatMapImpl::LockableStat outQueueLen_;
   stats::ExportedHistogramMapImpl::LockableHistogram inPktLengths_;
   stats::ExportedHistogramMapImpl::LockableHistogram outPktLengths_;
+  HwPortStats portStats_;
 };
 
 }} // namespace facebook::fboss

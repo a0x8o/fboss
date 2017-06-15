@@ -12,6 +12,7 @@
 #include <folly/Benchmark.h>
 #include <folly/Memory.h>
 #include "fboss/agent/SwSwitch.h"
+#include "fboss/agent/TunManager.h"
 #include "fboss/agent/hw/mock/MockRxPacket.h"
 #include "fboss/agent/hw/sim/SimPlatform.h"
 #include "fboss/agent/hw/sim/SimSwitch.h"
@@ -25,7 +26,7 @@ using namespace facebook::fboss;
 using folly::IPAddress;
 using folly::IPAddressV4;
 using folly::MacAddress;
-using folly::make_unique;
+using std::make_unique;
 using std::make_shared;
 using std::shared_ptr;
 using std::unique_ptr;
@@ -40,7 +41,7 @@ unique_ptr<MockRxPacket> arpRequest_10_0_0_5;
 unique_ptr<SwSwitch> setupSwitch() {
   MacAddress localMac("02:00:01:00:00:01");
   auto sw = make_unique<SwSwitch>(make_unique<SimPlatform>(localMac, 10));
-  sw->init();
+  sw->init(nullptr /* No custom TunManager */);
 
   auto updateFn = [&](const shared_ptr<SwitchState>& oldState) {
     auto state = oldState->clone();
@@ -52,9 +53,15 @@ unique_ptr<SwSwitch> setupSwitch() {
       vlan1->addPort(PortID(idx), false);
     }
     // Add Interface 1 to VLAN 1
-    auto intf1 = make_shared<Interface>
-      (InterfaceID(1), RouterID(0), VlanID(1),
-       "interface1", MacAddress("02:00:01:00:00:01"), 9000);
+    auto intf1 = make_shared<Interface>(
+        InterfaceID(1),
+        RouterID(0),
+        VlanID(1),
+        "interface1",
+        MacAddress("02:00:01:00:00:01"),
+        9000,
+        false, /* is virtual */
+        false  /* is state_sync disabled*/);
     Interface::Addresses addrs1;
     addrs1.emplace(IPAddress("10.0.0.1"), 24);
     addrs1.emplace(IPAddress("192.168.0.1"), 24);
@@ -170,7 +177,7 @@ BENCHMARK(ArpRequestNotMine, numIters) {
 }
 
 int main(int argc, char** argv) {
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   // Setting up the switch is fairly expensive.  Do this once before we run the
   // benchmark functions so we don't have to do it inside the benchmark

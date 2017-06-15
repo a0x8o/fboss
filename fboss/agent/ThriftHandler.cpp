@@ -17,7 +17,6 @@
 #include "fboss/agent/HighresCounterSubscriptionHandler.h"
 #include "fboss/agent/IPv6Handler.h"
 #include "fboss/agent/LldpManager.h"
-#include "fboss/agent/SfpModule.h"
 #include "fboss/agent/SwitchStats.h"
 #include "fboss/agent/SwSwitch.h"
 #include "fboss/agent/TxPacket.h"
@@ -38,6 +37,7 @@
 #include "fboss/agent/state/RouteTable.h"
 #include "fboss/agent/state/RouteTableRib.h"
 #include "fboss/agent/state/RouteUpdater.h"
+#include "fboss/agent/state/StateUtils.h"
 #include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/state/Vlan.h"
 #include "fboss/agent/state/VlanMap.h"
@@ -53,7 +53,7 @@ using apache::thrift::ClientReceiveState;
 using facebook::fb303::cpp2::fb_status;
 using folly::fbstring;
 using folly::IOBuf;
-using folly::make_unique;
+using std::make_unique;
 using folly::StringPiece;
 using folly::IPAddress;
 using folly::IPAddressV4;
@@ -76,6 +76,26 @@ using facebook::network::toAddress;
 using facebook::network::toIPAddress;
 
 namespace facebook { namespace fboss {
+
+namespace util {
+
+/**
+ * Utility function to convert `Nexthops` (resolved ones) to list<BinaryAddress>
+ */
+std::vector<network::thrift::BinaryAddress>
+fromFwdNextHops(RouteNextHopSet const& nexthops) {
+  std::vector<network::thrift::BinaryAddress> nhs;
+  nhs.reserve(nexthops.size());
+  for (auto const& nexthop : nexthops) {
+    auto addr = network::toBinaryAddress(nexthop.addr());
+    addr.__isset.ifName = true;
+    addr.ifName = util::createTunIntfName(nexthop.intf());
+    nhs.emplace_back(std::move(addr));
+  }
+  return nhs;
+}
+
+}
 
 class RouteUpdateStats {
  public:
@@ -117,14 +137,9 @@ ThriftHandler::ThriftHandler(SwSwitch* sw) : FacebookBase2("FBOSS"), sw_(sw) {
 
 fb_status ThriftHandler::getStatus() {
   if (sw_->isFullyInitialized()) {
-    // We schedule a lightweight task on the update eventbase
-    // so we can catch deadlocks in that thread
-    auto healthcheckFn = [=] {
-      //arbitrary code, could be changed if the log message is annoying
-      VLOG(2) << "Healthcheck passed.";
-    };
-    sw_->getUpdateEVB()->runInEventBaseThreadAndWait(healthcheckFn);
     return fb_status::ALIVE;
+  } else if (sw_->isExiting()) {
+    return fb_status::STOPPING;
   } else {
     return fb_status::STARTING;
   }
@@ -145,69 +160,16 @@ void ThriftHandler::flushCountersNow() {
 
 void ThriftHandler::addUnicastRoute(
     int16_t client, std::unique_ptr<UnicastRoute> route) {
-  ensureConfigured("addUnicastRoute");
-  ensureFibSynced("addUnicastRoute");
-  RouteUpdateStats stats(sw_, "Add", 1);
-  RouterID routerId = RouterID(0); // TODO, default vrf for now
-  folly::IPAddress network = toIPAddress(route->dest.ip);
-  uint8_t mask = static_cast<uint8_t>(route->dest.prefixLength);
-  RouteNextHops nexthops;
-  nexthops.reserve(route->nextHopAddrs.size());
-  for (const auto& nh : route->nextHopAddrs) {
-    nexthops.emplace(toIPAddress(nh));
-  }
-  if (network.isV4()) {
-    sw_->stats()->addRouteV4();
-  } else {
-    sw_->stats()->addRouteV6();
-  }
-
-  // Perform the update
-  auto updateFn = [=](const shared_ptr<SwitchState>& state) {
-    RouteUpdater updater(state->getRouteTables());
-    if (nexthops.size()) {
-      updater.addRoute(routerId, network, mask, std::move(nexthops));
-    } else {
-      updater.addRoute(routerId, network, mask, RouteForwardAction::DROP);
-    }
-    auto newRt = updater.updateDone();
-    if (!newRt) {
-      return shared_ptr<SwitchState>();
-    }
-    auto newState = state->clone();
-    newState->resetRouteTables(std::move(newRt));
-    return newState;
-  };
-  sw_->updateStateBlocking("add unicast route", updateFn);
+  auto routes = std::make_unique<std::vector<UnicastRoute>>();
+  routes->emplace_back(std::move(*route));
+  addUnicastRoutes(client, std::move(routes));
 }
 
 void ThriftHandler::deleteUnicastRoute(
     int16_t client, std::unique_ptr<IpPrefix> prefix) {
-  ensureConfigured("deleteUnicastRoute");
-  ensureFibSynced("deleteUnicastRoute");
-  RouteUpdateStats stats(sw_, "Delete", 1);
-  RouterID routerId = RouterID(0); // TODO, default vrf for now
-  folly::IPAddress network =  toIPAddress(prefix->ip);
-  uint8_t mask = static_cast<uint8_t>(prefix->prefixLength);
-  if (network.isV4()) {
-    sw_->stats()->delRouteV4();
-  } else {
-    sw_->stats()->delRouteV6();
-  }
-
-  // Perform the update
-  auto updateFn = [=](const shared_ptr<SwitchState>& state) {
-    RouteUpdater updater(state->getRouteTables());
-    updater.delRoute(routerId, network, mask);
-    auto newRt = updater.updateDone();
-    if (!newRt) {
-      return shared_ptr<SwitchState>();
-    }
-    auto newState = state->clone();
-    newState->resetRouteTables(std::move(newRt));
-    return newState;
-  };
-  sw_->updateStateBlocking("delete unicast route", updateFn);
+  auto prefixes = std::make_unique<std::vector<IpPrefix>>();
+  prefixes->emplace_back(std::move(*prefix));
+  deleteUnicastRoutes(client, std::move(prefixes));
 }
 
 void ThriftHandler::addUnicastRoutes(
@@ -218,18 +180,19 @@ void ThriftHandler::addUnicastRoutes(
   auto updateFn = [&](const shared_ptr<SwitchState>& state) {
     RouteUpdater updater(state->getRouteTables());
     RouterID routerId = RouterID(0); // TODO, default vrf for now
+    auto clientIdToAdmin = sw_->clientIdToAdminDistance(client);
     for (const auto& route : *routes) {
       auto network = toIPAddress(route.dest.ip);
       auto mask = static_cast<uint8_t>(route.dest.prefixLength);
-      RouteNextHops nexthops;
-      nexthops.reserve(route.nextHopAddrs.size());
-      for (const auto& nh : route.nextHopAddrs) {
-        nexthops.emplace(toIPAddress(nh));
-      }
+      auto adminDistance = route.__isset.adminDistance ? route.adminDistance :
+        clientIdToAdmin;
+      RouteNextHops nexthops = util::toRouteNextHops(route.nextHopAddrs);
       if (nexthops.size()) {
-        updater.addRoute(routerId, network, mask, std::move(nexthops));
+        updater.addRoute(routerId, network, mask, ClientID(client),
+                         RouteNextHopEntry(std::move(nexthops)));
       } else {
-        updater.addRoute(routerId, network, mask, RouteForwardAction::DROP);
+        updater.addRoute(routerId, network, mask, ClientID(client),
+                         RouteNextHopEntry(RouteForwardAction::DROP));
       }
       if (network.isV4()) {
         sw_->stats()->addRouteV4();
@@ -269,7 +232,7 @@ void ThriftHandler::deleteUnicastRoutes(
       } else {
         sw_->stats()->delRouteV6();
       }
-      updater.delRoute(routerId, network, mask);
+      updater.delRoute(routerId, network, mask, ClientID(client));
     }
     auto newRt = updater.updateDone();
     if (!newRt) {
@@ -293,22 +256,18 @@ void ThriftHandler::syncFib(
   // We could use folly::MoveWrapper if we did need to capture routes by value.
   auto updateFn = [&](const shared_ptr<SwitchState>& state) {
     // create an update object starting from empty
-    RouteUpdater updater(state->getRouteTables(), true);
-    cfg::SwitchConfig emptyPrevConfig;
-    // Add static routes from config
-    updater.updateStaticRoutes(sw_->getConfig(), emptyPrevConfig);
-    // add all interface routes
-    updater.addInterfaceAndLinkLocalRoutes(state->getInterfaces());
+    RouteUpdater updater(state->getRouteTables());
     RouterID routerId = RouterID(0); // TODO, default vrf for now
-    for (auto const& route : *routes) {
+    auto clientIdToAdmin = sw_->clientIdToAdminDistance(client);
+    updater.removeAllRoutesForClient(routerId, ClientID(client));
+    for (const auto& route : *routes) {
       folly::IPAddress network = toIPAddress(route.dest.ip);
       uint8_t mask = static_cast<uint8_t>(route.dest.prefixLength);
-      RouteNextHops nexthops;
-      nexthops.reserve(route.nextHopAddrs.size());
-      for (const auto& nh : route.nextHopAddrs) {
-        nexthops.emplace(toIPAddress(nh));
-      }
-      updater.addRoute(routerId, network, mask, std::move(nexthops));
+      auto adminDistance = route.__isset.adminDistance ? route.adminDistance :
+        clientIdToAdmin;
+      RouteNextHops nexthops = util::toRouteNextHops(route.nextHopAddrs);
+      updater.addRoute(routerId, network, mask, ClientID(client),
+                       RouteNextHopEntry(std::move(nexthops)));
       if (network.isV4()) {
         sw_->stats()->addRouteV4();
       } else {
@@ -423,38 +382,51 @@ void ThriftHandler::fillPortStats(PortInfoThrift& portInfo) {
     ctr.errors.discards = getSumStat(prefix, "discards");
   };
 
-  const auto& status = sw_->getPortStatus(PortID(portId));
-  portInfo.adminState = PortAdminState(status.enabled);
-  portInfo.operState = PortOperState(status.up);
-
   fillPortCounters(portInfo.output, "out_");
   fillPortCounters(portInfo.input, "in_");
 }
 
-void ThriftHandler::getPortInfo(PortInfoThrift& portInfo, int32_t portId) {
-  ensureConfigured();
-  const auto port = sw_->getState()->getPorts()->getPortIf(PortID(portId));
-
-  if (!port) {
-    throw FbossError("no such port ", portId);
-  }
-  portInfo.portId = portId;
+void ThriftHandler::getPortInfoHelper(
+    PortInfoThrift& portInfo,
+    const std::shared_ptr<Port> port) {
+  portInfo.portId = port->getID();
   portInfo.name = port->getName();
   portInfo.description = port->getDescription();
   portInfo.speedMbps = (int) port->getWorkingSpeed();
   for (auto entry : port->getVlans()) {
     portInfo.vlans.push_back(entry.first);
   }
+
+  portInfo.adminState = PortAdminState(port->getState() == cfg::PortState::UP);
+  portInfo.operState = PortOperState(port->getOperState());
+  portInfo.fecEnabled = sw_->getHw()->getPortFECConfig(port->getID());
+
+
   fillPortStats(portInfo);
+}
+
+void ThriftHandler::getPortInfo(PortInfoThrift &portInfo, int32_t portId) {
+  ensureConfigured();
+
+  const auto port =
+      sw_->getState()->getPorts()->getPortIf(PortID(portId));
+  if (!port) {
+    throw FbossError("no such port ", portId);
+  }
+
+  getPortInfoHelper(portInfo, port);
 }
 
 void ThriftHandler::getAllPortInfo(map<int32_t, PortInfoThrift>& portInfoMap) {
   ensureConfigured();
 
-  for (const auto& port : (*sw_->getState()->getPorts())) {
+  // NOTE: important to take pointer to switch state before iterating over
+  // list of ports
+  std::shared_ptr<SwitchState> swState = sw_->getState();
+  for (const auto& port : *(swState->getPorts())) {
     auto portId = port->getID();
     auto& portInfo = portInfoMap[portId];
-    getPortInfo(portInfo, portId);
+    getPortInfoHelper(portInfo, port);
   }
 }
 
@@ -508,33 +480,86 @@ void ThriftHandler::setPortState(int32_t portNum, bool enable) {
   sw_->updateStateBlocking("set port state", updateFn);
 }
 
-void ThriftHandler::getRouteTable(std::vector<UnicastRoute>& route) {
+void ThriftHandler::getRouteTable(std::vector<UnicastRoute>& routes) {
   ensureConfigured();
-  for (const auto& routeTable : (*sw_->getState()->getRouteTables())) {
+  for (const auto& routeTable : (*sw_->getAppliedState()->getRouteTables())) {
     for (const auto& ipv4Rib : routeTable->getRibV4()->routes()) {
       UnicastRoute tempRoute;
       auto ipv4 = ipv4Rib.value().get();
+      if (!ipv4->isResolved()) {
+        LOG(INFO) << "Skipping unresolved route: " << ipv4->toFollyDynamic();
+        continue;
+      }
       auto fwdInfo = ipv4->getForwardInfo();
       tempRoute.dest.ip = toBinaryAddress(ipv4->prefix().network);
       tempRoute.dest.prefixLength = ipv4->prefix().mask;
-      for (const auto& hop : fwdInfo.getNexthops()) {
-        tempRoute.nextHopAddrs.push_back(
-                    toBinaryAddress(hop.nexthop));
-      }
-      route.push_back(tempRoute);
+      tempRoute.nextHopAddrs = util::fromFwdNextHops(fwdInfo.getNextHopSet());
+      routes.emplace_back(std::move(tempRoute));
     }
     for (const auto& ipv6Rib : routeTable->getRibV6()->routes()) {
       UnicastRoute tempRoute;
       auto ipv6 = ipv6Rib.value().get();
-      auto fwdInfo = ipv6->getForwardInfo();
-      tempRoute.dest.ip = toBinaryAddress(
-                                                     ipv6->prefix().network);
-      tempRoute.dest.prefixLength = ipv6->prefix().mask;
-      for (const auto& hop : fwdInfo.getNexthops()) {
-        tempRoute.nextHopAddrs.push_back(
-                    toBinaryAddress(hop.nexthop));
+      if (!ipv6->isResolved()) {
+        LOG(INFO) << "Skipping unresolved route: " << ipv6->toFollyDynamic();
+        continue;
       }
-      route.push_back(tempRoute);
+      auto fwdInfo = ipv6->getForwardInfo();
+      tempRoute.dest.ip = toBinaryAddress(ipv6->prefix().network);
+      tempRoute.dest.prefixLength = ipv6->prefix().mask;
+      tempRoute.nextHopAddrs = util::fromFwdNextHops(fwdInfo.getNextHopSet());
+      routes.emplace_back(std::move(tempRoute));
+    }
+  }
+}
+
+void ThriftHandler::getRouteTableByClient(
+    std::vector<UnicastRoute>& routes, int16_t client) {
+  ensureConfigured();
+  for (const auto& routeTable : (*sw_->getState()->getRouteTables())) {
+    for (const auto& ipv4Rib : routeTable->getRibV4()->routes()) {
+      auto ipv4 = ipv4Rib.value().get();
+      auto entry = ipv4->getEntryForClient(ClientID(client));
+      if (not entry) {
+        continue;
+      }
+
+      UnicastRoute tempRoute;
+      tempRoute.dest.ip = toBinaryAddress(ipv4->prefix().network);
+      tempRoute.dest.prefixLength = ipv4->prefix().mask;
+      tempRoute.nextHopAddrs = util::fromRouteNextHops(
+          entry->getNextHopSet());
+      routes.emplace_back(std::move(tempRoute));
+    }
+
+    for (const auto& ipv6Rib : routeTable->getRibV6()->routes()) {
+      auto ipv6 = ipv6Rib.value().get();
+      auto entry = ipv6->getEntryForClient(ClientID(client));
+      if (not entry) {
+        continue;
+      }
+
+      UnicastRoute tempRoute;
+      tempRoute.dest.ip = toBinaryAddress(ipv6->prefix().network);
+      tempRoute.dest.prefixLength = ipv6->prefix().mask;
+      tempRoute.nextHopAddrs = util::fromRouteNextHops(
+          entry->getNextHopSet());
+      routes.emplace_back(std::move(tempRoute));
+    }
+  }
+}
+
+void ThriftHandler::getRouteTableDetails(std::vector<RouteDetails>& routes) {
+  ensureConfigured();
+  for (const auto& routeTable : (*sw_->getState()->getRouteTables())) {
+    for (const auto& ipv4Rib : routeTable->getRibV4()->routes()) {
+      auto ipv4 = ipv4Rib.value().get();
+      RouteDetails rd = ipv4->toRouteDetails();
+      routes.emplace_back(std::move(rd));
+    }
+    for (const auto& ipv6Rib : routeTable->getRibV6()->routes()) {
+      auto ipv6 = ipv6Rib.value().get();
+      RouteDetails rd = ipv6->toRouteDetails();
+      routes.emplace_back(std::move(rd));
     }
   }
 }
@@ -544,7 +569,7 @@ void ThriftHandler::getIpRoute(UnicastRoute& route,
   ensureConfigured();
   folly::IPAddress ipAddr = toIPAddress(*addr);
   auto routeTable = sw_->getState()->getRouteTables()->getRouteTableIf(
-                                                              RouterID(vrfId));
+      RouterID(vrfId));
   if (!routeTable) {
     throw FbossError("No Such VRF ", vrfId);
   }
@@ -552,7 +577,7 @@ void ThriftHandler::getIpRoute(UnicastRoute& route,
   if (ipAddr.isV4()) {
     auto ripV4Rib = routeTable->getRibV4();
     auto match = ripV4Rib->longestMatch(ipAddr.asV4());
-    if (!match) {
+    if (!match || !match->isResolved()) {
       route.dest.ip = toBinaryAddress(IPAddressV4("0.0.0.0"));
       route.dest.prefixLength = 0;
       return;
@@ -560,14 +585,11 @@ void ThriftHandler::getIpRoute(UnicastRoute& route,
     const auto fwdInfo = match->getForwardInfo();
     route.dest.ip = toBinaryAddress(match->prefix().network);
     route.dest.prefixLength = match->prefix().mask;
-    for (auto iter = fwdInfo.getNexthops().begin();
-              iter != fwdInfo.getNexthops().end(); ++iter) {
-      route.nextHopAddrs.push_back(toBinaryAddress(iter->nexthop));
-    }
+    route.nextHopAddrs = util::fromFwdNextHops(fwdInfo.getNextHopSet());
   } else {
     auto ripV6Rib = routeTable->getRibV6();
     auto match = ripV6Rib->longestMatch(ipAddr.asV6());
-    if (!match) {
+    if (!match || !match->isResolved()) {
       route.dest.ip = toBinaryAddress(IPAddressV6("::0"));
       route.dest.prefixLength = 0;
       return;
@@ -575,9 +597,31 @@ void ThriftHandler::getIpRoute(UnicastRoute& route,
     const auto fwdInfo = match->getForwardInfo();
     route.dest.ip = toBinaryAddress(match->prefix().network);
     route.dest.prefixLength = match->prefix().mask;
-    for (auto iter = fwdInfo.getNexthops().begin();
-              iter != fwdInfo.getNexthops().end(); ++iter) {
-      route.nextHopAddrs.push_back(toBinaryAddress(iter->nexthop));
+    route.nextHopAddrs = util::fromFwdNextHops(fwdInfo.getNextHopSet());
+  }
+}
+
+void ThriftHandler::getIpRouteDetails(
+  RouteDetails& route, std::unique_ptr<Address> addr, int32_t vrfId) {
+  ensureConfigured();
+  folly::IPAddress ipAddr = toIPAddress(*addr);
+  auto routeTable = sw_->getState()->getRouteTables()->getRouteTableIf(
+      RouterID(vrfId));
+  if (!routeTable) {
+    throw FbossError("No Such VRF ", vrfId);
+  }
+
+  if (ipAddr.isV4()) {
+    auto ripV4Rib = routeTable->getRibV4();
+    auto match = ripV4Rib->longestMatch(ipAddr.asV4());
+    if (match && match->isResolved()) {
+      route = match->toRouteDetails();
+    }
+  } else {
+    auto ripV6Rib = routeTable->getRibV6();
+    auto match = ripV6Rib->longestMatch(ipAddr.asV6());
+    if (match && match->isResolved()) {
+      route = match->toRouteDetails();
     }
   }
 }
@@ -614,7 +658,12 @@ static LinkNeighborThrift thriftLinkNeighbor(const LinkNeighbor& n,
 
 void ThriftHandler::getLldpNeighbors(vector<LinkNeighborThrift>& results) {
   ensureConfigured();
-  auto* db = sw_->getLldpMgr()->getDB();
+  auto lldpMgr = sw_->getLldpMgr();
+  if (lldpMgr == nullptr) {
+    throw std::runtime_error("lldpMgr is not configured");
+  }
+
+  auto* db = lldpMgr->getDB();
   // Do an immediate check for expired neighbors
   db->pruneExpiredNeighbors();
   auto neighbors = db->getNeighbors();
@@ -668,7 +717,8 @@ void ThriftHandler::async_eb_registerForNeighborChanged(
 void ThriftHandler::startPktCapture(unique_ptr<CaptureInfo> info) {
   ensureConfigured();
   auto* mgr = sw_->getCaptureMgr();
-  auto capture = make_unique<PktCapture>(info->name, info->maxPackets);
+  auto capture = make_unique<PktCapture>(
+      info->name, info->maxPackets, info->direction);
   mgr->startCapture(std::move(capture));
 }
 
@@ -771,7 +821,7 @@ void ThriftHandler::txPktL3(unique_ptr<fbstring> payload) {
   RWPrivateCursor cursor(pkt->buf());
   cursor.push(StringPiece(*payload));
 
-  sw_->sendL3Packet(RouterID(0), std::move(pkt));
+  sw_->sendL3Packet(std::move(pkt));
 }
 
 Vlan* ThriftHandler::getVlan(int32_t vlanId) {
@@ -814,29 +864,14 @@ void ThriftHandler::getVlanBinaryAddressesByName(BinaryAddresses& addrs,
 
 void ThriftHandler::getSfpDomInfo(map<int32_t, SfpDom>& domInfos,
                                   unique_ptr<vector<int32_t>> ports) {
-  ensureConfigured();
-  if (ports->empty()) {
-    domInfos = sw_->getSfpDoms();
-  } else {
-    for (auto port : *ports) {
-      domInfos[port] = sw_->getSfpDom(PortID(port));
-    }
-  }
+  throw FbossError(folly::to<std::string>("This call is no longer supported, ",
+      "use getTransceiverInfo instead"));
 }
 
 void ThriftHandler::getTransceiverInfo(map<int32_t, TransceiverInfo>& info,
                                   unique_ptr<vector<int32_t>> ids) {
-  ensureConfigured();
-  if (ids->empty()) {
-    auto transceivers = sw_->getTransceiversInfo();
-    for (auto& it : transceivers) {
-      info[it.first] = it.second;
-    }
-  } else {
-    for (auto id : *ids) {
-      info[id] = sw_->getTransceiverInfo(TransceiverID(id));
-    }
-  }
+  throw FbossError(folly::to<std::string>("This call is no longer supported, ",
+      "please call the QsfpService instead"));
 }
 
 template<typename ADDR_TYPE, typename ADDR_CONVERTER>
@@ -908,7 +943,7 @@ void ThriftHandler::async_tm_subscribeToCounters(
 
   // Grab the requested samplers from the underlying switch implementation
   auto samplers = make_unique<HighresSamplerList>();
-  auto numCounters = sw_->getHighresSamplers(samplers.get(), req->counters);
+  auto numCounters = sw_->getHighresSamplers(samplers.get(), req->counterSet);
 
   if (numCounters > 0) {
     // Grab the connection context and create a kill switch

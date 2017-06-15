@@ -14,13 +14,14 @@
 namespace facebook { namespace fboss {
 
 class SimPlatform;
+class SwitchState;
 
 class SimSwitch : public HwSwitch {
  public:
   SimSwitch(SimPlatform* platform, uint32_t numPorts);
 
   HwInitResult init(Callback* callback) override;
-  void stateChanged(const StateDelta& delta) override;
+  std::shared_ptr<SwitchState> stateChanged(const StateDelta& delta) override;
   std::unique_ptr<TxPacket> allocatePacket(uint32_t size) override;
   bool sendPacketSwitched(std::unique_ptr<TxPacket> pkt) noexcept override;
   bool sendPacketOutOfPort(
@@ -44,10 +45,9 @@ class SimSwitch : public HwSwitch {
   // TODO
   void updateStats(SwitchStats *switchStats) override {}
 
-  int getHighresSamplers(
-      HighresSamplerList* samplers,
-      const folly::StringPiece namespaceString,
-      const std::set<folly::StringPiece>& counterSet) override {
+  int getHighresSamplers(HighresSamplerList* samplers,
+                         const std::string& namespaceString,
+                         const std::set<CounterRequest>& counterSet) override {
     return 0;
   }
 
@@ -63,11 +63,6 @@ class SimSwitch : public HwSwitch {
 
   void unregisterCallbacks() override {
     // TODO
-  }
-
-  void remedyPorts() override {
-    // TODO
-    // Do nothing for now.
   }
 
   bool getAndClearNeighborHit(RouterID vrf,

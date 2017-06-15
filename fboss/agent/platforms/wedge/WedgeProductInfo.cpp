@@ -64,8 +64,8 @@ void WedgeProductInfo::initialize() {
     parse(data);
   } catch (const std::exception& err) {
     LOG(ERROR) << err.what();
-    // if fruid info fails fall back to hostname
-    initFromHostname();
+    // if fruid info fails fall back to fbwhoami
+    initFromFbWhoAmI();
   }
   initMode();
 }
@@ -89,30 +89,28 @@ std::string WedgeProductInfo::getProductName() {
 void WedgeProductInfo::initMode() {
   if (FLAGS_mode.empty()) {
     auto modelName = getProductName();
-    if (modelName == "Fabric-Card") {
-      mode_ = WedgePlatformMode::FC;
-    } else if (modelName == "Line-Card") {
-      mode_ = WedgePlatformMode::LC;
-    } else if (modelName.find("Wedge100") == 0) {
+    if (modelName.find("Wedge100") == 0 ||
+               modelName.find("WEDGE100") == 0) {
+      // Wedge100 comes from fruid.json, WEDGE100 comes from fbwhoami
       mode_ = WedgePlatformMode::WEDGE100;
-    } else if (modelName.find("Wedge") == 0) {
+    } else if (modelName.find("Wedge") == 0 ||
+               modelName.find("WEDGE") == 0) {
+      // Wedge100 comes from fruid.json, WEDGE comes from fbwhoami
       mode_ = WedgePlatformMode::WEDGE;
     } else if (modelName.find("SCM-LC") == 0 || modelName.find("LC") == 0) {
        // TODO remove LC once fruid.json is fixed on Galaxy Linecards
        mode_ = WedgePlatformMode::GALAXY_LC;
-    } else if (modelName.find("SCM-FC") == 0 || modelName.find("FAB") == 0) {
-       // TODO remove FAB once fruid.json is fixed on Galaxy fabric cards
-       mode_ = WedgePlatformMode::GALAXY_FC;
+    } else if (
+        modelName.find("SCM-FC") == 0 || modelName.find("SCM-FAB") == 0 ||
+        modelName.find("FAB") == 0) {
+      // TODO remove FAB once fruid.json is fixed on Galaxy fabric cards
+      mode_ = WedgePlatformMode::GALAXY_FC;
     } else {
       throw std::runtime_error("invalid model name " + modelName);
     }
   } else {
     if (FLAGS_mode == "wedge") {
       mode_ = WedgePlatformMode::WEDGE;
-    } else if (FLAGS_mode == "lc") {
-      mode_ = WedgePlatformMode::LC;
-    } else if (FLAGS_mode == "fc") {
-      mode_ = WedgePlatformMode::FC;
     } else if (FLAGS_mode == "wedge100") {
       mode_ = WedgePlatformMode::WEDGE100;
     } else if (FLAGS_mode == "galaxy_lc") {
@@ -126,7 +124,21 @@ void WedgeProductInfo::initMode() {
 }
 
 void WedgeProductInfo::parse(std::string data) {
-  dynamic info = parseJson(data)[kInfo];
+  dynamic info;
+  try {
+    info = parseJson(data).at(kInfo);
+  } catch (const std::exception& err) {
+    LOG(ERROR) << err.what();
+    // Handle fruid data present outside of "Information" i.e.
+    // {
+    //   "Information" : fruid json
+    // }
+    // vs
+    // {
+    //  Fruid json
+    // }
+    info = parseJson(data);
+  }
   productInfo_.oem = folly::to<std::string>(info[kSysMfg].asString());
   productInfo_.product = folly::to<std::string>(info[kProdName].asString());
   productInfo_.serial = folly::to<std::string>(info[kSerialNum].asString());
@@ -151,13 +163,10 @@ void WedgeProductInfo::parse(std::string data) {
 
   productInfo_.fabricLocation = folly::to<std::string>
                                     (info[kFabricLocation].asString());
-  // Append L/R to the serial number based on the fabricLocation
-  if (boost::iequals(productInfo_.fabricLocation, kFabricLocationLeft)) {
-    productInfo_.serial = productInfo_.serial + "L";
-  } else if (boost::iequals(productInfo_.fabricLocation,
-        kFabricLocationRight)) {
-    productInfo_.serial = productInfo_.serial + "R";
-  }
+  // FB only - we apply custom logic to construct unique SN for
+  // cases where we create multiple assets for a single physical
+  // card in chassis.
+  setFBSerial();
   productInfo_.version = info[kVersion].asInt();
   productInfo_.subVersion = info[kSubVersion].asInt();
   productInfo_.productionState = info[kProductionState].asInt();

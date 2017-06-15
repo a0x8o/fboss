@@ -10,11 +10,14 @@
 // Copyright 2004-present Facebook.  All rights reserved.
 #pragma once
 
-#include "fboss/agent/types.h"
 #include <folly/IPAddress.h>
+
 #include "fboss/agent/state/NodeBase.h"
-#include "fboss/agent/state/RouteForwardInfo.h"
+#include "fboss/agent/state/RouteNextHopEntry.h"
+#include "fboss/agent/state/RouteNextHopsMulti.h"
 #include "fboss/agent/state/RouteTypes.h"
+#include "fboss/agent/types.h"
+#include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 
 #include <boost/container/flat_set.hpp>
 
@@ -28,8 +31,7 @@ namespace facebook { namespace fboss {
 template<typename AddrT>
 struct RouteFields {
   enum CopyBehavior {
-    COPY_ALL_MEMBERS,
-    COPY_ONLY_PREFIX,
+    COPY_PREFIX_AND_NEXTHOPS,
   };
   typedef RoutePrefix<AddrT> Prefix;
   explicit RouteFields(const Prefix& prefix);
@@ -47,14 +49,16 @@ struct RouteFields {
    */
   static RouteFields fromFollyDynamic(const folly::dynamic& routeJson);
 
+  RouteDetails toRouteDetails() const;
+
   Prefix prefix;
   // The following fields will not be copied during clone()
   /*
    * All next hops of the routes. This set could be empty if and only if
    * the route is directly connected
    */
-  RouteNextHops nexthops;
-  RouteForwardInfo fwd;
+  RouteNextHopsMulti nexthopsmulti;
+  RouteNextHopEntry fwd;
   uint32_t flags{0};
 };
 
@@ -65,29 +69,27 @@ class Route : public NodeBaseT<Route<AddrT>, RouteFields<AddrT>> {
   typedef NodeBaseT<Route<AddrT>, RouteFields<AddrT>> RouteBase;
   typedef typename RouteFields<AddrT>::Prefix Prefix;
   typedef RouteForwardAction Action;
-  // Constructor for directly connected route
-  Route(const Prefix& prefix, InterfaceID intf, const folly::IPAddress& addr);
-  // Constructor for a route with ECMP
-  Route(const Prefix& prefix, const RouteNextHops& nhs);
-  Route(const Prefix& prefix, RouteNextHops&& nhs);
-  // Constructor for a route with special forwarding action
-  Route(const Prefix& prefix, Action action);
 
-  ~Route() override;
+  // Constructor for a route
+  Route(const Prefix& prefix, ClientID clientId, RouteNextHopEntry entry)
+    : RouteBase(prefix) {
+    update(clientId, std::move(entry));
+  }
 
   static std::shared_ptr<Route<AddrT>>
-  fromFollyDynamic(const folly::dynamic& json) {
-    const auto& fields = RouteFields<AddrT>::fromFollyDynamic(json);
-    return std::make_shared<Route<AddrT>>(fields);
-  }
+  fromFollyDynamic(const folly::dynamic& json);
+
+  folly::dynamic toFollyDynamic() const override;
 
   static std::shared_ptr<Route<AddrT>>
   fromJson(const folly::fbstring& jsonStr) {
     return fromFollyDynamic(folly::parseJson(jsonStr));
   }
 
-  folly::dynamic toFollyDynamic() const override {
-    return this->getFields()->toFollyDynamic();
+  RouteDetails toRouteDetails() const {
+    RouteDetails rd = this->getFields()->toRouteDetails();
+    rd.isConnected = isConnected();
+    return rd;
   }
 
   static void modify(std::shared_ptr<SwitchState>* state);
@@ -107,9 +109,6 @@ class Route : public NodeBaseT<Route<AddrT>, RouteFields<AddrT>> {
   bool isConnected() const {
     return (RouteBase::getFields()->flags & CONNECTED);
   }
-  bool isWithNexthops() const {
-    return !nexthops().empty();
-  }
   bool isDrop() const {
     return isResolved() && RouteBase::getFields()->fwd.isDrop();
   }
@@ -126,56 +125,49 @@ class Route : public NodeBaseT<Route<AddrT>, RouteFields<AddrT>> {
   }
   std::string str() const;
   // Return the forwarding info for this route
-  const RouteForwardInfo& getForwardInfo() const {
-    CHECK(isResolved());
+  const RouteNextHopEntry& getForwardInfo() const {
     return RouteBase::getFields()->fwd;
   }
-  const RouteNextHops& nexthops() const {
-    return RouteBase::getFields()->nexthops;
+  const RouteNextHopEntry * FOLLY_NULLABLE getEntryForClient(
+      ClientID clientId) const {
+    return RouteBase::getFields()
+      ->nexthopsmulti.getEntryForClient(clientId);
   }
-  bool isSame(InterfaceID intf, const folly::IPAddress& addr) const;
-  bool isSame(const RouteNextHops& nhs) const;
-  bool isSame(Action action) const;
+  std::pair<ClientID, const RouteNextHopEntry *> getBestEntry() const {
+    return RouteBase::getFields()->nexthopsmulti.getBestEntry();
+  }
+  bool hasNoEntry() const {
+    return RouteBase::getFields()->nexthopsmulti.isEmpty();
+  }
+
+  bool has(ClientID clientId, const RouteNextHopEntry& entry) const;
+
   bool isSame(const Route* rt) const;
+
   /*
    * The following functions modify the route object.
    * They should only be called on unpublished objects which are only visible
    * to a single thread
    */
-  void setFlagsProcessing() {
+  void setProcessing() {
     CHECK(!isProcessing());
-    RouteBase::writableFields()->flags |= PROCESSING;
+    setFlagsProcessing();
   }
-  void setResolved(RouteForwardNexthops&& fwd) {
-    RouteBase::writableFields()->fwd.setNexthops(std::move(fwd));
-    setFlagsResolved();
+  void setConnected() {
+    setFlagsConnected();
   }
-  void setResolved(const RouteForwardNexthops& fwd) {
-    RouteBase::writableFields()->fwd.setNexthops(fwd);
-    setFlagsResolved();
-  }
-  void setResolved(Action action) {
-    RouteBase::writableFields()->fwd.setAction(action);
-    setFlagsResolved();
-  }
-  void clearFlags() {
-    auto& flags = RouteBase::writableFields()->flags;
-    flags = 0x0;
-  }
-
-  bool flagsCleared() const {
-    return RouteBase::getFields()->flags == 0;
-  }
+  void setResolved(RouteNextHopEntry fwd);
   void setUnresolvable();
-  void update(InterfaceID intf, const folly::IPAddress& addr);
-  void update(const RouteNextHops& nhs);
-  void update(RouteNextHops&& nhs);
-  void update(Action action);
+  void clearForward();
+
+  void update(ClientID clientId, RouteNextHopEntry entry);
+
+  void delEntryForClient(ClientID clientId);
+
  private:
   // no copy or assign operator
   Route(const Route &) = delete;
   Route& operator&(const Route &) = delete;
-  void updateNexthopCommon(const RouteNextHops& nhs);
   /**
    * Bit definition for RouteFields<>::flags
    *
@@ -202,6 +194,11 @@ class Route : public NodeBaseT<Route<AddrT>, RouteFields<AddrT>> {
     UNRESOLVABLE = 0x4,
     PROCESSING = 0x8,
   };
+  void setFlagsProcessing() {
+    auto& flags = RouteBase::writableFields()->flags;
+    flags |= PROCESSING;
+    flags &= ~(RESOLVED|UNRESOLVABLE|CONNECTED);
+  }
   void setFlagsResolved() {
     auto& flags = RouteBase::writableFields()->flags;
     flags |= RESOLVED;
@@ -210,12 +207,17 @@ class Route : public NodeBaseT<Route<AddrT>, RouteFields<AddrT>> {
   void setFlagsUnresolvable() {
     auto& flags = RouteBase::writableFields()->flags;
     flags |= UNRESOLVABLE;
-    flags &= ~(RESOLVED|PROCESSING);
+    flags &= ~(RESOLVED|PROCESSING|CONNECTED);
   }
   void setFlagsConnected() {
-    RouteBase::writableFields()->flags = CONNECTED;
-    setFlagsResolved();
+    auto& flags = RouteBase::writableFields()->flags;
+    flags |= CONNECTED;
   }
+  void clearForwardInFlags() {
+    auto& flags = RouteBase::writableFields()->flags;
+    flags &= ~(RESOLVED|PROCESSING|CONNECTED|UNRESOLVABLE);
+  }
+
   // Inherit the constructors required for clone()
   using NodeBaseT<Route<AddrT>, RouteFields<AddrT>>::NodeBaseT;
   friend class CloneAllocator;

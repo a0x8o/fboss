@@ -21,16 +21,18 @@
 
 namespace facebook { namespace fboss {
 
-class Port;
-class PortMap;
-class Vlan;
-class VlanMap;
-class Interface;
-class InterfaceMap;
-class RouteTable;
-class RouteTableMap;
 class AclEntry;
 class AclMap;
+class AggregatePortMap;
+class Interface;
+class InterfaceMap;
+class Port;
+class PortMap;
+class RouteTable;
+class RouteTableMap;
+class Vlan;
+class VlanMap;
+template <typename AddressT> class Route;
 
 struct SwitchStateFields {
   SwitchStateFields();
@@ -38,6 +40,7 @@ struct SwitchStateFields {
   template<typename Fn>
   void forEachChild(Fn fn) {
     fn(ports.get());
+    fn(aggPorts.get());
     fn(vlans.get());
     fn(interfaces.get());
     fn(routeTables.get());
@@ -53,6 +56,7 @@ struct SwitchStateFields {
   static SwitchStateFields fromFollyDynamic(const folly::dynamic& json);
   // Static state, which can be accessed without locking.
   std::shared_ptr<PortMap> ports;
+  std::shared_ptr<AggregatePortMap> aggPorts;
   std::shared_ptr<VlanMap> vlans;
   std::shared_ptr<InterfaceMap> interfaces;
   std::shared_ptr<RouteTableMap> routeTables;
@@ -70,8 +74,14 @@ struct SwitchStateFields {
   // Keep maxNeighborProbes sufficiently large
   // so we don't expire arp/ndp entries during
   // agent restart on our neighbors
-  uint32_t maxNeighborProbes{30};
+  uint32_t maxNeighborProbes{300};
   std::chrono::seconds staleEntryInterval{10};
+  // source IP of the DHCP relay pkt to the DHCP server
+  folly::IPAddressV4 dhcpV4RelaySrc;
+  folly::IPAddressV6 dhcpV6RelaySrc;
+  // source IP of the DHCP reply pkt to the client host
+  folly::IPAddressV4 dhcpV4ReplySrc;
+  folly::IPAddressV6 dhcpV6ReplySrc;
 };
 
 /*
@@ -128,7 +138,7 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
   static std::unique_ptr<SwitchState> uniquePtrFromFollyDynamic(
       const folly::dynamic& json) {
     const auto& fields = SwitchStateFields::fromFollyDynamic(json);
-    return folly::make_unique<SwitchState>(fields);
+    return std::make_unique<SwitchState>(fields);
   }
 
   static std::unique_ptr<SwitchState> uniquePtrFromJson(
@@ -142,10 +152,27 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
 
   static void modify(std::shared_ptr<SwitchState>* state);
 
+  template <typename EntryClassT, typename NTableT>
+  static void revertNewNeighborEntry(
+      const std::shared_ptr<EntryClassT>& newEntry,
+      const std::shared_ptr<EntryClassT>& oldEntry,
+      std::shared_ptr<SwitchState>* appliedState);
+
+  template <typename AddressT>
+  static void revertNewRouteEntry(
+      const RouterID& id,
+      const std::shared_ptr<Route<AddressT>>& newRoute,
+      const std::shared_ptr<Route<AddressT>>& oldRoute,
+      std::shared_ptr<SwitchState>* appliedState);
+
   const std::shared_ptr<PortMap>& getPorts() const {
     return getFields()->ports;
   }
   std::shared_ptr<Port> getPort(PortID id) const;
+
+  const std::shared_ptr<AggregatePortMap> getAggregatePorts() const {
+    return getFields()->aggPorts;
+  }
 
   const std::shared_ptr<VlanMap>& getVlans() const {
     return getFields()->vlans;
@@ -198,6 +225,35 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
 
   void setStaleEntryInterval(std::chrono::seconds interval);
 
+  // dhcp relay packet IP overrides
+
+  folly::IPAddressV4 getDhcpV4RelaySrc() const {
+    return getFields()->dhcpV4RelaySrc;
+  }
+  void setDhcpV4RelaySrc(folly::IPAddressV4 v4RelaySrc) {
+     writableFields()->dhcpV4RelaySrc = v4RelaySrc;
+  }
+
+  folly::IPAddressV6 getDhcpV6RelaySrc() const {
+    return getFields()->dhcpV6RelaySrc;
+  }
+  void setDhcpV6RelaySrc(folly::IPAddressV6 v6RelaySrc) {
+     writableFields()->dhcpV6RelaySrc = v6RelaySrc;
+  }
+
+  folly::IPAddressV4 getDhcpV4ReplySrc() const {
+    return getFields()->dhcpV4ReplySrc;
+  }
+  void setDhcpV4ReplySrc(folly::IPAddressV4 v4ReplySrc) {
+     writableFields()->dhcpV4ReplySrc = v4ReplySrc;
+  }
+
+  folly::IPAddressV6 getDhcpV6ReplySrc() const {
+    return getFields()->dhcpV6ReplySrc;
+  }
+  void setDhcpV6ReplySrc(folly::IPAddressV6 v6ReplySrc) {
+     writableFields()->dhcpV6ReplySrc = v6ReplySrc;
+  }
 
   /*
    * The following functions modify the static state.
@@ -208,6 +264,7 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
 
   void registerPort(PortID id, const std::string& name);
   void resetPorts(std::shared_ptr<PortMap> ports);
+  void resetAggregatePorts(std::shared_ptr<AggregatePortMap> aggPorts);
   void resetVlans(std::shared_ptr<VlanMap> vlans);
   void addVlan(const std::shared_ptr<Vlan>& vlan);
   void addIntf(const std::shared_ptr<Interface>& intf);

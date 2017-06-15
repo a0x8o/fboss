@@ -71,16 +71,13 @@ void BcmUnit::attach(std::string warmBootDir) {
    * FIXME(orib): This assumes that we only ever have one unit set up,
    * and that as a result, opennsl_driver_init() will only be called once.
    */
-  wbHelper_ = folly::make_unique<BcmWarmBootHelper>(unit_, warmBootDir);
+  wbHelper_ = std::make_unique<BcmWarmBootHelper>(unit_, warmBootDir);
   unsetenv(wbEnvVar);
   if(warmBootHelper()->canWarmBoot()) {
     setenv(wbEnvVar, wbFlag, 1);
   }
 
   opennsl_driver_init();
-  auto rv = opennsl_switch_event_register(unit_, switchEventCallback, this);
-  bcmCheckError(rv, "unable to register switch event callback for unit ",
-                unit_);
 
   attached_.store(true, std::memory_order_release);
 }
@@ -96,36 +93,6 @@ BootType BcmUnit::bootType() {
   }
 
   return wbHelper_->canWarmBoot() ? BootType::WARM_BOOT : BootType::COLD_BOOT;
-}
-
-void BcmUnit::onSwitchEvent(opennsl_switch_event_t event,
-                            uint32_t arg1, uint32_t arg2, uint32_t arg3) {
-  switch (event) {
-    case OPENNSL_SWITCH_EVENT_STABLE_FULL:
-    case OPENNSL_SWITCH_EVENT_STABLE_ERROR:
-    case OPENNSL_SWITCH_EVENT_UNCONTROLLED_SHUTDOWN:
-    case OPENNSL_SWITCH_EVENT_WARM_BOOT_DOWNGRADE:
-      LOG(FATAL) << "Fatal switch event : " << event << "occured";
-      break;
-    default:
-      break;
-  }
-}
-
-void BcmUnit::switchEventCallback(int unitNumber,
-                                  opennsl_switch_event_t event,
-                                  uint32_t arg1,
-                                  uint32_t arg2,
-                                  uint32_t arg3,
-                                  void* userdata) {
-  BcmUnit* unit = reinterpret_cast<BcmUnit*>(userdata);
-  try {
-    unit->onSwitchEvent(event, arg1, arg2, arg3);
-  } catch (const std::exception& ex) {
-    LOG(FATAL) << "unhandled exception while processing switch event "
-      << event << "(" << arg1 << ", " << arg2 << ", " << arg3
-      << ") on unit " << unitNumber;
-  }
 }
 
 void BcmUnit::rawRegisterWrite(uint16_t phyID,

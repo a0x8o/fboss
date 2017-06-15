@@ -11,17 +11,24 @@
 
 #include <folly/Memory.h>
 #include "fboss/agent/SysError.h"
+#include "fboss/agent/ThriftHandler.h"
 #include "fboss/agent/hw/mock/MockHwSwitch.h"
 
-using folly::make_unique;
+#include <gmock/gmock.h>
+
+using std::make_unique;
 using std::string;
 using std::unique_ptr;
 
 namespace facebook { namespace fboss {
 
-MockPlatform::MockPlatform()
-  : tmpDir_("fboss_mock_state"),
-    hw_(new MockHwSwitch(this)) {
+MockPlatform::MockPlatform(std::unique_ptr<MockHwSwitch> hw) :
+    tmpDir_("fboss_mock_state"),
+    hw_(std::move(hw)) {
+}
+
+MockPlatform::MockPlatform() :
+    MockPlatform(make_unique<::testing::NiceMock<MockHwSwitch>>(this)) {
 }
 
 MockPlatform::~MockPlatform() {
@@ -29,13 +36,6 @@ MockPlatform::~MockPlatform() {
 
 HwSwitch* MockPlatform::getHwSwitch() const {
   return hw_.get();
-}
-
-unique_ptr<ThriftHandler> MockPlatform::createHandler(SwSwitch* sw) {
-  // We may need to implement this eventually.
-  // For now none of our tests call createHandler()
-  throw std::runtime_error("MockPlatform::createHandler() "
-                           "not implemented yet");
 }
 
 string MockPlatform::getVolatileStateDir() const {

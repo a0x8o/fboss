@@ -14,15 +14,9 @@
 #include <folly/FBString.h>
 #include "fboss/agent/types.h"
 #include <folly/IPAddress.h>
-
-#include <boost/container/flat_set.hpp>
+#include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 
 namespace facebook { namespace fboss {
-
-/**
- * Nexthops (ECMP) for a route
- */
-typedef boost::container::flat_set<folly::IPAddress> RouteNextHops;
 
 /**
  * Route forward actions

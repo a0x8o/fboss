@@ -57,11 +57,6 @@ class BcmPortTable {
   BcmPort* getBcmPortIf(opennsl_port_t id) const;
 
   /*
-   * Indicate that a port's link status has changed.
-   */
-  void setPortStatus(opennsl_port_t id, int status);
-
-  /*
    * Update all ports' statistics.
    */
   void updatePortStats();
@@ -71,11 +66,6 @@ class BcmPortTable {
   }
   bool portExists(opennsl_port_t port) const {
     return getBcmPortIf(port) != nullptr;
-  }
-  void remedyPorts() {
-    for (auto& portIdAndBcmPort : bcmPhysicalPorts_) {
-      portIdAndBcmPort.second->remedy();
-    }
   }
   void preparePortsForGracefulExit() {
     for (auto& portIdAndBcmPort : bcmPhysicalPorts_) {

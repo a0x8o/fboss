@@ -12,7 +12,9 @@
 #include <boost/container/flat_set.hpp>
 
 #include "fboss/agent/PlatformPort.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
+
+#include <vector>
 
 namespace facebook { namespace fboss {
 
@@ -22,7 +24,10 @@ typedef boost::container::flat_set<cfg::PortSpeed> LaneSpeeds;
 
 class BcmPlatformPort : public PlatformPort {
  public:
-  BcmPlatformPort() {}
+  using XPEs = std::vector<unsigned int>;
+
+  explicit BcmPlatformPort(const XPEs& egressXPEs)
+      : egressXPEs_(egressXPEs) {}
   BcmPlatformPort(BcmPlatformPort&&) = default;
   BcmPlatformPort& operator=(BcmPlatformPort&&) = default;
 
@@ -39,10 +44,22 @@ class BcmPlatformPort : public PlatformPort {
    */
   virtual LaneSpeeds supportedLaneSpeeds() const = 0;
 
+  TransmitterTechnology getTransmitterTech() const override = 0;
+
+  const XPEs&  getEgressXPEs() const { return egressXPEs_; }
+
  private:
   // Forbidden copy constructor and assignment operator
   BcmPlatformPort(BcmPlatformPort const &) = delete;
   BcmPlatformPort& operator=(BcmPlatformPort const &) = delete;
+  /*
+   * Tomahawk onwards BRCM started dividing ASIC MMU into
+   * multiple blocks called XPEs. A subset of ports then
+   * get mapped to each XPE. For earlier ASICs (TD2),
+   * where the MMU is not subdivided, we consider entire
+   * MMU to be a single XPE
+  */
+  XPEs egressXPEs_;
 };
 
 }} // facebook::fboss

@@ -10,7 +10,8 @@
 #pragma once
 
 #include "fboss/agent/types.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
+#include "fboss/qsfp_service/if/gen-cpp2/transceiver_types.h"
 
 namespace facebook { namespace fboss {
 
@@ -89,6 +90,8 @@ class PlatformPort {
    */
   virtual void linkSpeedChanged(const cfg::PortSpeed& speed) = 0;
 
+  virtual TransmitterTechnology getTransmitterTech() const = 0;
+
   /*
    * statusIndication() will be called by the hardware code once a second.
    *
@@ -107,14 +110,20 @@ class PlatformPort {
                                 bool ingress, bool egress,
                                 bool discards, bool errors) = 0;
   /**
-   * Do platform specific actions to remedy a port that is down.
-   */
-  virtual void remedy() = 0;
-
-  /**
    * Do platform specific actions for the port before we are warm booting.
    */
   virtual void prepareForGracefulExit() = 0;
+
+  /*
+   * There are situations (e.g. backplane ports on some platforms)
+   * where we don't need to enable FEC for ports even on 100G speeds.
+   * Not enabling FEC on these means that we don't incur the (very)
+   * minor latency (100ns) that enabling FEC entails.
+   * So, provide derived class platform ports a hook to override
+   * decision to enable FEC.
+   *
+   */
+  virtual bool shouldDisableFEC() const = 0;
 
  private:
   // Forbidden copy constructor and assignment operator

@@ -9,6 +9,7 @@
  */
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
 
+#include "fboss/agent/hw/BufferStatsLogger.h"
 #include "fboss/agent/hw/bcm/BcmRxPacket.h"
 
 #include <folly/Memory.h>
@@ -24,16 +25,25 @@ extern "C" {
 namespace facebook { namespace fboss {
 
 std::unique_ptr<BcmRxPacket> BcmSwitch::createRxPacket(opennsl_pkt_t* pkt) {
-  return folly::make_unique<BcmRxPacket>(pkt);
+  return std::make_unique<BcmRxPacket>(pkt);
 }
 
 void BcmSwitch::configureAdditionalEcmpHashSets() {}
+
+bool BcmSwitch::isAlpmEnabled() {
+  return false;
+}
 
 void BcmSwitch::dropDhcpPackets() {}
 
 void BcmSwitch::dropIPv6RAs() {}
 
 void BcmSwitch::setupCos() {}
+
+void BcmSwitch::copyIPv6LinkLocalMcastPackets() {
+  // OpenNSL doesn't yet provide functions for adding field-processor rules
+  // for capturing packets
+}
 
 void BcmSwitch::configureRxRateLimiting() {
   // OpenNSL doesn't yet provide functions for configuring rate-limiting,
@@ -62,10 +72,9 @@ std::unique_ptr<PacketTraceInfo> BcmSwitch::getPacketTrace(
   return nullptr;
 }
 
-int BcmSwitch::getHighresSamplers(
-    HighresSamplerList* samplers,
-    const folly::StringPiece namespaceString,
-    const std::set<folly::StringPiece>& counterSet) {
+int BcmSwitch::getHighresSamplers(HighresSamplerList* samplers,
+                                  const std::string& namespaceString,
+                                  const std::set<CounterRequest>& counterSet) {
   return 0;
 }
 
@@ -78,8 +87,8 @@ void BcmSwitch::fetchL2Table(std::vector<L2EntryThrift> *l2Table) {
 void BcmSwitch::initFieldProcessor(bool isWarmBoot) const {
   // API not available in opennsl
 }
-void BcmSwitch::configureCosQMappingForLocalInterfaces(
-    const StateDelta& delta) const {
+
+void BcmSwitch::reconfigureCoPP(const StateDelta&) {
   // API not available in opennsl
 }
 
@@ -93,4 +102,26 @@ void BcmSwitch::processChangedAcl(
   const std::shared_ptr<AclEntry>& newAcl) {}
 void BcmSwitch::processAddedAcl(const std::shared_ptr<AclEntry>& acl) {}
 void BcmSwitch::processRemovedAcl(const std::shared_ptr<AclEntry>& acl) {}
+
+BcmSwitch::MmuState BcmSwitch::queryMmuState() const {
+  return MmuState::UNKNOWN;
+}
+
+bool BcmSwitch::startBufferStatCollection() {
+  LOG(INFO) << "Buffer stats collection not supported";
+  return bufferStatsEnabled_;
+}
+bool BcmSwitch::stopBufferStatCollection() {
+  LOG(INFO) << "no op, buffer stats collection is not supported";
+  return !bufferStatsEnabled_;
+}
+void BcmSwitch::exportDeviceBufferUsage() {}
+
+std::unique_ptr<BufferStatsLogger> BcmSwitch::createBufferStatsLogger() {
+  return std::make_unique<GlogBufferStatsLogger>();
+}
+
+void BcmSwitch::setupTrunking() {
+  // API not available in OpenNSL
+}
 }} //facebook::fboss

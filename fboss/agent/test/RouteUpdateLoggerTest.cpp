@@ -7,7 +7,7 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/RouteUpdateLogger.h"
 #include "fboss/agent/state/RouteTypes.h"
 #include "fboss/agent/state/StateDelta.h"
@@ -53,15 +53,15 @@ class MockRouteLogger : public RouteLogger<AddrT> {
 class RouteUpdateLoggerTest : public ::testing::Test {
  public:
   void SetUp() override {
-    blankState = std::make_shared<SwitchState>();
+    sw = createMockSw();
+    initState = sw->getState();
     stateA = testStateA();
-    deltaAdd = std::make_shared<StateDelta>(blankState, stateA);
-    deltaRemove = std::make_shared<StateDelta>(stateA, blankState);
-    sw = createMockSw(blankState);
-    routeUpdateLogger = folly::make_unique<RouteUpdateLogger>(
+    deltaAdd = std::make_shared<StateDelta>(initState, stateA);
+    deltaRemove = std::make_shared<StateDelta>(stateA, initState);
+    routeUpdateLogger = std::make_unique<RouteUpdateLogger>(
         sw.get(),
-        folly::make_unique<MockRouteLogger<folly::IPAddressV4>>(),
-        folly::make_unique<MockRouteLogger<folly::IPAddressV6>>());
+        std::make_unique<MockRouteLogger<folly::IPAddressV4>>(),
+        std::make_unique<MockRouteLogger<folly::IPAddressV6>>());
     mockRouteLoggerV4 = static_cast<MockRouteLogger<folly::IPAddressV4>*>(
         routeUpdateLogger->getRouteLoggerV4());
     mockRouteLoggerV6 = static_cast<MockRouteLogger<folly::IPAddressV6>*>(
@@ -76,7 +76,7 @@ class RouteUpdateLoggerTest : public ::testing::Test {
       bool exact) {
     RoutePrefix<folly::IPAddress> prefix{folly::IPAddress{addr}, mask};
     auto req =
-        folly::make_unique<RouteUpdateLoggingInstance>(prefix, user, exact);
+        std::make_unique<RouteUpdateLoggingInstance>(prefix, user, exact);
     routeUpdateLogger->startLoggingForPrefix(*req);
   }
 
@@ -121,7 +121,7 @@ class RouteUpdateLoggerTest : public ::testing::Test {
     expectNoAdded();
   }
 
-  std::shared_ptr<SwitchState> blankState;
+  std::shared_ptr<SwitchState> initState;
   std::shared_ptr<SwitchState> stateA;
   std::shared_ptr<StateDelta> deltaAdd;
   std::shared_ptr<StateDelta> deltaRemove;

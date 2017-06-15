@@ -15,12 +15,10 @@
 #include "fboss/lib/usb/UsbError.h"
 #include "fboss/lib/usb/WedgeI2CBus.h"
 #include "fboss/agent/SwSwitch.h"
-#include "fboss/agent/QsfpModule.h"
 #include "fboss/agent/SysError.h"
 #include "fboss/agent/hw/bcm/BcmAPI.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/platforms/wedge/WedgePort.h"
-#include "fboss/agent/platforms/wedge/WedgeQsfp.h"
 
 #include <future>
 
@@ -34,7 +32,7 @@ DEFINE_string(mgmt_if, "eth0",
               "name of management interface");
 
 using folly::MacAddress;
-using folly::make_unique;
+using std::make_unique;
 using folly::Subprocess;
 using std::string;
 
@@ -44,30 +42,30 @@ constexpr auto kNumWedge40Qsfps = 16;
 
 namespace facebook { namespace fboss {
 
-WedgePlatform::WedgePlatform(std::unique_ptr<WedgeProductInfo> productInfo,
-                             uint8_t numQsfps)
-    : productInfo_(std::move(productInfo)),
-      numQsfpModules_(numQsfps) {
-  // Make sure we actually set the number of qsfp modules
-  CHECK(numQsfpModules_ > 0);
-}
-
-// default to kNumWedge40Qsfps if numQsfps not specified
 WedgePlatform::WedgePlatform(std::unique_ptr<WedgeProductInfo> productInfo)
-    : WedgePlatform(std::move(productInfo), kNumWedge40Qsfps) {}
+    : productInfo_(std::move(productInfo)) {}
 
 void WedgePlatform::init() {
   auto config = loadConfig();
   BcmAPI::init(config);
   initLocalMac();
   auto mode = getMode();
-  bool isLc = mode == WedgePlatformMode::LC ||
-    mode == WedgePlatformMode::GALAXY_LC;
+  bool isLc = (mode == WedgePlatformMode::GALAXY_LC);
   hw_.reset(new BcmSwitch(this, isLc ? BcmSwitch::HALF_HASH :
         BcmSwitch::FULL_HASH));
 }
 
-WedgePlatform::~WedgePlatform() {
+WedgePlatform::~WedgePlatform() {}
+
+WedgePlatform::InitPortMap WedgePlatform::initPorts() {
+  portMapping_ = createPortMapping();
+
+  InitPortMap mapping;
+  for (const auto& kv: *portMapping_) {
+    opennsl_port_t id = kv.first;
+    mapping[id] = kv.second.get();
+  }
+  return mapping;
 }
 
 HwSwitch* WedgePlatform::getHwSwitch() const {
@@ -96,7 +94,6 @@ WedgePlatformMode WedgePlatform::getMode() const {
   return productInfo_->getMode();
 }
 
-
 void WedgePlatform::initLocalMac() {
   if (!FLAGS_mac.empty()) {
     localMac_ = MacAddress(FLAGS_mac);
@@ -109,7 +106,7 @@ void WedgePlatform::initLocalMac() {
   // "locally administered" bit.  This MAC should be unique, and it's fine for
   // us to use a locally administered address for now.
   std::vector<std::string> cmd{"/sbin/ip", "address", "ls", FLAGS_mgmt_if};
-  Subprocess p(cmd, Subprocess::pipeStdout());
+  Subprocess p(cmd, Subprocess::Options().pipeStdout());
   auto out = p.communicate();
   p.waitChecked();
   auto idx = out.first.find("link/ether ");
@@ -124,52 +121,28 @@ std::unique_ptr<BaseWedgeI2CBus> WedgePlatform::getI2CBus() {
   return make_unique<WedgeI2CBus>();
 }
 
-void WedgePlatform::initTransceiverMap(SwSwitch* sw) {
-  // If we can't get access to the USB devices, don't bother to
-  // create the QSFP objects;  this is likely to be a permanent
-  // error.
+TransceiverIdxThrift WedgePlatform::getPortMapping(PortID portId) const {
+  auto info = TransceiverIdxThrift();
+  auto port = getPort(portId);
 
-  try {
-    wedgeI2CBusLock_ = make_unique<WedgeI2CBusLock>(getI2CBus());
-  } catch (const LibusbError& ex) {
-    LOG(ERROR) << "failed to initialize USB to I2C interface";
-    return;
+  auto transceiver = port->getTransceiverID();
+  if (transceiver) {
+    info.transceiverId = static_cast<int32_t>(*transceiver);
+    info.__isset.transceiverId = true;
   }
-
-  // Wedge port 0 is the CPU port, so the first port associated with
-  // a QSFP+ is port 1.  We start the transceiver IDs with 0, though.
-
-  for (int idx = 0; idx < numQsfpModules_; idx++) {
-    std::unique_ptr<WedgeQsfp> qsfpImpl =
-      make_unique<WedgeQsfp>(idx, wedgeI2CBusLock_.get());
-    for (int channel = 0; channel < QsfpModule::CHANNEL_COUNT; ++channel) {
-      qsfpImpl->setChannelPort(ChannelID(channel),
-          PortID(idx * QsfpModule::CHANNEL_COUNT + channel + 1));
-    }
-    std::unique_ptr<QsfpModule> qsfp =
-      make_unique<QsfpModule>(std::move(qsfpImpl));
-    auto qsfpPtr = qsfp.get();
-    sw->addTransceiver(TransceiverID(idx), move(qsfp));
-    LOG(INFO) << "making QSFP for " << idx;
-    for (int channel = 0; channel < QsfpModule::CHANNEL_COUNT; ++channel) {
-      PortID portId = fbossPortForQsfpChannel(idx, channel);
-      sw->addTransceiverMapping(portId,
-          ChannelID(channel), TransceiverID(idx));
-      (getPort(portId))->setQsfp(qsfpPtr);
-    }
+  auto channel = port->getChannel();
+  if (channel) {
+    info.channelId = static_cast<int32_t>(*channel);
+    info.__isset.channelId = true;
   }
+  return info;
 }
 
-PortID WedgePlatform::fbossPortForQsfpChannel(int transceiver, int channel) {
-  return PortID(transceiver * QsfpModule::CHANNEL_COUNT + channel + 1);
+WedgePort* WedgePlatform::getPort(PortID id) const {
+  return portMapping_->getPort(id);
 }
-
-WedgePort* WedgePlatform::getPort(PortID id) {
-  auto iter = ports_.find(id);
-  if (iter == ports_.end()) {
-    throw FbossError("Cannot find the Wedge port object for BCM port ", id);
-  }
-  return iter->second.get();
+WedgePort* WedgePlatform::getPort(TransceiverID id) const {
+  return portMapping_->getPort(id);
 }
 
 }} // facebook::fboss

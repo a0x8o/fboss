@@ -8,6 +8,7 @@
  *
  */
 #include "RouteTypes.h"
+#include "fboss/agent/AddressUtil.h"
 
 namespace {
 constexpr auto kAddress = "address";
@@ -18,8 +19,6 @@ constexpr auto kNexthops = "Nexthops";
 }
 
 namespace facebook { namespace fboss {
-
-using std::string;
 
 std::string forwardActionStr(RouteForwardAction action) {
   switch (action) {
@@ -41,7 +40,9 @@ RouteForwardAction str2ForwardAction(const std::string& action) {
   }
 }
 
+//
 // RoutePrefix<> Class
+//
 
 template<typename AddrT>
 bool RoutePrefix<AddrT>::operator<(const RoutePrefix& p2) const {

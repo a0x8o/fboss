@@ -27,10 +27,33 @@ from fboss.cli.commands import lldp
 from fboss.cli.commands import ndp
 from fboss.cli.commands import port
 from fboss.cli.commands import route
+from fboss.cli.utils.utils import AGENT_KEYWORD
 from thrift.Thrift import TApplicationException
 from thrift.transport.TTransport import TTransportException
 from neteng.fboss.ttypes import FbossBaseError
 from fboss.thrift_clients import FbossAgentClient
+
+
+class AliasedGroup(click.Group):
+    """
+    For command abbreviation
+        http://click.pocoo.org/5/advanced/#command-aliases
+    """
+
+    def get_command(self, ctx, cmd_name):
+        rv = click.Group.get_command(self, ctx, cmd_name)
+        if rv is not None:
+            return rv
+
+        matches = [
+            x for x in self.list_commands(ctx)
+            if x.startswith(cmd_name)
+        ]
+        if not matches:
+            return None
+        elif len(matches) == 1:
+            return click.Group.get_command(self, ctx, matches[0])
+        ctx.fail('Too many matches: %s' % ', '.join(sorted(matches)))
 
 
 class CliOptions(object):
@@ -48,7 +71,7 @@ class ArpCli(object):
         self.arp.add_command(self._table, name='table')
         self.arp.add_command(self._flush, name='flush')
 
-    @click.group()
+    @click.group(cls=AliasedGroup)
     def arp():
         ''' Show ARP Information '''
         pass
@@ -73,18 +96,18 @@ class GetConfigCli(object):
     ''' Get running config sub-commands '''
 
     def __init__(self):
-        self.config.add_command(self._ctrl, name='ctrl')
+        self.config.add_command(self._agent, name=AGENT_KEYWORD)
 
-    @click.group()
+    @click.group(cls=AliasedGroup)
     def config():
         ''' Show running config '''
         pass
 
     @click.command()
     @click.pass_obj
-    def _ctrl(cli_opts):
+    def _agent(cli_opts):
         ''' Show controller running config '''
-        config.GetConfigCmd(cli_opts).run('ctrl')
+        config.GetConfigCmd(cli_opts).run(AGENT_KEYWORD)
 
 
 class IpCli(object):
@@ -116,7 +139,7 @@ class L2Cli(object):
         self.l2.add_command(self._table, name='table')
         self.l2.add_command(self._flush, name='flush')
 
-    @click.group()
+    @click.group(cls=AliasedGroup)
     def l2():
         ''' Show L2 information '''
         pass
@@ -158,7 +181,7 @@ class NdpCli(object):
         self.ndp.add_command(self._table, name='table')
         self.ndp.add_command(self._flush, name='flush')
 
-    @click.group()
+    @click.group(cls=AliasedGroup)
     def ndp():
         ''' Show NDP information '''
         pass
@@ -204,8 +227,11 @@ class PortCli(object):
         self.port.add_command(self._details, name='details')
         self.port.add_command(self._flap, name='flap')
         self.port.add_command(self._status, name='status')
+        self.port.add_command(self._enable, name='enable')
+        self.port.add_command(self._disable, name='disable')
+        self.port.add_command(self._stats, name='stats')
 
-    @click.group()
+    @click.group(cls=AliasedGroup)
     def port():
         ''' Show port information '''
         pass
@@ -225,14 +251,40 @@ class PortCli(object):
         port.PortFlapCmd(cli_opts).run(ports)
 
     @click.command()
+    @click.argument('ports', nargs=-1, required=True, type=PortType())
+    @click.pass_obj
+    def _enable(cli_opts, ports):
+        ''' Enable given [port(s)] '''
+        port.PortSetStatusCmd(cli_opts).run(ports, True)
+
+    @click.command()
+    @click.argument('ports', nargs=-1, required=True, type=PortType())
+    @click.pass_obj
+    def _disable(cli_opts, ports):
+        ''' Disable given [port(s)] '''
+        port.PortSetStatusCmd(cli_opts).run(ports, False)
+
+    @click.command()
     @click.argument('ports', nargs=-1, type=PortType())
     @click.option('--detail', is_flag=True, help='Display detailed port status')
+    @click.option('--internal', is_flag=True,
+                  help='Display all ports info with internal ID')
     @click.option('-v', '--verbose', is_flag=True,
                     help='Show flags and thresholds as well as details')
     @click.pass_obj
-    def _status(cli_opts, detail, ports, verbose):
+    def _status(cli_opts, detail, ports, verbose, internal):
         ''' Show port status '''
-        port.PortStatusCmd(cli_opts).run(detail, ports, verbose)
+        port.PortStatusCmd(cli_opts).run(detail, ports, verbose, internal)
+
+    @click.command()
+    @click.argument('ports', nargs=-1, type=PortType())
+    @click.option('--detail',
+                  is_flag=True,
+                  help='Display detailed port stats with lldp')
+    @click.pass_obj
+    def _stats(cli_opts, detail, ports):
+        ''' Show port statistics '''
+        port.PortStatsCmd(cli_opts).run(detail, ports)
 
 
 class ProductInfoCli(object):
@@ -263,8 +315,9 @@ class RouteCli(object):
     def __init__(self):
         self.route.add_command(self._ip, name='ip')
         self.route.add_command(self._table, name='table')
+        self.route.add_command(self._details, name='details')
 
-    @click.group()
+    @click.group(cls=AliasedGroup)
     def route():
         ''' Show route information '''
         pass
@@ -279,14 +332,22 @@ class RouteCli(object):
         route.RouteIpCmd(cli_opts).run(ip, vrf)
 
     @click.command()
+    @click.option('--client-id', type=int, default=None,
+                  help='If pass, show all routes programmed by certain client')
     @click.pass_obj
-    def _table(cli_opts):
+    def _table(cli_opts, client_id):
         ''' Show the route table '''
-        route.RouteTableCmd(cli_opts).run()
+        route.RouteTableCmd(cli_opts).run(client_id)
+
+    @click.command()
+    @click.pass_obj
+    def _details(cli_opts):
+        ''' Show details of the route table '''
+        route.RouteTableDetailsCmd(cli_opts).run()
 
 
 # -- Main Command Group -- #
-@click.group()
+@click.group(cls=AliasedGroup)
 @click.option('--hostname', '-H', default='::1',
         type=str, help='Host to connect to (default = ::1)')
 @click.option('--port', '-p', default=None,

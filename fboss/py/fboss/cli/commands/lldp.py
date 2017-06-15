@@ -9,14 +9,14 @@
 #
 
 import binascii
-import string
 
+from fboss.cli.utils import utils
 from fboss.cli.commands import commands as cmds
 
 
 class LldpCmd(cmds.FbossCmd):
     def run(self, lldp_port, verbosity):
-        self._client = self._create_ctrl_client()
+        self._client = self._create_agent_client()
         resp = self._client.getLldpNeighbors()
         self._AllPortsInfo = self._client.getAllPortInfo()
         if not resp:
@@ -44,10 +44,9 @@ class LldpCmd(cmds.FbossCmd):
                           for key, value in headers.items())
 
         entries = []
-        for neighbor in resp:
+        for neighbor in sorted(resp, key=self._port_sort_fn):
             if (lldp_port and not neighbor.localPort == lldp_port):
                 continue
-
             fields = self._get_fields(neighbor)
             for key, value in fields.items():
                 if len(str(value)) > max_widths[key]:
@@ -63,6 +62,10 @@ class LldpCmd(cmds.FbossCmd):
             self._print_fields(selected, entries, headers, max_widths)
         else:
             self._print_verbose(entries, headers)
+
+    def _port_sort_fn(self, neighbor):
+        port_name = self._AllPortsInfo[neighbor.localPort].name
+        return utils.port_name_sort_fn(port_name)
 
     def _print_fields(self, selected, fields, headers, max_widths):
         fmt = ' '.join('{{{}:<{}}}'.format(key, max_widths[key])
@@ -114,7 +117,11 @@ class LldpCmd(cmds.FbossCmd):
             print()
 
     def is_printable(self, value):
-        return all(c in string.printable for c in value)
+        try:
+            value.decode('utf-8')
+            return True
+        except UnicodeDecodeError:
+            return False
 
     def _get_fields(self, neighbor):
         fields = {}

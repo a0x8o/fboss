@@ -9,7 +9,7 @@
  */
 #pragma once
 
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/state/NodeBase.h"
 
@@ -48,7 +48,8 @@ struct PortFields {
   const PortID id{0};
   std::string name;
   std::string description;
-  cfg::PortState state{cfg::PortState::DOWN};
+  cfg::PortState state{cfg::PortState::DOWN};   // Administrative state
+  bool operState{false};    // Operational state of port. UP(true), DOWN(false)
   VlanID ingressVlan{0};
   cfg::PortSpeed speed{cfg::PortSpeed::DEFAULT};
   cfg::PortSpeed maxSpeed{cfg::PortSpeed::DEFAULT};
@@ -82,12 +83,13 @@ class Port : public NodeBaseT<Port, PortFields> {
 
   /*
    * Initialize a cfg::Port object with the default settings
-   * that would be applied for this port.
+   * that would be applied for this port. Port identifiers
+   * like port ID and name are retained.
    *
    * The resulting cfg::Port object can be passed to applyConfig() to return
    * the port to a state as if it had been newly constructed.
    */
-  void initDefaultConfig(cfg::Port* config) const;
+  void initDefaultConfigState(cfg::Port* config) const;
 
   PortID getID() const {
     return getFields()->id;
@@ -117,9 +119,26 @@ class Port : public NodeBaseT<Port, PortFields> {
     writableFields()->state = state;
   }
 
-  bool isDisabled() const {
+  bool getOperState() const {
+    return getFields()->operState;
+  }
+
+  void setOperState(bool isUp) {
+    writableFields()->operState = isUp;
+  }
+
+  bool isAdminDisabled() const {
     auto state = getFields()->state;
     return state == cfg::PortState::POWER_DOWN || state == cfg::PortState::DOWN;
+  }
+
+  /**
+   * Tells you Oper+Admin state of port. Will be UP only if both admin and
+   * oper state is UP.
+   */
+  bool isPortUp() const {
+    auto const& fields = getFields();
+    return fields->state == cfg::PortState::UP && fields->operState;
   }
 
   const VlanMembership& getVlans() const {

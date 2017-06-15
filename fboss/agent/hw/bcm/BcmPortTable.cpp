@@ -26,7 +26,7 @@ extern "C" {
 
 namespace facebook { namespace fboss {
 
-using folly::make_unique;
+using std::make_unique;
 using std::unique_ptr;
 using std::make_pair;
 
@@ -103,11 +103,6 @@ BcmPort* BcmPortTable::getBcmPortIf(PortID id) const {
     return nullptr;
   }
   return iter->second;
-}
-
-void BcmPortTable::setPortStatus(opennsl_port_t id, int status) {
-  auto port = getBcmPort(id);
-  port->setPortStatus(status);
 }
 
 void BcmPortTable::updatePortStats() {

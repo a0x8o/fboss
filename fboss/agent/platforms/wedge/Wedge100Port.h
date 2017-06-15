@@ -11,7 +11,7 @@
 
 #include "fboss/agent/platforms/wedge/WedgePort.h"
 #include "fboss/agent/hw/bcm/BcmPortGroup.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 namespace facebook { namespace fboss {
 
@@ -30,38 +30,35 @@ enum class LedColor : uint32_t {
 
 class Wedge100Port : public WedgePort {
  public:
-  explicit Wedge100Port(PortID id, Wedge100Platform* platform,
-                        TransceiverID frontPanelPort,
-                        ChannelID channel)
-      : WedgePort(id),
-        platform_(platform),
-        frontPanelPort_(frontPanelPort),
-        channel_(channel) {}
+  Wedge100Port(PortID id,
+               WedgePlatform* platform,
+               folly::Optional<TransceiverID> frontPanelPort,
+               folly::Optional<ChannelID> channel,
+               const XPEs& egressXPEs) :
+      WedgePort(id, platform, frontPanelPort, channel, egressXPEs) {}
 
   LaneSpeeds supportedLaneSpeeds() const override {
-    return {
-      cfg::PortSpeed::GIGE,
-      cfg::PortSpeed::XG,
-      cfg::PortSpeed::TWENTYFIVEG
-    };
+    LaneSpeeds speeds;
+    speeds.insert(cfg::PortSpeed::GIGE);
+    speeds.insert(cfg::PortSpeed::XG);
+    speeds.insert(cfg::PortSpeed::TWENTYFIVEG);
+    return speeds;
   }
 
-  void remedy() override;
   void prepareForGracefulExit() override;
   void linkStatusChanged(bool up, bool adminUp) override;
+  bool shouldDisableFEC() const override {
+    return false;
+  }
 
  private:
   bool isTop() {
-    return !(frontPanelPort_ & 0x1);
+    return frontPanelPort_ ? !(*frontPanelPort_ & 0x1) : false;
   }
 
   BcmPortGroup::LaneMode laneMode();
   bool useCompactMode();
   LedColor getLedColor(bool up, bool adminUp);
-
-  Wedge100Platform* platform_{nullptr};
-  TransceiverID frontPanelPort_{0};
-  ChannelID channel_{0};
 };
 
 }} // facebook::fboss

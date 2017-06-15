@@ -21,7 +21,7 @@ void SwSwitch::initThread(folly::StringPiece name) {
   char pthreadName[pthreadLength + 1];
   memcpy(pthreadName, name.begin(), pthreadLength);
   pthreadName[pthreadLength] = '\0';
-  folly::setThreadName(pthread_self(), pthreadName);
+  folly::setThreadName(pthreadName);
 }
 
 void SwSwitch::publishInitTimes(std::string name, const float& time) {}
@@ -36,4 +36,13 @@ void SwSwitch::logLinkStateEvent(PortID port, bool up) {
   VLOG(2) << logMsg;
 }
 
+void SwSwitch::logSwitchRunStateChange(
+    const SwitchRunState& oldState,
+    const SwitchRunState& newState) {
+  std::string logMsg = folly::sformat(
+      "SwitchRunState changed from {} to {}",
+      switchRunStateStr(oldState),
+      switchRunStateStr(newState));
+  VLOG(2) << logMsg;
+}
 }} // facebook::fboss

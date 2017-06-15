@@ -2,18 +2,24 @@ namespace cpp2 facebook.fboss
 namespace d neteng.fboss.highres
 namespace php fboss
 namespace py neteng.fboss.highres
+namespace py.asyncio neteng.fboss.asyncio.highres
 
 typedef string (cpp2.type = "::folly::fbstring") fbstring
 
 enum SleepMethod {
-  NANOSLEEP,
-  PAUSE
+  NANOSLEEP = 0,
+  PAUSE = 1,
+}
+
+struct CounterRequest {
+  1 : string namespaceName,
+  2 : string counterName,
 }
 
 struct CounterSubscribeRequest {
   /* What to subscribe to */
   // The set of all the counters to which the client wants to subscribe
-  1 : set<string> counters,
+  1 : set<string> counters_DEPRECATED,
 
   /* When to sample */
   // The maximum duration of the subscription in nanoseconds
@@ -29,7 +35,9 @@ struct CounterSubscribeRequest {
   // Whether to use nanosleep() or asm ("pause")
   6 : SleepMethod sleepMethod,
   // Whether to lower the priority of the sampling thread
-  7 : bool veryNice
+  7 : bool veryNice,
+
+  8 : set<CounterRequest> counterSet
 }
 
 struct HighresTime {
@@ -42,10 +50,11 @@ struct CounterPublication {
   1: string hostname,
   // A list of sample times included in this batch
   2: list<HighresTime> times,
+  3: map<string,list<i64>> counters_DEPRECATED,
   // All of the samples for this batch:
   // {namespace::counter name} -> {list of sample values}
   // The list corresponds to the times in highres_time
-  3: map<string,list<i64>> counters
+  4: map<CounterRequest,list<i64>> counterValues,
 }
 
 service FbossHighresClient {

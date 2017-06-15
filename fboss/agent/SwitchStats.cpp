@@ -14,6 +14,7 @@
 #include <folly/Memory.h>
 
 using facebook::stats::SUM;
+using facebook::stats::AVG;
 using facebook::stats::RATE;
 
 namespace facebook { namespace fboss {
@@ -64,9 +65,31 @@ SwitchStats::SwitchStats(ThreadLocalStatsMap *map)
       addRouteV6_(map, kCounterPrefix + "route.v6.add", RATE),
       delRouteV4_(map, kCounterPrefix + "route.v4.delete", RATE),
       delRouteV6_(map, kCounterPrefix + "route.v6.delete", RATE),
+      dstLookupFailureV4_(map, kCounterPrefix + "ipv4.dst_lookup_failure",
+          SUM, RATE),
+      dstLookupFailureV6_(map, kCounterPrefix + "ipv6.dst_lookup_failure",
+          SUM, RATE),
+      dstLookupFailure_(map, kCounterPrefix + "ip.dst_lookup_failure",
+          SUM, RATE),
       updateState_(map, kCounterPrefix + "state_update.us", 50000, 0, 1000000),
       routeUpdate_(map,  kCounterPrefix + "route_update.us", 50, 0, 500),
-      linkStateChange_(map, kCounterPrefix + "link_state.down", SUM) {
+
+      bgHeartbeatDelay_(map, kCounterPrefix + "bg_heartbeat_delay.ms",
+                        100, 0, 20000, AVG, 50, 100),
+      updHeartbeatDelay_(map, kCounterPrefix + "upd_heartbeat_delay.ms",
+                         100, 0, 20000, AVG, 50, 100),
+      fbossPktTxHeartbeatDelay_(map,
+                         kCounterPrefix + "fbossPktTx_heartbeat_delay.ms",
+                         100, 0, 20000, AVG, 50, 100),
+      bgEventBacklog_(map, kCounterPrefix + "bg_event_backlog",
+                      1, 0, 200, AVG, 50, 100),
+      updEventBacklog_(map, kCounterPrefix + "upd_event_backlog",
+                       1, 0, 200, AVG, 50, 100),
+      fbossPktTxEventBacklog_(map, kCounterPrefix + "fbossPktTx_event_backlog",
+                 1, 0, 200, AVG, 50, 100),
+      linkStateChange_(map, kCounterPrefix + "link_state.down", SUM),
+      hwOutOfSync_(
+        map, kCounterPrefix + "hw_out_of_sync") {
 }
 
 PortStats* SwitchStats::port(PortID portID) {
@@ -78,7 +101,15 @@ PortStats* SwitchStats::port(PortID portID) {
 }
 
 PortStats* SwitchStats::createPortStats(PortID portID) {
-  auto rv = ports_.emplace(portID, folly::make_unique<PortStats>(portID, this));
+
+
+ auto series = std::make_unique<TLTimeseries>(
+    stats::ThreadCachedServiceData::get()->getThreadStats(),
+    folly::to<std::string>("port", static_cast<int32_t>(portID),
+      kCounterPrefix, "link_state.down"),
+    SUM);
+  auto rv = ports_.emplace(portID, std::make_unique<PortStats>(portID, std::move(series),
+                                                               this));
   const auto& it = rv.first;
   DCHECK(rv.second);
   return it->second.get();

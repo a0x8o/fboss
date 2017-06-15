@@ -18,6 +18,7 @@
 #include "fboss/agent/Platform.h"
 #include "fboss/agent/SwSwitch.h"
 #include "fboss/agent/ThriftHandler.h"
+#include "fboss/agent/TunManager.h"
 #include "common/stats/ServiceData.h"
 #include <folly/io/async/AsyncTimeout.h>
 #include <folly/io/async/AsyncSignalHandler.h>
@@ -138,7 +139,7 @@ class Initializer {
 
     // Initialize the switch.  This operation can take close to a minute
     // on some of our current platforms.
-    sw_->init(setupFlags());
+    sw_->init(nullptr, setupFlags());
 
     // Wait for the local MAC address to be available.
     ret.wait();
@@ -176,23 +177,6 @@ class Initializer {
     // Call flushWarmBootFunc 30 seconds after applying config
     fs_->addFunction(flushWarmbootFunc, seconds(1), flushWarmboot,
         seconds(FLAGS_flush_warmboot_cache_secs)/*initial delay*/);
-
-    // Transceiver Module Detection Thread
-    const string sfpDetect = "DetectTransceiver";
-    auto sfpDetectFunc = [=]() {
-      sw_->detectTransceiver();
-    };
-    fs_->addFunction(sfpDetectFunc, seconds(1), sfpDetect);
-
-    // Transceiver Module Detection Thread
-    const string sfpDomCacheUpdate = "CacheUpdateTransceiver";
-    auto sfpDomCacheUpdateFunc = [=]() {
-      sw_->updateTransceiverInfoFields();
-    };
-    // Call sfpDomCacheUpdate 15 seconds to get SFP monitor the
-    // DOM values
-    fs_->addFunction(sfpDomCacheUpdateFunc, seconds(15), sfpDomCacheUpdate,
-        seconds(15));
 
     fs_->start();
     LOG(INFO) << "Started background thread: UpdateStatsThread";
@@ -257,8 +241,8 @@ int fbossMain(int argc, char** argv, PlatformInitFn initPlatform) {
   // messages if --minloglevel is set to 0.  We pretty much always want to see
   // VLOG messages, so set minloglevel to 0 by default, unless overridden on
   // the command line.
-  google::SetCommandLineOptionWithMode("minloglevel", "0",
-                                       google::SET_FLAGS_DEFAULT);
+  gflags::SetCommandLineOptionWithMode(
+      "minloglevel", "0", gflags::SET_FLAGS_DEFAULT);
 
   // Allow the fb303 setOption() call to update the command line flag
   // settings.  This allows us to change the log levels on the fly using
@@ -320,6 +304,7 @@ int fbossMain(int argc, char** argv, PlatformInitFn initPlatform) {
   auto stopServices = [&]() {
     statsPublisher.cancelTimeout();
     init.stopFunctionScheduler();
+    fbossFinalize();
   };
   SignalHandler signalHandler(&eventBase, &sw, stopServices);
 

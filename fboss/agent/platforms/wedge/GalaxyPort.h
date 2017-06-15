@@ -10,26 +10,37 @@
 #pragma once
 
 #include "fboss/agent/platforms/wedge/WedgePort.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 namespace facebook { namespace fboss {
 
 
 class GalaxyPort : public WedgePort {
  public:
-  explicit GalaxyPort(PortID id) : WedgePort(id) {}
+  GalaxyPort(PortID id,
+             WedgePlatform* platform,
+             folly::Optional<TransceiverID> frontPanelPort,
+             folly::Optional<ChannelID> channel,
+             const XPEs& egressXPEs) :
+      WedgePort(id, platform, frontPanelPort, channel, egressXPEs) {}
 
   LaneSpeeds supportedLaneSpeeds() const override {
-    return {
-      cfg::PortSpeed::GIGE,
-      cfg::PortSpeed::XG,
-      cfg::PortSpeed::TWENTYFIVEG
-    };
+    LaneSpeeds speeds;
+    speeds.insert(cfg::PortSpeed::GIGE);
+    speeds.insert(cfg::PortSpeed::XG);
+    speeds.insert(cfg::PortSpeed::TWENTYFIVEG);
+    return speeds;
   }
 
-  void remedy() override {}
   void prepareForGracefulExit() override {}
   void linkStatusChanged(bool up, bool adminUp) override;
+  bool isBackplanePort() const {
+    return !frontPanelPort_.hasValue();
+  }
+  bool shouldDisableFEC() const override {
+    // Only disable FEC if this is a backplane port
+    return isBackplanePort();
+  }
 };
 
 }} // facebook::fboss

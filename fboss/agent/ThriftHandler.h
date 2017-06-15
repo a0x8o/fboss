@@ -28,6 +28,7 @@
 
 namespace facebook { namespace fboss {
 
+class Port;
 class SwSwitch;
 class Vlan;
 
@@ -39,8 +40,8 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
   using ThriftCallback = std::unique_ptr<apache::thrift::HandlerCallback<T>>;
   using TConnectionContext = apache::thrift::server::TConnectionContext;
 
-  typedef network::thrift::cpp2::Address Address;
-  typedef network::thrift::cpp2::BinaryAddress BinaryAddress;
+  typedef network::thrift::Address Address;
+  typedef network::thrift::BinaryAddress BinaryAddress;
   typedef folly::EventBase EventBase;
   typedef std::vector<Address> Addresses;
   typedef std::vector<BinaryAddress> BinaryAddresses;
@@ -93,10 +94,17 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
   /* Returns the Ip Route for the address */
   void getIpRoute(UnicastRoute& route,
                   std::unique_ptr<Address> addr, int32_t vrfId) override;
+  void getIpRouteDetails(RouteDetails& route,
+                         std::unique_ptr<Address> addr, int32_t vrfId) override;
   void getAllInterfaces(
       std::map<int32_t, InterfaceDetail>& interfaces) override;
   void getInterfaceList(std::vector<std::string>& interfaceList) override;
+
   void getRouteTable(std::vector<UnicastRoute>& routeTable) override;
+  void getRouteTableByClient(
+      std::vector<UnicastRoute>& routeTable, int16_t clientId) override;
+  void getRouteTableDetails(std::vector<RouteDetails>& routeTable) override;
+
   void getPortStatus(std::map<int32_t, PortStatus>& status,
                      std::unique_ptr<std::vector<int32_t>> ports)
                      override;
@@ -203,33 +211,7 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
    */
   void reloadConfig() override;
 
- private:
-  struct ThreadLocalListener {
-    EventBase* eventBase;
-    std::unordered_map<const apache::thrift::server::TConnectionContext*,
-                       std::shared_ptr<NeighborListenerClientAsyncClient>>
-        clients;
-
-    explicit ThreadLocalListener(EventBase* eb) : eventBase(eb){};
-  };
-  folly::ThreadLocalPtr<ThreadLocalListener, int> listeners_;
-
-  void onPortStatusChanged(PortID id, PortStatus st);
-
-  void invokeNeighborListeners(ThreadLocalListener* info,
-                                std::vector<std::string> added,
-                                std::vector<std::string> deleted);
-
-  void fillPortStats(PortInfoThrift& portInfo);
-  Vlan* getVlan(int32_t vlanId);
-  Vlan* getVlan(const std::string& vlanName);
-  template<typename ADDR_TYPE, typename ADDR_CONVERTER>
-  void getVlanAddresses(const Vlan* vlan, std::vector<ADDR_TYPE>& addrs,
-      ADDR_CONVERTER& converter);
-  // Forbidden copy constructor and assignment operator
-  ThriftHandler(ThriftHandler const &) = delete;
-  ThriftHandler& operator=(ThriftHandler const &) = delete;
-
+ protected:
   void ensureConfigured(folly::StringPiece function);
   void ensureConfigured() {
     // This version of ensureConfigured() won't log
@@ -250,6 +232,37 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
     // This version of ensureFibSynced() won't log
     ensureFibSynced(folly::StringPiece(nullptr, nullptr));
   }
+ private:
+  struct ThreadLocalListener {
+    EventBase* eventBase;
+    std::unordered_map<const apache::thrift::server::TConnectionContext*,
+                       std::shared_ptr<NeighborListenerClientAsyncClient>>
+        clients;
+
+    explicit ThreadLocalListener(EventBase* eb) : eventBase(eb){};
+  };
+  folly::ThreadLocalPtr<ThreadLocalListener, int> listeners_;
+
+  void onPortStatusChanged(PortID id, PortStatus st);
+
+  void invokeNeighborListeners(ThreadLocalListener* info,
+                                std::vector<std::string> added,
+                                std::vector<std::string> deleted);
+
+  void getPortInfoHelper(
+      PortInfoThrift& portInfo,
+      const std::shared_ptr<Port> port);
+  void fillPortStats(PortInfoThrift& portInfo);
+
+  Vlan* getVlan(int32_t vlanId);
+  Vlan* getVlan(const std::string& vlanName);
+  template<typename ADDR_TYPE, typename ADDR_CONVERTER>
+  void getVlanAddresses(const Vlan* vlan, std::vector<ADDR_TYPE>& addrs,
+      ADDR_CONVERTER& converter);
+  // Forbidden copy constructor and assignment operator
+  ThriftHandler(ThriftHandler const &) = delete;
+  ThriftHandler& operator=(ThriftHandler const &) = delete;
+
 
   template<typename Result>
   void fail(const ThriftCallback<Result>& callback,

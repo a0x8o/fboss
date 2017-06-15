@@ -1,8 +1,10 @@
 // Copyright 2004-present Facebook. All Rights Reserved.
 #include "fboss/lib/usb/WedgeI2CBus.h"
 #include "fboss/lib/usb/Wedge100I2CBus.h"
+#include "fboss/lib/usb/GalaxyI2CBus.h"
 #include "fboss/lib/usb/UsbError.h"
 
+#include <chrono>
 #include <folly/Conv.h>
 #include <folly/Memory.h>
 #include <folly/FileUtil.h>
@@ -16,10 +18,15 @@
 #include <sysexits.h>
 
 #include <vector>
+#include <utility>
 
 using namespace facebook::fboss;
 using folly::MutableByteRange;
 using folly::StringPiece;
+using std::pair;
+using std::make_pair;
+using std::chrono::seconds;
+using std::chrono::steady_clock;
 
 // We can check on the hardware type:
 
@@ -28,6 +35,8 @@ const char *trident2 = "0xb850\n";  // Note expected carriage return
 
 DEFINE_bool(clear_low_power, false,
             "Allow the QSFP to use higher power; needed for LR4 optics");
+DEFINE_bool(set_low_power, false,
+            "Force the QSFP to limit power usage; Only useful for testing");
 DEFINE_bool(tx_disable, false, "Set the TX disable bits");
 DEFINE_bool(tx_enable, false, "Clear the TX disable bits");
 DEFINE_bool(set_40g, false, "Rate select 40G");
@@ -35,11 +44,17 @@ DEFINE_bool(set_100g, false, "Rate select 100G");
 DEFINE_bool(cdr_enable, false, "Set the CDR bits if transceiver supports it");
 DEFINE_bool(cdr_disable, false,
     "Clear the CDR bits if transceiver supports it");
+DEFINE_string(platform, "", "Platform on which we are running."
+             " One of (galaxy, wedge100, wedge)");
+DEFINE_int32(open_timeout, 30, "Number of seconds to wait to open bus");
 
-bool overrideLowPower(TransceiverI2CApi* bus, unsigned int port) {
+bool overrideLowPower(
+    TransceiverI2CApi* bus,
+    unsigned int port,
+    uint8_t value) {
   // 0x01 overrides low power mode
   // 0x04 is an LR4-specific bit that is otherwise reserved
-  uint8_t buf[1] = {5};
+  uint8_t buf[1] = {value};
   try {
     bus->moduleWrite(port, TransceiverI2CApi::ADDR_QSFP, 93, 1, buf);
   } catch (const UsbError& ex) {
@@ -64,8 +79,8 @@ bool setCdr(TransceiverI2CApi* bus, unsigned int port, uint8_t value) {
         port);
     return false;
   }
-  // If 2nd and 3rd bits are set, CDR is supported
-  if (!(supported[0] & 0xC)) {
+  // If 2nd and 3rd bits are set, CDR is supported.
+  if ((supported[0] & 0xC) != 0xC) {
     fprintf(stderr, "CDR unsupported by this device, doing nothing");
     return false;
   }
@@ -83,9 +98,28 @@ bool setCdr(TransceiverI2CApi* bus, unsigned int port, uint8_t value) {
 }
 
 bool rateSelect(TransceiverI2CApi* bus, unsigned int port, uint8_t value) {
-  // 0b11 - 25G channels
-  // 0b10 - 10G channels
-  uint8_t buf[1] = {value};
+  // If v1 is used, both at 10, if v2
+  // 0b10 - 25G channels
+  // 0b00 - 10G channels
+  uint8_t version[1];
+  try {
+    bus->moduleRead(port, TransceiverI2CApi::ADDR_QSFP, 141,
+                      1, version);
+  } catch (const UsbError& ex) {
+    fprintf(stderr,
+        "Port %d: Unable to determine rate select version in use, defaulting \
+        to V1\n",
+        port);
+    version[0] = 0b01;
+  }
+
+  uint8_t buf[1];
+  if (version[0] & 1) {
+    buf[0] = 0b10;
+  } else {
+    buf[0] = value;
+  }
+
   try {
     bus->moduleWrite(port, TransceiverI2CApi::ADDR_QSFP, 87, 1, buf);
     bus->moduleWrite(port, TransceiverI2CApi::ADDR_QSFP, 88, 1, buf);
@@ -129,18 +163,25 @@ void printChannelMonitor(unsigned int index,
                          const uint8_t* buf,
                          unsigned int rxMSB,
                          unsigned int rxLSB,
-                         unsigned int txMSB,
-                         unsigned int txLSB) {
+                         unsigned int txBiasMSB,
+                         unsigned int txBiasLSB,
+                         unsigned int txPowerMSB,
+                         unsigned int txPowerLSB) {
   uint16_t rxValue = (buf[rxMSB] << 8) | buf[rxLSB];
-  uint16_t txValue = (buf[txMSB] << 8) | buf[txLSB];
+  uint16_t txPowerValue = (buf[txPowerMSB] << 8) | buf[txPowerLSB];
+  uint16_t txBiasValue = (buf[txBiasMSB] << 8) | buf[txBiasLSB];
 
   // RX power ranges from 0mW to 6.5535mW
   double rxPower = 0.0001 * rxValue;
 
-  // TX bias ranges from 0mA to 131mA
-  double txBias = (131.0 * txValue) / 65535;
+  // TX power ranges from 0mW to 6.5535mW
+  double txPower = 0.0001 * txPowerValue;
 
-  printf("    Channel %d:   %12fmW  %12fmA\n", index, rxPower, txBias);
+  // TX bias ranges from 0mA to 131mA
+  double txBias = (131.0 * txBiasValue) / 65535;
+
+  printf("    Channel %d:   %12fmW  %12fmW  %12fmA\n",
+         index, rxPower, txPower, txBias);
 }
 
 void printPortDetail(TransceiverI2CApi* bus, unsigned int port) {
@@ -176,8 +217,8 @@ void printPortDetail(TransceiverI2CApi* bus, unsigned int port) {
   printf("    Temp: 0x%02x\n", buf[6]);
   printf("    Vcc: 0x%02x\n", buf[7]);
   printf("    Rx Power: 0x%02x 0x%02x\n", buf[9], buf[10]);
+  printf("    Tx Power: 0x%02x 0x%02x\n", buf[13], buf[14]);
   printf("    Tx Bias: 0x%02x 0x%02x\n", buf[11], buf[12]);
-  printf("    Reserved Set 3: 0x%02x 0x%02x\n", buf[13], buf[14]);
   printf("    Reserved Set 4: 0x%02x 0x%02x\n", buf[15], buf[16]);
   printf("    Reserved Set 5: 0x%02x 0x%02x\n", buf[17], buf[18]);
   printf("    Vendor Defined: 0x%02x 0x%02x 0x%02x\n",
@@ -188,11 +229,12 @@ void printPortDetail(TransceiverI2CApi* bus, unsigned int port) {
   uint16_t voltage = (buf[26] << 8) | buf[27];
   printf("  Supply Voltage: %f V\n", voltage / 10000.0);
 
-  printf("  Channel Data:  %12s    %12s\n", "RX Power", "TX Bias");
-  printChannelMonitor(1, buf, 34, 35, 42, 43);
-  printChannelMonitor(2, buf, 36, 37, 44, 45);
-  printChannelMonitor(3, buf, 38, 39, 46, 47);
-  printChannelMonitor(4, buf, 40, 41, 48, 49);
+  printf("  Channel Data:  %12s    %12s    %12s\n",
+         "RX Power", "TX Power", "TX Bias");
+  printChannelMonitor(1, buf, 34, 35, 42, 43, 50, 51);
+  printChannelMonitor(2, buf, 36, 37, 44, 45, 52, 53);
+  printChannelMonitor(3, buf, 38, 39, 46, 47, 54, 55);
+  printChannelMonitor(4, buf, 40, 41, 48, 49, 56, 57);
   printf("    Power measurement is %s\n",
          (buf[220] & 0x04) ? "supported" : "unsupported");
   printf("    Reported RX Power is %s\n",
@@ -265,7 +307,7 @@ void printPortDetail(TransceiverI2CApi* bus, unsigned int port) {
   printf("  Date Code: %s\n", vendorDate.str().c_str());
 }
 
-bool isWedge() {
+bool isTrident2() {
   std::string contents;
   if (!folly::readFile(chipCheckPath, contents)) {
     if (errno == ENOENT) {
@@ -276,11 +318,47 @@ bool isWedge() {
   return (contents == trident2);
 }
 
+std::pair<std::unique_ptr<TransceiverI2CApi>, int>  getTransceiverAPI() {
+  if (FLAGS_platform.size()) {
+     if (FLAGS_platform == "galaxy") {
+        return make_pair(std::make_unique<GalaxyI2CBus>(), 0);
+     } else if (FLAGS_platform == "wedge100") {
+        return make_pair(std::make_unique<Wedge100I2CBus>(), 0);
+     } else if (FLAGS_platform == "wedge") {
+        return make_pair(std::make_unique<WedgeI2CBus>(), 0);
+     } else {
+       fprintf(stderr, "Unknown platform %s\n", FLAGS_platform.c_str());
+       return make_pair(nullptr, EX_USAGE);
+     }
+   }
+  // TODO(klahey):  Should probably verify the other chip architecture.
+  if (isTrident2()) {
+     return make_pair(std::make_unique<WedgeI2CBus>(), 0);
+  }
+  return make_pair(std::make_unique<Wedge100I2CBus>(), 0);
+}
+
+void tryOpenBus(TransceiverI2CApi* bus) {
+  auto expireTime = steady_clock::now() + seconds(FLAGS_open_timeout);
+  while (true) {
+    try {
+      bus->open();
+      return;
+    } catch (const std::exception& ex) {
+      if (steady_clock::now() > expireTime) {
+        throw;
+      }
+    }
+    usleep(100);
+  }
+}
+
+
 int main(int argc, char* argv[]) {
   google::InitGoogleLogging(argv[0]);
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  google::SetCommandLineOptionWithMode("minloglevel", "0",
-                                       google::SET_FLAGS_DEFAULT);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::SetCommandLineOptionWithMode(
+      "minloglevel", "0", gflags::SET_FLAGS_DEFAULT);
 
   if (FLAGS_set_100g && FLAGS_set_40g) {
     fprintf(stderr, "Cannot set both 40g and 100g\n");
@@ -288,6 +366,10 @@ int main(int argc, char* argv[]) {
   }
   if (FLAGS_cdr_enable && FLAGS_cdr_disable) {
     fprintf(stderr, "Cannot set and clear the CDR bits\n");
+    return EX_USAGE;
+  }
+  if (FLAGS_clear_low_power && FLAGS_set_low_power) {
+    fprintf(stderr, "Cannot set and clear lp mode\n");
     return EX_USAGE;
   }
 
@@ -311,19 +393,17 @@ int main(int argc, char* argv[]) {
   if (!good) {
     return EX_USAGE;
   }
-
-  // TODO(klahey):  Should probably verify the other chip architecture.
-  std::unique_ptr<TransceiverI2CApi> bus;
-  if (isWedge()) {
-    bus = folly::make_unique<WedgeI2CBus>();
-  } else {
-    bus = folly::make_unique<Wedge100I2CBus>();
+  auto busAndError = getTransceiverAPI();
+  if (busAndError.second) {
+      return busAndError.second;
   }
+  auto bus = std::move(busAndError.first);
+
   try {
-    bus->open();
+    tryOpenBus(bus.get());
   } catch (const std::exception& ex) {
-    fprintf(stderr, "error: unable to open device: %s\n", ex.what());
-    return EX_IOERR;
+      fprintf(stderr, "error: unable to open device: %s\n", ex.what());
+      return EX_IOERR;
   }
 
   if (ports.empty()) {
@@ -338,11 +418,15 @@ int main(int argc, char* argv[]) {
 
   bool printInfo = !(FLAGS_clear_low_power || FLAGS_tx_disable ||
                      FLAGS_tx_enable || FLAGS_set_100g || FLAGS_set_40g ||
-                     FLAGS_cdr_enable || FLAGS_cdr_disable);
+                     FLAGS_cdr_enable || FLAGS_cdr_disable ||
+                     FLAGS_set_low_power);
   int retcode = EX_OK;
   for (unsigned int portNum : ports) {
-    if (FLAGS_clear_low_power && overrideLowPower(bus.get(), portNum)) {
+    if (FLAGS_clear_low_power && overrideLowPower(bus.get(), portNum, 0x5)) {
       printf("QSFP %d: cleared low power flags\n", portNum);
+    }
+    if (FLAGS_set_low_power && overrideLowPower(bus.get(), portNum, 0x0)) {
+      printf("QSFP %d: set low power flags\n", portNum);
     }
     if (FLAGS_tx_disable && setTxDisable(bus.get(), portNum, 0x0f)) {
       printf("QSFP %d: disabled TX on all channels\n", portNum);
@@ -351,10 +435,10 @@ int main(int argc, char* argv[]) {
       printf("QSFP %d: enabled TX on all channels\n", portNum);
     }
 
-    if (FLAGS_set_40g && rateSelect(bus.get(), portNum, 0xaa)) {
+    if (FLAGS_set_40g && rateSelect(bus.get(), portNum, 0x0)) {
       printf("QSFP %d: set to optimize for 10G channels\n", portNum);
     }
-    if (FLAGS_set_100g && rateSelect(bus.get(), portNum, 0xff)) {
+    if (FLAGS_set_100g && rateSelect(bus.get(), portNum, 0xaa)) {
       printf("QSFP %d: set to optimize for 25G channels\n", portNum);
     }
 

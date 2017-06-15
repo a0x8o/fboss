@@ -13,13 +13,22 @@ namespace facebook { namespace fboss {
 
 // stubbed out
 void BcmPort::disablePause() {}
-void BcmPort::setAdditionalStats(std::chrono::seconds now) {}
 void BcmPort::setConfiguredMaxSpeed() {
   configuredMaxSpeed_ = cfg::PortSpeed::XG;
 }
 void BcmPort::setKR4Ability() {}
-void BcmPort::remedy() {}
 void BcmPort::prepareForGracefulExit() {}
 void BcmPort::setFEC(const std::shared_ptr<Port>& swPort) {}
 
+bool BcmPort::isFECEnabled() {
+  return false;
+}
+
+void BcmPort::setAdditionalStats(
+    std::chrono::seconds now,
+    HwPortStats* curPortStats) {}
+
+bool BcmPort::shouldReportStats() const {
+  return true;
+}
 }} // namespace facebook::fboss

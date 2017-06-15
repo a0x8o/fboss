@@ -109,7 +109,6 @@ void BcmHost::addBcmHost(bool isMultipath, bool replace) {
       " @egress ", getEgressId());
     VLOG(3) << "created L3 host object for " << addr_.str()
     << " @egress " << getEgressId();
-
   }
   added_ = true;
 }
@@ -117,23 +116,23 @@ void BcmHost::addBcmHost(bool isMultipath, bool replace) {
 void BcmHost::program(opennsl_if_t intf, const MacAddress* mac,
                       opennsl_port_t port, RouteForwardAction action) {
   unique_ptr<BcmEgress> createdEgress{nullptr};
-  BcmEgress* egress{nullptr};
+  BcmEgress* egressPtr{nullptr};
   // get the egress object and then update it with the new MAC
   if (egressId_ == BcmEgressBase::INVALID) {
-    createdEgress = folly::make_unique<BcmEgress>(hw_);
-    egress = createdEgress.get();
+    createdEgress = std::make_unique<BcmEgress>(hw_);
+    egressPtr = createdEgress.get();
   } else {
-    egress = dynamic_cast<BcmEgress*>(
+    egressPtr = dynamic_cast<BcmEgress*>(
         hw_->writableHostTable()->getEgressObjectIf(egressId_));
   }
-  CHECK(egress);
+  CHECK(egressPtr);
   if (mac) {
-    egress->program(intf, vrf_, addr_, *mac, port);
+    egressPtr->program(intf, vrf_, addr_, *mac, port);
   } else {
     if (action == DROP) {
-      egress->programToDrop(intf, vrf_, addr_);
+      egressPtr->programToDrop(intf, vrf_, addr_);
     } else {
-      egress->programToCPU(intf, vrf_, addr_);
+      egressPtr->programToCPU(intf, vrf_, addr_);
     }
   }
   if (createdEgress) {
@@ -147,14 +146,13 @@ void BcmHost::program(opennsl_if_t intf, const MacAddress* mac,
   }
   auto oldPort = port_;
   port_ = port;
-  VLOG(1) << "Updated port for : " << egress->getID() << " from " << oldPort
+  VLOG(1) << "Updated port for : " << egressPtr->getID() << " from " << oldPort
     << " to " << port;
   // Update port mapping, for entries marked to DROP or to CPU port gets
   // set to 0, which implies no ports are associated with this entry now.
-  hw_->writableHostTable()->updatePortEgressMapping(egress->getID(),
+  hw_->writableHostTable()->updatePortEgressMapping(egressPtr->getID(),
       oldPort, port_);
 }
-
 
 BcmHost::~BcmHost() {
   if (!added_) {
@@ -171,23 +169,24 @@ BcmHost::~BcmHost() {
 }
 
 BcmEcmpHost::BcmEcmpHost(const BcmSwitch *hw, opennsl_vrf_t vrf,
-                         const RouteForwardNexthops& fwd)
+                         const RouteNextHopSet& fwd)
     : hw_(hw), vrf_(vrf) {
   CHECK_GT(fwd.size(), 0);
   BcmHostTable *table = hw_->writableHostTable();
   BcmEcmpEgress::Paths paths;
-  RouteForwardNexthops prog;
+  RouteNextHopSet prog;
   prog.reserve(fwd.size());
   SCOPE_FAIL {
     for (const auto& nhop : prog) {
-      table->derefBcmHost(vrf, nhop.nexthop);
+      table->derefBcmHost(vrf, nhop.addr());
     }
   };
   // allocate a BcmHost object for each path in this ECMP
   int total = 0;
   for (const auto& nhop : fwd) {
-    auto host = table->incRefOrCreateBcmHost(vrf, nhop.nexthop);
-    auto ret = prog.emplace(nhop.intf, nhop.nexthop);
+    auto host = table->incRefOrCreateBcmHost(vrf, nhop.addr());
+    auto ret = prog.emplace(RouteNextHop::createForward(
+                                nhop.addr(), nhop.intf()));
     CHECK(ret.second);
     // TODO:
     // Ideally, we should have the nexthop resolved already and programmed in
@@ -195,7 +194,7 @@ BcmEcmpHost::BcmEcmpHost(const BcmSwitch *hw, opennsl_vrf_t vrf,
     // do the HW programming. For now, we program the egress object to punt
     // to CPU. Any traffic going to CPU will trigger the neighbor discovery.
     if (!host->isProgrammed()) {
-      const auto intf = hw->getIntfTable()->getBcmIntf(nhop.intf);
+      const auto intf = hw->getIntfTable()->getBcmIntf(nhop.intf());
       host->programToCPU(intf->getBcmIfId());
     }
     paths.insert(host->getEgressId());
@@ -204,7 +203,7 @@ BcmEcmpHost::BcmEcmpHost(const BcmSwitch *hw, opennsl_vrf_t vrf,
     // just one path. No BcmEcmpEgress object this case.
     egressId_ = *paths.begin();
   } else {
-    auto ecmp = folly::make_unique<BcmEcmpEgress>(hw, std::move(paths));
+    auto ecmp = std::make_unique<BcmEcmpEgress>(hw, std::move(paths));
     //ecmp->program(paths, fwd.size());
     egressId_ = ecmp->getID();
     ecmpEgressId_ = egressId_;
@@ -220,7 +219,7 @@ BcmEcmpHost::~BcmEcmpHost() {
   hw_->writableHostTable()->derefEgress(ecmpEgressId_);
   BcmHostTable *table = hw_->writableHostTable();
   for (const auto& nhop : fwd_) {
-    table->derefBcmHost(vrf_, nhop.nexthop);
+    table->derefBcmHost(vrf_, nhop.addr());
   }
 }
 
@@ -246,7 +245,7 @@ HostT* BcmHostTable::incRefOrCreateBcmHost(
   SCOPE_FAIL {
     map->erase(iter);
   };
-  auto newHost = folly::make_unique<HostT>(hw_, key.first, key.second, args...);
+  auto newHost = std::make_unique<HostT>(hw_, key.first, key.second, args...);
   auto hostPtr = newHost.get();
   iter->second.first = std::move(newHost);
   return hostPtr;
@@ -263,7 +262,7 @@ BcmHost* BcmHostTable::incRefOrCreateBcmHost(
 }
 
 BcmEcmpHost* BcmHostTable::incRefOrCreateBcmEcmpHost(
-    opennsl_vrf_t vrf, const RouteForwardNexthops& fwd) {
+    opennsl_vrf_t vrf, const RouteNextHopSet& fwd) {
   return incRefOrCreateBcmHost(&ecmpHosts_, std::make_pair(vrf, fwd));
 }
 
@@ -293,12 +292,12 @@ BcmHost* BcmHostTable::getBcmHost(
 }
 
 BcmEcmpHost* BcmHostTable::getBcmEcmpHostIf(
-    opennsl_vrf_t vrf, const RouteForwardNexthops& fwd) const {
+    opennsl_vrf_t vrf, const RouteNextHopSet& fwd) const {
   return getBcmHostIf(&ecmpHosts_, vrf, fwd);
 }
 
 BcmEcmpHost* BcmHostTable::getBcmEcmpHost(
-    opennsl_vrf_t vrf, const RouteForwardNexthops& fwd) const {
+    opennsl_vrf_t vrf, const RouteNextHopSet& fwd) const {
   auto host = getBcmEcmpHostIf(vrf, fwd);
   if (!host) {
     throw FbossError("Cannot find BcmEcmpHost vrf=", vrf, " fwd=", fwd);
@@ -329,7 +328,7 @@ BcmHost* BcmHostTable::derefBcmHost(
 }
 
 BcmEcmpHost* BcmHostTable::derefBcmEcmpHost(
-    opennsl_vrf_t vrf, const RouteForwardNexthops& fwd) noexcept {
+    opennsl_vrf_t vrf, const RouteNextHopSet& fwd) noexcept {
   return derefBcmHost(&ecmpHosts_, vrf, fwd);
 }
 
@@ -353,6 +352,10 @@ BcmEgressBase* BcmHostTable::derefEgress(opennsl_if_t egressId) {
   CHECK(it != egressMap_.end());
   CHECK_GT(it->second.second, 0);
   if (--it->second.second == 0) {
+    if (it->second.first->isEcmp()) {
+      CHECK(numEcmpEgressProgrammed_ > 0);
+      numEcmpEgressProgrammed_--;
+    }
     egressMap_.erase(egressId);
     return nullptr;
   }
@@ -454,6 +457,9 @@ BcmEgressBase* BcmHostTable::getEgressObjectIf(opennsl_if_t egress) {
 void BcmHostTable::insertBcmEgress(
     std::unique_ptr<BcmEgressBase> egress) {
   auto id = egress->getID();
+  if (egress->isEcmp()) {
+    numEcmpEgressProgrammed_++;
+  }
   auto ret = egressMap_.emplace(id, std::make_pair(std::move(egress), 1));
   CHECK(ret.second);
 }
@@ -499,9 +505,9 @@ folly::dynamic BcmHost::toFollyDynamic() const {
 folly::dynamic BcmEcmpHost::toFollyDynamic() const {
   folly::dynamic ecmpHost = folly::dynamic::object;
   ecmpHost[kVrf] = vrf_;
-  std::vector<folly::dynamic> nhops;
+  folly::dynamic nhops = folly::dynamic::array;
   for (auto& nhop: fwd_) {
-    nhops.emplace_back(nhop.toFollyDynamic());
+    nhops.push_back(nhop.toFollyDynamic());
   }
   ecmpHost[kNextHops] = std::move(nhops);
   ecmpHost[kEgressId] = egressId_;
@@ -514,13 +520,13 @@ folly::dynamic BcmEcmpHost::toFollyDynamic() const {
 }
 
 folly::dynamic BcmHostTable::toFollyDynamic() const {
-  std::vector<folly::dynamic> hostsJson;
+  folly::dynamic hostsJson = folly::dynamic::array;
   for (const auto& vrfIpAndHost: hosts_) {
-    hostsJson.emplace_back(vrfIpAndHost.second.first->toFollyDynamic());
+    hostsJson.push_back(vrfIpAndHost.second.first->toFollyDynamic());
   }
-  std::vector<folly::dynamic> ecmpHostsJson;
+  folly::dynamic ecmpHostsJson = folly::dynamic::array;
   for (const auto& vrfNhopsAndHost: ecmpHosts_) {
-    ecmpHostsJson.emplace_back(vrfNhopsAndHost.second.first->toFollyDynamic());
+    ecmpHostsJson.push_back(vrfNhopsAndHost.second.first->toFollyDynamic());
   }
   folly::dynamic hostTable = folly::dynamic::object;
   hostTable[kHosts] = std::move(hostsJson);

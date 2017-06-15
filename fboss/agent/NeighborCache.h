@@ -12,6 +12,7 @@
 #include "fboss/agent/SwSwitch.h"
 #include "fboss/agent/NeighborCacheImpl-defs.h"
 #include "fboss/agent/NeighborCacheEntry.h"
+#include "fboss/agent/state/PortDescriptor.h"
 
 #include <chrono>
 #include <folly/Memory.h>
@@ -99,7 +100,7 @@ class NeighborCache {
         timeout_(timeout),
         maxNeighborProbes_(maxNeighborProbes),
         staleEntryInterval_(staleEntryInterval),
-        impl_(folly::make_unique<NeighborCacheImpl<NTable>>(
+        impl_(std::make_unique<NeighborCacheImpl<NTable>>(
             this, sw, vlanID, vlanName, intfID)) {}
 
   // Methods useful for subclasses
@@ -110,7 +111,7 @@ class NeighborCache {
 
   void setExistingEntry(AddressType ip,
                         folly::MacAddress mac,
-                        PortID port,
+                        PortDescriptor port,
                         NeighborEntryState state) {
     std::lock_guard<std::mutex> g(cacheLock_);
     impl_->setExistingEntry(ip, mac, port, state);
@@ -118,14 +119,14 @@ class NeighborCache {
 
   void setEntry(AddressType ip,
                 folly::MacAddress mac,
-                PortID port,
+                PortDescriptor port,
                 NeighborEntryState state) {
     std::lock_guard<std::mutex> g(cacheLock_);
     impl_->setEntry(ip, mac, port, state);
   }
 
   void updateEntryState(AddressType ip,
-                         NeighborEntryState state) {
+                        NeighborEntryState state) {
     std::lock_guard<std::mutex> g(cacheLock_);
     impl_->updateEntryState(ip, state);
   }

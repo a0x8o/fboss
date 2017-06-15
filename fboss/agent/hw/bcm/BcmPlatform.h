@@ -51,13 +51,27 @@ class BcmPlatform : public Platform {
    * Get filename for where we dump the HW config that
    * the switch was initialized with.
    */
-  std::string getHwConfigDumpFile() const;
+  virtual std::string getHwConfigDumpFile() const;
 
   /*
    * Based on the chip we may or may not be able to
    * use the host table for host routes (/128 or /32).
    */
   virtual bool canUseHostTableForHostRoutes() const = 0;
+  TransceiverIdxThrift getPortMapping(PortID portId) const override = 0;
+
+  /*
+   * Get total device buffer in bytes
+   */
+  virtual uint32_t getMMUBufferBytes() const = 0;
+  /*
+   * MMU buffer is split into cells, each of which is
+   * X bytes. Cells then serve as units of for allocation
+   * and accounting of MMU resources.
+   */
+  virtual uint32_t getMMUCellBytes() const = 0;
+
+  virtual bool isBufferStatsCollectionSupported() const = 0;
 
  private:
   // Forbidden copy constructor and assignment operator

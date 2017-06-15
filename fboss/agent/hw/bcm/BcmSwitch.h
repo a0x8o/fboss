@@ -11,7 +11,9 @@
 
 #include "fboss/agent/HwSwitch.h"
 #include "fboss/agent/types.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
+#include "fboss/agent/hw/bcm/BcmAclTable.h"
+#include "fboss/agent/hw/bcm/BcmSwitchEventCallback.h"
 #include "fboss/agent/hw/bcm/gen-cpp2/packettrace_types.h"
 #include <folly/dynamic.h>
 
@@ -20,6 +22,7 @@
 #include <boost/container/flat_map.hpp>
 
 extern "C" {
+#include <opennsl/error.h>
 #include <opennsl/port.h>
 #include <opennsl/rx.h>
 #include <opennsl/types.h>
@@ -29,6 +32,7 @@ namespace facebook { namespace fboss {
 
 struct AclEntryID;
 class AclEntry;
+class AggregatePort;
 class ArpEntry;
 class BcmCosManager;
 class BcmEgress;
@@ -38,7 +42,8 @@ class BcmPlatform;
 class BcmPortTable;
 class BcmRouteTable;
 class BcmRxPacket;
-class BcmSwitchEventManager;
+class BcmTableStats;
+class BcmTrunkTable;
 class BcmUnit;
 class BcmWarmBootCache;
 class MockRxPacket;
@@ -47,22 +52,61 @@ class Port;
 class PortStats;
 class Vlan;
 class VlanMap;
+class BufferStatsLogger;
+
 /*
- * Map AclEntryId to opennsl_field_entry_t
- * opennsl_field_entry_t is not opensourced. Using int for now.
+ * Virtual interface to BcmSwitch, primarily for mocking/testing
  */
-using BcmAclTable =
-  boost::container::flat_map<AclEntryID, int>;
+class BcmSwitchIf : public HwSwitch {
+ public:
+  virtual std::unique_ptr<BcmUnit> releaseUnit() = 0;
+
+  virtual BcmPlatform* getPlatform() const = 0;
+
+  virtual std::unique_ptr<PacketTraceInfo> getPacketTrace(
+      std::unique_ptr<MockRxPacket> pkt) = 0;
+
+  virtual bool isRxThreadRunning() = 0;
+
+  virtual int getUnit() const = 0;
+
+  virtual const BcmPortTable* getPortTable() const = 0;
+
+  virtual const BcmIntfTable* getIntfTable() const = 0;
+
+  virtual const BcmHostTable* getHostTable() const = 0;
+
+  virtual const BcmAclTable* getAclTable() const = 0;
+
+  virtual const BcmTrunkTable* getTrunkTable() const = 0;
+
+  virtual opennsl_if_t getDropEgressId() const = 0;
+
+  virtual opennsl_if_t getToCPUEgressId() const = 0;
+
+  virtual BcmCosManager* getCosMgr() const = 0;
+
+  virtual BcmHostTable* writableHostTable() const = 0;
+
+  virtual BcmWarmBootCache* getWarmBootCache() const = 0;
+
+  virtual void dumpState() const = 0;
+};
 
 /*
  * BcmSwitch is a HwSwitch implementation for systems that use a single
  * Broadcom ASIC.
  */
-class BcmSwitch : public HwSwitch {
+class BcmSwitch : public BcmSwitchIf {
  public:
    enum HashMode {
      FULL_HASH, // Full hash - use src IP, dst IP, src port, dst port
      HALF_HASH  // Half hash - user src IP, dst IP
+   };
+   enum class MmuState {
+    UNKNOWN,
+    MMU_LOSSLESS,
+    MMU_LOSSY
    };
   /*
    * Construct a new BcmSwitch.
@@ -92,7 +136,7 @@ class BcmSwitch : public HwSwitch {
    * Once this method has called no other BcmSwitch methods should be accessed
    * before destroying the BcmSwitch object.
    */
-  std::unique_ptr<BcmUnit> releaseUnit();
+  std::unique_ptr<BcmUnit> releaseUnit() override;
 
   /*
    * Initialize the BcmSwitch.
@@ -101,22 +145,22 @@ class BcmSwitch : public HwSwitch {
 
   void unregisterCallbacks() override;
 
-  void remedyPorts() override;
-
-  BcmPlatform* getPlatform() const {
+  BcmPlatform* getPlatform() const override {
     return platform_;
   }
+  MmuState getMmuState() const { return mmuState_; }
+  uint64_t getMMUCellBytes() const { return mmuCellBytes_; }
 
   std::unique_ptr<TxPacket> allocatePacket(uint32_t size) override;
   bool sendPacketSwitched(std::unique_ptr<TxPacket> pkt) noexcept override;
   bool sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
                            PortID portID) noexcept override;
   std::unique_ptr<PacketTraceInfo> getPacketTrace(
-      std::unique_ptr<MockRxPacket> pkt);
+      std::unique_ptr<MockRxPacket> pkt) override;
 
-  bool isRxThreadRunning();
+  bool isRxThreadRunning() override;
 
-  int getUnit() const {
+  int getUnit() const override {
     return unit_;
   }
 
@@ -136,23 +180,37 @@ class BcmSwitch : public HwSwitch {
   static VlanID getVlanId(opennsl_vlan_t vlan) {
     return VlanID(vlan);
   }
-  const BcmPortTable* getPortTable() const {
+  const BcmPortTable* getPortTable() const override {
     return portTable_.get();
   }
-  const BcmIntfTable* getIntfTable() const {
+  const BcmIntfTable* getIntfTable() const override {
     return intfTable_.get();
   }
-  const BcmHostTable* getHostTable() const {
+  const BcmHostTable* getHostTable() const override {
     return hostTable_.get();
   }
+  const BcmAclTable* getAclTable() const override {
+    return aclTable_.get();
+  }
+  BufferStatsLogger* getBufferStatsLogger() {
+    return bufferStatsLogger_.get();
+  }
+  const BcmTrunkTable* getTrunkTable() const override {
+    return trunkTable_.get();
+  }
+
   bool isPortUp(PortID port) const override;
 
-  opennsl_if_t getDropEgressId() const;
-  opennsl_if_t getToCPUEgressId() const;
+  opennsl_if_t getDropEgressId() const override;
+  opennsl_if_t getToCPUEgressId() const override;
 
-  // The following function will modify the object.
+  // The following function will modify the object. In particular, the return
+  // state will be published (to indicate what has actually been applied). If
+  // everything from delta was successfully applied, then the "new" state in
+  // delta will be published.
+  //
   // Lock has to be performed in the function.
-  void stateChanged(const StateDelta& delta) override;
+  std::shared_ptr<SwitchState> stateChanged(const StateDelta& delta) override;
 
   /*
    * gracefulExit performs the requisite cleanup
@@ -200,26 +258,34 @@ class BcmSwitch : public HwSwitch {
    *                              counter namespace.
    * @param[in]  counterSet       The set of requested Broadcom counters.
    */
-  int getHighresSamplers(
-      HighresSamplerList* samplers,
-      const folly::StringPiece namespaceString,
-      const std::set<folly::StringPiece>& counterSet) override;
+  int getHighresSamplers(HighresSamplerList* samplers,
+                         const std::string& namespaceString,
+                         const std::set<CounterRequest>& counterSet) override;
 
-  BcmCosManager* getCosMgr() const {
+  /*
+   * Wrapper functions to register and unregister a BCM event callbacks.  These
+   * just forward the call.
+   */
+  std::shared_ptr<BcmSwitchEventCallback> registerSwitchEventCallback(
+      opennsl_switch_event_t eventID,
+      std::shared_ptr<BcmSwitchEventCallback> callback);
+  void unregisterSwitchEventCallback(opennsl_switch_event_t eventID);
+
+  BcmCosManager* getCosMgr() const override {
     return cosManager_.get();
   };
 
   void fetchL2Table(std::vector<L2EntryThrift> *l2Table) override;
 
-  BcmHostTable* writableHostTable() const { return hostTable_.get(); }
-  BcmWarmBootCache* getWarmBootCache() const {
+  BcmHostTable* writableHostTable() const override { return hostTable_.get(); }
+  BcmWarmBootCache* getWarmBootCache() const override {
     return warmBootCache_.get();
   }
 
   /**
    * Log the hardware state for the switch
    */
-  void dumpState() const;
+  void dumpState() const override;
 
   /*
    * Handle a fatal crash.
@@ -235,13 +301,25 @@ class BcmSwitch : public HwSwitch {
 
   cfg::PortSpeed getPortSpeed(PortID port) const override;
   cfg::PortSpeed getMaxPortSpeed(PortID port) const override;
+  bool getPortFECConfig(PortID port) const override;
 
   bool isValidStateUpdate(const StateDelta& delta) const override;
+
+  bool startBufferStatCollection();
+  bool stopBufferStatCollection();
+  bool startFineGrainedBufferStatLogging();
+  bool stopFineGrainedBufferStatLogging();
+  bool isBufferStatCollectionEnabled() const {
+    return bufferStatsEnabled_;
+  }
+  bool isFineGrainedBufferStatLoggingEnabled() const {
+    return fineGrainedBufferStatsEnabled_;
+  }
 
  private:
   enum Flags : uint32_t {
     RX_REGISTERED = 0x01,
-    LINKSCAN_REGISTERED = 0x02,
+    LINKSCAN_REGISTERED = 0x02
   };
   // Forbidden copy constructor and assignment operator
   BcmSwitch(BcmSwitch const &) = delete;
@@ -272,9 +350,13 @@ class BcmSwitch : public HwSwitch {
   void processAddedIntf(const std::shared_ptr<Interface>& intf);
   void processRemovedIntf(const std::shared_ptr<Interface>& intf);
 
-  template<typename DELTA>
-  void processNeighborEntryDelta(const DELTA& delta);
-  void processArpChanges(const StateDelta& delta);
+  template <typename DELTA, typename ParentClassT>
+  void processNeighborEntryDelta(
+      const DELTA& delta,
+      std::shared_ptr<SwitchState>* appliedState);
+  void processArpChanges(
+      const StateDelta& delta,
+      std::shared_ptr<SwitchState>* appliedState);
 
   void processDisabledPorts(const StateDelta& delta);
   void processEnabledPorts(const StateDelta& delta);
@@ -283,16 +365,22 @@ class BcmSwitch : public HwSwitch {
 
   template <typename RouteT>
   void processChangedRoute(
-      const RouterID id, const std::shared_ptr<RouteT>& oldRoute,
+      const RouterID& id,
+      std::shared_ptr<SwitchState>* appliedState,
+      const std::shared_ptr<RouteT>& oldRoute,
       const std::shared_ptr<RouteT>& newRoute);
   template <typename RouteT>
   void processAddedRoute(
-      const RouterID id, const std::shared_ptr<RouteT>& route);
+      const RouterID& id,
+      std::shared_ptr<SwitchState>* appliedState,
+      const std::shared_ptr<RouteT>& route);
   template <typename RouteT>
   void processRemovedRoute(
       const RouterID id, const std::shared_ptr<RouteT>& route);
   void processRemovedRoutes(const StateDelta& delta);
-  void processAddedChangedRoutes(const StateDelta& delta);
+  void processAddedChangedRoutes(
+      const StateDelta& delta,
+      std::shared_ptr<SwitchState>* appliedState);
 
   void processAclChanges(const StateDelta& delta);
   void processChangedAcl(const std::shared_ptr<AclEntry>& oldAcl,
@@ -300,7 +388,15 @@ class BcmSwitch : public HwSwitch {
   void processAddedAcl(const std::shared_ptr<AclEntry>& acl);
   void processRemovedAcl(const std::shared_ptr<AclEntry>& acl);
 
-  void stateChangedImpl(const StateDelta& delta);
+  void processAggregatePortChanges(const StateDelta& delta);
+  void processChangedAggregatePort(
+      const std::shared_ptr<AggregatePort>& oldAggPort,
+      const std::shared_ptr<AggregatePort>& newAggPort);
+  void processAddedAggregatePort(const std::shared_ptr<AggregatePort>& aggPort);
+  void processRemovedAggregatePort(
+      const std::shared_ptr<AggregatePort>& aggPort);
+
+  std::shared_ptr<SwitchState> stateChangedImpl(const StateDelta& delta);
 
   /*
    * Calls linkStateChanged below
@@ -378,8 +474,19 @@ class BcmSwitch : public HwSwitch {
 
   /*
    * Drop DHCP packets that are sent to us.
+   * stopBufferStatCollection();
    */
   void dropDhcpPackets();
+
+  /**
+   * Copy IPv6 link local multicast packets to CPU
+   */
+  void copyIPv6LinkLocalMcastPackets();
+  /*
+   * (re) configure control plane policing based on new StateDelta
+   */
+  void reconfigureCoPP(const StateDelta& delta);
+
 
   /*
    * Create ACL group
@@ -418,16 +525,15 @@ class BcmSwitch : public HwSwitch {
    * Setup COS manager
    */
   void setupCos();
-
   /*
-   * Cos Q mapping for packets destined to us.
-   * Most often these are matched by next hop self
-   * as the RX reason and we put it into the right
-   * Cos Queue. However if these packets have their
-   * TTL set to 1, that gets precedence and such packets
-   * destined to us get put in low pri cos queue. Fix that.
+   * Create buffer stats logger
    */
-   void configureCosQMappingForLocalInterfaces(const StateDelta& delta) const;
+  std::unique_ptr<BufferStatsLogger> createBufferStatsLogger();
+
+  /**
+   * Setup trunking machinery
+   */
+  void setupTrunking();
 
    /*
     * Check if state, speed update for this port port would
@@ -440,6 +546,12 @@ class BcmSwitch : public HwSwitch {
     const std::shared_ptr<Port>& newPort,
     const std::shared_ptr<SwitchState>& newState) const;
 
+  // Returns whether ALPM has been enabled via the sdk
+  bool isAlpmEnabled();
+
+  MmuState queryMmuState() const;
+  void exportDeviceBufferUsage();
+
   /*
    * Member variables
    */
@@ -449,15 +561,30 @@ class BcmSwitch : public HwSwitch {
   int unit_{-1};
   uint32_t flags_{0};
   HashMode hashMode_;
+  MmuState mmuState_{MmuState::UNKNOWN};
+  bool bufferStatsEnabled_{false};
+  bool fineGrainedBufferStatsEnabled_{false};
+  uint64_t mmuBufferBytes_{0};
+  uint64_t mmuCellBytes_{0};
+  std::unique_ptr<BcmWarmBootCache> warmBootCache_;
   std::unique_ptr<BcmPortTable> portTable_;
   std::unique_ptr<BcmEgress> toCPUEgress_;
   std::unique_ptr<BcmIntfTable> intfTable_;
   std::unique_ptr<BcmHostTable> hostTable_;
   std::unique_ptr<BcmRouteTable> routeTable_;
   std::unique_ptr<BcmAclTable> aclTable_;
-  std::unique_ptr<BcmWarmBootCache> warmBootCache_;
-  std::unique_ptr<BcmSwitchEventManager> switchEventManager_;
   std::unique_ptr<BcmCosManager> cosManager_;
+  std::unique_ptr<BcmTableStats> bcmTableStats_;
+  std::unique_ptr<BufferStatsLogger> bufferStatsLogger_;
+  std::unique_ptr<BcmTrunkTable> trunkTable_;
+  /*
+   * TODO - Right now we setup copp using logic embedded in code.
+   * So we need to remember what is already setup and what needs
+   * to be done now. Ideally CoPP setup should just be done via
+   * config - t14668101, once that is done, get rid of this member
+   * variable.
+   */
+  std::vector<std::shared_ptr<AclEntry>> coppAclEntries_;
   /*
    * Lock to synchronize access to all BCM* data structures
    */

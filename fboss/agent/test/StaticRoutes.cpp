@@ -12,7 +12,7 @@
 #include "fboss/agent/state/Route.h"
 #include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/hw/mock/MockPlatform.h"
-#include "fboss/agent/gen-cpp/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 #include <folly/IPAddressV4.h>
 #include <folly/IPAddressV6.h>
@@ -27,8 +27,10 @@ using folly::IPAddressV4;
 using folly::IPAddressV6;
 using folly::IPAddress;
 
+auto kStaticClient = StdClientIds2ClientID(StdClientIds::STATIC_ROUTE);
+
 TEST(StaticRoutes, configureUnconfigure) {
-  MockPlatform platform;
+  auto platform = createMockPlatform();
   auto stateV0 = make_shared<SwitchState>();
   auto tablesV0 = stateV0->getRouteTables();
 
@@ -58,7 +60,7 @@ TEST(StaticRoutes, configureUnconfigure) {
   config.staticRoutesWithNhops[3].nexthops[0] = "2001::2";
 
 
-  auto stateV1 = publishAndApplyConfig(stateV0, &config, &platform);
+  auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
   ASSERT_NE(nullptr, stateV1);
   RouterID rid0(0);
   auto t1 = stateV1->getRouteTables()->getRouteTableIf(rid0);
@@ -79,14 +81,16 @@ TEST(StaticRoutes, configureUnconfigure) {
   EXPECT_FALSE(r1v4->isUnresolvable());
   EXPECT_FALSE(r1v4->isConnected());
   EXPECT_FALSE(r1v4->needResolve());
-  EXPECT_TRUE(r1v4->isSame(DROP));
+  EXPECT_EQ(r1v4->getForwardInfo(), RouteNextHopEntry(DROP));
+
   auto r2v4 = rib1v4->exactMatch(prefix2v4);
   ASSERT_NE(nullptr, r2v4);
   EXPECT_TRUE(r2v4->isResolved());
   EXPECT_FALSE(r2v4->isUnresolvable());
   EXPECT_FALSE(r2v4->isConnected());
   EXPECT_FALSE(r2v4->needResolve());
-  EXPECT_TRUE(r2v4->isSame(TO_CPU));
+  EXPECT_EQ(r2v4->getForwardInfo(), RouteNextHopEntry(TO_CPU));
+
   // Recursive resolution to DROP
   auto r3v4 = rib1v4->exactMatch(prefix3v4);
   ASSERT_NE(nullptr, r3v4);
@@ -94,7 +98,8 @@ TEST(StaticRoutes, configureUnconfigure) {
   EXPECT_FALSE(r3v4->isUnresolvable());
   EXPECT_FALSE(r3v4->isConnected());
   EXPECT_FALSE(r3v4->needResolve());
-  EXPECT_TRUE(r3v4->isSame(DROP));
+  EXPECT_EQ(r3v4->getForwardInfo(), RouteNextHopEntry(DROP));
+
   // Recursive resolution to CPU
   auto r4v4 = rib1v4->exactMatch(prefix4v4);
   ASSERT_NE(nullptr, r4v4);
@@ -102,8 +107,7 @@ TEST(StaticRoutes, configureUnconfigure) {
   EXPECT_FALSE(r4v4->isUnresolvable());
   EXPECT_FALSE(r4v4->isConnected());
   EXPECT_FALSE(r4v4->needResolve());
-  EXPECT_TRUE(r4v4->isSame(TO_CPU));
-
+  EXPECT_EQ(r4v4->getForwardInfo(), RouteNextHopEntry(TO_CPU));
 
   auto rib1v6 = t1->getRibV6();
   auto r1v6 = rib1v6->exactMatch(prefix1v6);
@@ -112,14 +116,16 @@ TEST(StaticRoutes, configureUnconfigure) {
   EXPECT_FALSE(r1v6->isUnresolvable());
   EXPECT_FALSE(r1v6->isConnected());
   EXPECT_FALSE(r1v6->needResolve());
-  EXPECT_TRUE(r1v6->isSame(DROP));
+  EXPECT_EQ(r1v6->getForwardInfo(), RouteNextHopEntry(DROP));
+
   auto r2v6 = rib1v6->exactMatch(prefix2v6);
   ASSERT_NE(nullptr, r2v6);
   EXPECT_TRUE(r2v6->isResolved());
   EXPECT_FALSE(r2v6->isUnresolvable());
   EXPECT_FALSE(r2v6->isConnected());
   EXPECT_FALSE(r2v6->needResolve());
-  EXPECT_TRUE(r2v6->isSame(TO_CPU));
+  EXPECT_EQ(r2v6->getForwardInfo(), RouteNextHopEntry(TO_CPU));
+
   // Recursive resolution to DROP
   auto r3v6 = rib1v6->exactMatch(prefix3v6);
   ASSERT_NE(nullptr, r3v6);
@@ -127,7 +133,8 @@ TEST(StaticRoutes, configureUnconfigure) {
   EXPECT_FALSE(r3v6->isUnresolvable());
   EXPECT_FALSE(r3v6->isConnected());
   EXPECT_FALSE(r3v6->needResolve());
-  EXPECT_TRUE(r3v6->isSame(DROP));
+  EXPECT_EQ(r3v6->getForwardInfo(), RouteNextHopEntry(DROP));
+
   // Recursive resolution to CPU
   auto r4v6 = rib1v6->exactMatch(prefix4v6);
   ASSERT_NE(nullptr, r4v6);
@@ -135,11 +142,11 @@ TEST(StaticRoutes, configureUnconfigure) {
   EXPECT_FALSE(r4v6->isUnresolvable());
   EXPECT_FALSE(r4v6->isConnected());
   EXPECT_FALSE(r4v6->needResolve());
-  EXPECT_TRUE(r4v6->isSame(TO_CPU));
+  EXPECT_EQ(r4v6->getForwardInfo(), RouteNextHopEntry(TO_CPU));
 
   // Now blow away the static routes from config.
   cfg::SwitchConfig emptyConfig;
-  auto stateV2 = publishAndApplyConfig(stateV1, &emptyConfig, &platform,
+  auto stateV2 = publishAndApplyConfig(stateV1, &emptyConfig, platform.get(),
       &config);
   ASSERT_NE(nullptr, stateV2);
   auto t2 = stateV2->getRouteTables()->getRouteTableIf(rid0);

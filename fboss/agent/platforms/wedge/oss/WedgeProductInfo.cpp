@@ -11,7 +11,11 @@
 
 namespace facebook { namespace fboss {
 
-void WedgeProductInfo::initFromHostname() {
+void WedgeProductInfo::initFromFbWhoAmI() {
+}
+
+void WedgeProductInfo::setFBSerial() {
+
 }
 
 }} // facebook::fboss

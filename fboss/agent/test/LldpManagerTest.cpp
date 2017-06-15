@@ -26,7 +26,7 @@
 
 #include <boost/cast.hpp>
 #include "gmock/gmock.h"
-#include "gtest/gtest.h"
+#include <gtest/gtest.h>
 using ::testing::AtLeast;
 
 
@@ -101,10 +101,11 @@ TxMatchFn checkLldpPDU() {
 
 TEST(LldpManagerTest, LldpSend) {
   auto sw = setupSwitch();
-  //setAllPortsUp(sw->getState());
   SwSwitch* swPtr = sw.get();
-  EXPECT_HW_CALL(sw, sendPacketOutOfPort_(TxPacketMatcher::createMatcher(
-                  "Lldp PDU", checkLldpPDU()))).Times(AtLeast(1));
+  EXPECT_HW_CALL(
+      sw,
+      sendPacketOutOfPort_(TxPacketMatcher::createMatcher(
+                             "Lldp PDU", checkLldpPDU()), _)).Times(AtLeast(1));
   LldpManager lldpManager(swPtr);
   lldpManager.sendLldpOnAllPorts(false);
 }

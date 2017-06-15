@@ -10,17 +10,21 @@
 
 #pragma once
 
+#include <boost/container/flat_set.hpp>
+
 #include <chrono>
 #include <folly/io/async/AsyncTimeout.h>
 
 #include "fboss/agent/SwSwitch.h"
+#include "fboss/agent/state/Port.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 namespace facebook { namespace fboss {
 
 class PortRemediator : private folly::AsyncTimeout {
  public:
   explicit PortRemediator(SwSwitch* swSwitch);
-  ~PortRemediator();
+  ~PortRemediator() override;
 
   static void start(void *arg) {
     auto me = static_cast<PortRemediator*>(arg);
@@ -33,8 +37,15 @@ class PortRemediator : private folly::AsyncTimeout {
   }
 
   void timeoutExpired() noexcept override;
+  void init();
 
  private:
+  void updatePortState(
+      PortID portId,
+      cfg::PortState newPortState,
+      bool preventCoalescing);
+  boost::container::flat_set<PortID> getUnexpectedDownPorts()
+      const;
   SwSwitch* sw_;
   std::chrono::seconds interval_;
 };

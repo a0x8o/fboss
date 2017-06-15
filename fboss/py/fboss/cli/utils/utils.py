@@ -14,6 +14,11 @@ import re
 
 from facebook.network.Address.ttypes import BinaryAddress
 
+AGENT_KEYWORD = 'agent'
+BGP_KEYWORD = 'bgp'
+COOP_KEYWORD = 'coop'
+SDK_KEYWORD = 'sdk'
+
 if sys.stdout.isatty():
     COLOR_RED = '\033[31m'
     COLOR_GREEN = '\033[32m'
@@ -22,6 +27,7 @@ else:
     COLOR_RED = ''
     COLOR_GREEN = ''
     COLOR_RESET = ''
+
 
 def ip_to_binary(ip):
     for family in (socket.AF_INET, socket.AF_INET6):
@@ -32,6 +38,7 @@ def ip_to_binary(ip):
         return BinaryAddress(addr=data)
     raise socket.error('illegal IP address string: {}'.format(ip))
 
+
 def ip_ntop(addr):
     if len(addr) == 4:
         return socket.inet_ntop(socket.AF_INET, addr)
@@ -40,16 +47,25 @@ def ip_ntop(addr):
     else:
         raise ValueError('bad binary address %r' % (addr,))
 
+
 def port_sort_fn(port):
     if not port.name:
         return '', port.portId, 0, 0
-    m = re.match('([a-z][a-z][a-z])(\d+)/(\d+)/(\d)', port.name)
+    return port_name_sort_fn(port.name)
+
+
+def port_name_sort_fn(port_name):
+    m = re.match('([a-z][a-z][a-z])(\d+)/(\d+)/(\d)', port_name)
     if not m:
         return '', 0, 0, 0
     return m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
 
 
-def get_status_strs(status):
+def make_error_string(msg):
+    return COLOR_RED + msg + COLOR_RESET
+
+
+def get_status_strs(status, is_present):
     ''' Get port status attributes '''
 
     attrs = {}
@@ -68,14 +84,14 @@ def get_status_strs(status):
         speed = ""
     if not status.up:
         link_status = "Down"
-        if status.enabled and status.present:
+        if status.enabled and is_present:
             color_start = COLOR_RED
         else:
             color_start = ''
             color_end = ''
-    if status.present is None:
+    if is_present is None:
         present = "Unknown"
-    elif not status.present:
+    elif not is_present:
         present = ""
 
     if color_start:
@@ -91,3 +107,16 @@ def get_status_strs(status):
     attrs['speed'] = speed
 
     return attrs
+
+
+def get_qsfp_info_map(qsfp_client, qsfps, continue_on_error=False):
+    if not qsfp_client:
+        return {}
+    try:
+        return qsfp_client.getTransceiverInfo(qsfps)
+    except Exception as e:
+        if not continue_on_error:
+            raise
+        print(make_error_string(
+            "Could not get qsfp info; continue anyway\n{}".format(e)))
+        return {}

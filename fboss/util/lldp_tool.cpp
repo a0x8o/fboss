@@ -5,20 +5,22 @@
 //
 // It can listen on both front-panel ports and local linux interfaces.
 #include "fboss/agent/FbossError.h"
-#include "fboss/agent/hw/bcm/facebook/gen-cpp/bcm_config_types.h"
 #include "fboss/agent/hw/bcm/BcmAPI.h"
 #include "fboss/agent/hw/bcm/BcmError.h"
 #include "fboss/agent/hw/bcm/BcmRxPacket.h"
 #include "fboss/agent/hw/bcm/BcmUnit.h"
+#include "fboss/agent/hw/bcm/facebook/gen-cpp2/bcm_config_types.h"
 #include "fboss/agent/lldp/LinkNeighbor.h"
 #include "fboss/agent/packet/Ethertype.h"
 #include "fboss/agent/packet/PktUtil.h"
+#include "fboss/util/thrift/gen-cpp2/LldpConfig_types.h"
 
 #include <folly/Exception.h>
 #include <folly/FileUtil.h>
 #include <folly/MacAddress.h>
 #include <folly/String.h>
 #include <gflags/gflags.h>
+#include <thrift/lib/cpp2/protocol/Serializer.h>
 
 #include <mutex>
 #include <sys/types.h>
@@ -30,16 +32,14 @@
 #include <netpacket/packet.h>
 #include <net/ethernet.h>
 #include <net/if.h>
-#include <err.h>
-#include <errno.h>
 #include <string.h>
-#include <time.h>
 
 extern "C" {
 #include <opennsl/l2.h>
 #include <bcm/l2.h>
 #include <opennsl/link.h>
 #include <opennsl/port.h>
+#include <bcm/port.h>
 #include <opennsl/rx.h>
 #include <opennsl/stg.h>
 }
@@ -55,17 +55,21 @@ using std::map;
 using std::string;
 using std::vector;
 
+// Defined in BcmSwitch.cpp
+DECLARE_int32(linkscan_interval_us);
+
 DEFINE_bool(bcm, true,
             "Whether to listen via a Broadcom ASIC.  "
             "Enabled by default; set to \"no\" to disable");
 DEFINE_string(bcm_config, "",
               "The location of the Broadcom JSON configuration file");
-DEFINE_int32(linkscan_interval_us, 250000,
-             "The Broadcom linkscan interval");
 DEFINE_string(if_name, "eth0", "The local interface to listen on");
 DEFINE_int32(mtu, 9000, "The maximum packet size to expect");
 DEFINE_bool(verbose, false,
              "Print more verbose information about each neighbor packet");
+DEFINE_string(lldp_ports_config,
+              "",
+              "The location of the config file for port's interface configs");
 
 static const MacAddress MAC_LLDP_NEAREST_BRIDGE("01:80:c2:00:00:0e");
 static const MacAddress MAC_CDP("01:00:0c:cc:cc:cc");
@@ -83,9 +87,32 @@ void initBcmAPI() {
     throw FbossError("unable to read Broadcom config file ",
                      FLAGS_bcm_config);
   }
-  bcm::BcmConfig cfg;
-  cfg.readFromJson(contents.c_str());
+  auto cfg = apache::thrift::SimpleJSONSerializer::deserialize<bcm::BcmConfig>(
+      contents);
   BcmAPI::init(cfg.config);
+}
+
+std::map<int32_t, cfg::OnePortConfig> readLldpPortConfig() {
+  using RetType = std::map<int32_t, cfg::OnePortConfig>;
+  if (FLAGS_lldp_ports_config.empty()) {
+    return RetType();
+  }
+  string contents;
+  if (!folly::readFile(FLAGS_lldp_ports_config.c_str(), contents)) {
+    throw FbossError("unable to read the config file ",
+                     FLAGS_lldp_ports_config);
+  }
+  cfg::LldpConfig lldpConfig;
+  try {
+    lldpConfig =
+        apache::thrift::SimpleJSONSerializer::deserialize<cfg::LldpConfig>(
+            contents);
+  } catch (const std::exception& jsonEx) {
+    LOG(ERROR) << "unable to parse " << FLAGS_lldp_ports_config
+               << " as a JSON file: " << folly::exceptionStr(jsonEx);
+    return RetType();
+  }
+  return lldpConfig.portConfigMap;
 }
 
 std::string formatNeighborInfoVerbose(LinkNeighbor* neighbor,
@@ -227,7 +254,9 @@ class BcmProcessor {
 
   static opennsl_rx_t lldpPktHandler(int unit, opennsl_pkt_t* nslPkt,
                                      void* cookie);
+  void setFEC(opennsl_port_t port, bool disableFEC);
 
+  cfg::LldpConfig lldpConfig_;
   int unit_{-1};
   std::unique_ptr<BcmUnit> bcmUnit_;
 };
@@ -248,6 +277,8 @@ void BcmProcessor::prepare() {
   bcmCheckError(rv, "failed to set linkscan ports");
   rv = opennsl_linkscan_enable_set(unit_, FLAGS_linkscan_interval_us);
   bcmCheckError(rv, "failed to enable linkscan");
+
+  lldpConfig_.portConfigMap = readLldpPortConfig();
 
   // Enable all ports, with each port in a separate VLAN.
   int idx;
@@ -308,16 +339,66 @@ void BcmProcessor::configurePort(opennsl_port_t port, opennsl_vlan_t vlan) {
   rv = opennsl_stg_stp_set(unit_, stg, port, OPENNSL_STG_STP_FORWARD);
   bcmCheckError(rv, "failed to set spanning tree state on port ", port);
 
+  // We enable FEC for all 100G ports unless told otherwise by config
+  bool disableFEC = false;
+  const auto itr = lldpConfig_.portConfigMap.find(port);
+  if (itr != lldpConfig_.portConfigMap.end()) {
+    opennsl_port_if_t currentPortInterface;
+    rv = opennsl_port_interface_get(unit_, port, &currentPortInterface);
+    bcmCheckError(rv, "failed to get interface for port ", port);
+    opennsl_port_if_t desiredMode = OPENNSL_PORT_IF_NULL;
+    switch (itr->second.portMode) {
+      case  cfg::PortMode::CR4:
+        desiredMode = OPENNSL_PORT_IF_CR4;
+        break;
+      case  cfg::PortMode::CAUI:
+        desiredMode = OPENNSL_PORT_IF_CAUI;
+        break;
+      case cfg::PortMode::DEFAULT:
+        LOG(INFO) << "Using default port mode " << currentPortInterface
+                  << " for port " << port;
+        break;
+    }
+    if (desiredMode != OPENNSL_PORT_IF_NULL) {
+      rv = opennsl_port_interface_set(unit_, port, desiredMode);
+      bcmCheckError(rv, "failed to set desired mode for port: ", port);
+    }
+
+    if (itr->second.__isset.portSpeedMbps) {
+      auto desiredSpeed = static_cast<int>(itr->second.portSpeedMbps);
+      rv = opennsl_port_speed_set(unit_, port, desiredSpeed);
+      bcmCheckError(rv, "failed to set desired speed for port: ", port);
+    }
+    if (itr->second.__isset.disableFEC) {
+      disableFEC = itr->second.disableFEC;
+    }
+  }
   // Enable the port
   int enable = 1;
   rv = opennsl_port_enable_set(unit_, port, enable);
   bcmCheckError(rv, "failed to enable port ", port);
+  setFEC(port, disableFEC);
+
+}
+
+void BcmProcessor::setFEC(opennsl_port_t port, bool disableFEC) {
+  int curSpeed{0};
+  auto rv = opennsl_port_speed_get(unit_, port, &curSpeed);
+  bcmCheckError(rv, "Failed to get current speed for port ", port);
+  // Bcm takes port speeds in mb/s
+  constexpr int HUNDREDG = 100000;
+  auto desiredFEC =
+      ((curSpeed == HUNDREDG && !disableFEC) ? BCM_PORT_PHY_CONTROL_FEC_ON
+                                            : BCM_PORT_PHY_CONTROL_FEC_OFF);
+  bcm_port_phy_control_set(
+      unit_, port, BCM_PORT_PHY_CONTROL_FORWARD_ERROR_CORRECTION, desiredFEC);
 }
 
 opennsl_rx_t BcmProcessor::lldpPktHandler(int unit, opennsl_pkt_t* nslPkt,
                                           void* cookie) {
   // Ignore packets smaller than the minimum ethernet frame size
   int len = nslPkt->pkt_len;
+  LOG(INFO) << "Received packet of size " << len;
   if (len < 64) {
     return OPENNSL_RX_NOT_HANDLED;
   }
@@ -424,10 +505,10 @@ void LocalInterfaceProcessor::run() {
 
 int main(int argc, char* argv[]) {
   // Parse command line flags
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
   google::InitGoogleLogging(argv[0]);
-  google::SetCommandLineOptionWithMode("minloglevel", "0",
-                                       google::SET_FLAGS_DEFAULT);
+  gflags::SetCommandLineOptionWithMode(
+      "minloglevel", "0", gflags::SET_FLAGS_DEFAULT);
   google::InstallFailureSignalHandler();
 
   BcmProcessor bcm;

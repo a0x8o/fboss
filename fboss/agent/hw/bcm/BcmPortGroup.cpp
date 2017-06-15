@@ -15,9 +15,6 @@
 
 #include "fboss/agent/state/Port.h"
 
-extern "C" {
-#include <opennsl/port.h>
-}
 
 namespace {
 using facebook::fboss::BcmPortGroup;
@@ -100,7 +97,7 @@ BcmPortGroup::LaneMode BcmPortGroup::calculateDesiredLaneMode(
   auto desiredMode = LaneMode::QUAD;
   for (int lane = 0; lane < ports.size(); ++lane) {
     auto port = ports[lane];
-    if (!port->isDisabled()) {
+    if (!port->isAdminDisabled()) {
       auto neededMode = neededLaneModeForSpeed(port->getSpeed(), laneSpeeds);
       if (neededMode < desiredMode) {
         desiredMode = neededMode;
@@ -200,7 +197,7 @@ void BcmPortGroup::reconfigureLaneMode(
   // 4. enable ports
   for (auto& bcmPort : allPorts_) {
     auto swPort = bcmPort->getSwitchStatePort(state);
-    if (!swPort->isDisabled()) {
+    if (!swPort->isAdminDisabled()) {
       bcmPort->enable(swPort);
     }
   }

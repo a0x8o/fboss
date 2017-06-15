@@ -34,13 +34,6 @@ class TunManager : public StateObserver {
   ~TunManager() override;
 
   /**
-   * Start probe procedure to read existing TUN interface info from the host.
-   * This function can be called from any thread and probe function will happen
-   * in the thread serving 'evb_'
-   */
-  void startProbe();
-
-  /**
    * Update the intfs_ map based on the given state update. This
    * overrides the StateObserver stateUpdated api, which is always
    * guaranteed to be called from the update thread.
@@ -54,17 +47,22 @@ class TunManager : public StateObserver {
    * @return true The packet is sent to host
    *         false The packet is dropped due to errors
    */
-  bool sendPacketToHost(std::unique_ptr<RxPacket> pkt);
+  virtual bool sendPacketToHost(
+      InterfaceID dstIfID, std::unique_ptr<RxPacket> pkt);
 
   /**
-   * Sync the new SwitchState
+   * Performs probe procedure to read existing TUN interface info from the host
+   * and sync the new SwitchState
+   *
    * This should really be only called externally once, after config is applied.
    * After that all updates should come via the stateUpdated calls.
    *
    * SwSwitch calls this API when initial configuration is applied on agent
    * restart.
    */
-  void sync(std::shared_ptr<SwitchState> state);
+  virtual void sync(std::shared_ptr<SwitchState> state);
+
+  void forceInitialSync();
 
   /**
    * This should be called externally only after initial sync has been
@@ -73,7 +71,7 @@ class TunManager : public StateObserver {
    * SwSwitch calls this API after calling initial sync when initial
    * configuration is applied.
    */
-  void startObservingUpdates();
+  virtual void startObservingUpdates();
 
  private:
   // no copy to assign
@@ -91,8 +89,9 @@ class TunManager : public StateObserver {
    * 1. During probe process when we discover existing Tun interface on linux
    * 2. When we want to create a new TUN interface in linux
    */
-  void addIntf(const std::string& name, int ifIndex);
-  void addIntf(InterfaceID ifID, const Interface::Addresses& addrs);
+  void addExistingIntf(const std::string& name, int ifIndex);
+  void addNewIntf(
+      InterfaceID ifID, bool isUp, const Interface::Addresses& addrs);
 
   // Remove an existing TUN interface
   void removeIntf(InterfaceID ifID);
@@ -100,8 +99,10 @@ class TunManager : public StateObserver {
   // A tun interface was changed, update the addresses accordingly
   void updateIntf(InterfaceID ifID, const Interface::Addresses& addrs);
 
-  // Bring up the interface on the host
-  void bringUpIntf(const std::string& ifName, int ifIndex);
+  /**
+   * Bring UP/DOWN interfaces by mutating admin status in Linux
+   */
+  void setIntfStatus(const std::string& ifName, int ifIndex, bool status);
 
   /**
    * Add/remove a route table.
@@ -176,7 +177,6 @@ class TunManager : public StateObserver {
   /**
    * Lookup host for existing Tun interfaces and their addresses.
    */
-  void probe();
   void doProbe(std::lock_guard<std::mutex>& mutex);
 
   /**
@@ -188,6 +188,14 @@ class TunManager : public StateObserver {
    * Get MTU of switch interface
    */
   int getInterfaceMtu(InterfaceID ifID) const;
+
+  /**
+   * Get Interface statuses map from a given SwitchState. In switch each
+   * Interface/VLAN consists of multiple Ports. We derive state of Interface
+   * to be UP if alteast one of the port belonging to that interface is UP.
+   */
+  static boost::container::flat_map<InterfaceID, bool> getInterfaceStatus(
+      std::shared_ptr<SwitchState> state);
 
   template<typename MAPNAME,
            typename CHANGEFN, typename ADDFN, typename REMOVEFN>
@@ -201,9 +209,8 @@ class TunManager : public StateObserver {
   nl_sock *sock_{nullptr};
 
   /**
-   * The mutex used to protect intfs_.
-   * probe() and sync() could manipulate intfs_. They both run on the same
-   * thread that serves evb_.
+   * The mutex used to protect `intfs_` which can be used by
+   * sync() could manipulate intfs_. Called on the thread that serves evb_.
    * sendPacketToHost() uses intfs_, it can be called from any thread.
    */
   boost::container::flat_map<InterfaceID, std::unique_ptr<TunIntf>> intfs_;
@@ -215,6 +222,8 @@ class TunManager : public StateObserver {
 
   // Initial probe done
   bool probeDone_{false};
+
+  uint64_t numSyncs_{0};
 
   enum : uint8_t {
     /**

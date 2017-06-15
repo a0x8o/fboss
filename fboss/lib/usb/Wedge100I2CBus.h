@@ -9,35 +9,47 @@
  */
 #pragma once
 
-#include "fboss/lib/usb/BaseWedgeI2CBus.h"
+#include "fboss/lib/usb/PCA9548MultiplexedBus.h"
 
-namespace facebook { namespace fboss {
+namespace facebook {
+namespace fboss {
 
 // Handle the intricacies of routing I2C requests to appropriate QSFPs,
 // based on the hardware.
 
-class Wedge100I2CBus : public BaseWedgeI2CBus {
- public:
-  Wedge100I2CBus();
-  virtual ~Wedge100I2CBus() {}
+class Wedge100I2CBus : public PCA9548MultiplexedBus {
+  enum : uint8_t {
+    MULTIPLEXERS = 5,
+    MULTIPLEXERS_START_ADDR = 0x70,
+    NUM_PORTS = 32,
+  };
+  // QSFP_ADDR_MAP represents PCA 9548 multiplexer pin address
+  // to QSFP mapping. Entry 0 in this array maps to first
+  // QSFP handled by this multiplexer
+  static constexpr QsfpAddressMap_t QSFP_ADDR_MAP = {{
+      0x2,
+      0x1,
+      0x8,
+      0x4,
+      0x20,
+      0x10,
+      0x80,
+      0x40,
+  }};
 
- protected:
-  virtual void initBus() override;
-  virtual void verifyBus(bool autoReset = true) override;
-  virtual void selectQsfpImpl(unsigned int module) override;
+ public:
+  Wedge100I2CBus()
+      : PCA9548MultiplexedBus(
+            MULTIPLEXERS_START_ADDR,
+            MULTIPLEXERS,
+            NUM_PORTS,
+            QSFP_ADDR_MAP) {}
+  ~Wedge100I2CBus() override {}
 
  private:
-  enum : uint8_t {
-    MULTIPLEXERS = 4,
-    // The PCA9548 switch selecting for 32 port controllers
-    // Note that the address is shifted one to the left to
-    // work with the underlying I2C libraries.
-    ADDR_SWITCH_32 = 0xe0,
-  };
-
   // Forbidden copy constructor and assignment operator
-  Wedge100I2CBus(Wedge100I2CBus const &) = delete;
-  Wedge100I2CBus& operator=(Wedge100I2CBus const &) = delete;
+  Wedge100I2CBus(Wedge100I2CBus const&) = delete;
+  Wedge100I2CBus& operator=(Wedge100I2CBus const&) = delete;
 };
-
-}} // facebook::fboss
+}
+} // facebook::fboss

@@ -301,6 +301,108 @@ TEST(Route, resolve) {
   }
 }
 
+TEST(Route, resolveDropToCPUMix) {
+  auto platform = createMockPlatform();
+  auto stateV0 = make_shared<SwitchState>();
+  auto tablesV0 = stateV0->getRouteTables();
+
+  cfg::SwitchConfig config;
+  config.vlans.resize(2);
+  config.vlans[0].id = 1;
+  config.vlans[1].id = 2;
+
+  config.interfaces.resize(2);
+  config.interfaces[0].intfID = 1;
+  config.interfaces[0].vlanID = 1;
+  config.interfaces[0].routerID = 0;
+  config.interfaces[0].__isset.mac = true;
+  config.interfaces[0].mac = "00:00:00:00:00:11";
+  config.interfaces[0].ipAddresses.resize(2);
+  config.interfaces[0].ipAddresses[0] = "1.1.1.1/24";
+  config.interfaces[0].ipAddresses[1] = "1::1/48";
+  config.interfaces[1].intfID = 2;
+  config.interfaces[1].vlanID = 2;
+  config.interfaces[1].routerID = 0;
+  config.interfaces[1].__isset.mac = true;
+  config.interfaces[1].mac = "00:00:00:00:00:22";
+  config.interfaces[1].ipAddresses.resize(2);
+  config.interfaces[1].ipAddresses[0] = "2.2.2.2/24";
+  config.interfaces[1].ipAddresses[1] = "2::1/48";
+
+  auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
+  stateV1->publish();
+  ASSERT_NE(nullptr, stateV1);
+
+  auto rid = RouterID(0);
+
+  // add a DROP route and a ToCPU route
+  RouteUpdater u1(stateV1->getRouteTables());
+  u1.addRoute(rid, IPAddress("11.1.1.0"), 24, CLIENT_A,
+              RouteNextHopEntry(RouteForwardAction::DROP));
+  u1.addRoute(rid, IPAddress("22.1.1.0"), 24, CLIENT_A,
+              RouteNextHopEntry(RouteForwardAction::TO_CPU));
+  // then, add a route for 4 nexthops. One to each interface, one
+  // to the DROP and one to the ToCPU
+  RouteNextHopSet nhops = makeNextHops({"1.1.1.10", // intf 1
+                                        "2.2.2.10", // intf 2
+                                        "11.1.1.10", // DROP
+                                        "22.1.1.10"}); // ToCPU
+  u1.addRoute(rid, IPAddress("8.8.8.0"), 24,
+              CLIENT_A, RouteNextHopEntry(nhops));
+  auto table2 = u1.updateDone();
+  ASSERT_NE(nullptr, table2);
+  table2->publish();
+  {
+    auto r2 = GET_ROUTE_V4(table2, rid, "8.8.8.0/24");
+    EXPECT_RESOLVED(r2);
+    EXPECT_FALSE(r2->isDrop());
+    EXPECT_FALSE(r2->isToCPU());
+    EXPECT_FALSE(r2->isConnected());
+    const auto& fwd = r2->getForwardInfo();
+    EXPECT_EQ(RouteForwardAction::NEXTHOPS, fwd.getAction());
+    EXPECT_EQ(2, fwd.getNextHopSet().size());
+  }
+
+  // now update the route with just DROP and ToCPU, expect ToCPU to win
+  RouteUpdater u2(table2);
+  RouteNextHopSet nhops2 = makeNextHops({"11.1.1.10", // DROP
+                                         "22.1.1.10"}); // ToCPU
+  u2.addRoute(rid, IPAddress("8.8.8.0"), 24,
+              CLIENT_A, RouteNextHopEntry(nhops2));
+  auto table3 = u2.updateDone();
+  ASSERT_NE(nullptr, table3);
+  table3->publish();
+  {
+    auto r2 = GET_ROUTE_V4(table3, rid, "8.8.8.0/24");
+    EXPECT_RESOLVED(r2);
+    EXPECT_FALSE(r2->isDrop());
+    EXPECT_TRUE(r2->isToCPU());
+    EXPECT_FALSE(r2->isConnected());
+    const auto& fwd = r2->getForwardInfo();
+    EXPECT_EQ(RouteForwardAction::TO_CPU, fwd.getAction());
+    EXPECT_EQ(0, fwd.getNextHopSet().size());
+  }
+
+  // now update the route with just DROP
+  RouteUpdater u3(table3);
+  RouteNextHopSet nhops3 = makeNextHops({"11.1.1.10"}); // DROP
+  u3.addRoute(rid, IPAddress("8.8.8.0"), 24,
+              CLIENT_A, RouteNextHopEntry(nhops3));
+  auto table4 = u3.updateDone();
+  ASSERT_NE(nullptr, table4);
+  table4->publish();
+  {
+    auto r2 = GET_ROUTE_V4(table4, rid, "8.8.8.0/24");
+    EXPECT_RESOLVED(r2);
+    EXPECT_TRUE(r2->isDrop());
+    EXPECT_FALSE(r2->isToCPU());
+    EXPECT_FALSE(r2->isConnected());
+    const auto& fwd = r2->getForwardInfo();
+    EXPECT_EQ(RouteForwardAction::DROP, fwd.getAction());
+    EXPECT_EQ(0, fwd.getNextHopSet().size());
+  }
+}
+
 // Testing add and delete ECMP routes
 TEST(Route, addDel) {
   auto platform = createMockPlatform();
@@ -1340,8 +1442,8 @@ TEST(Route, deepCopy) {
 
   EXPECT_FALSE(nhm1 == nhm2);
 
-  EXPECT_TRUE(nhm1.isSame(CLIENT_A, newHops));
-  EXPECT_TRUE(nhm2.isSame(CLIENT_A, origHops));
+  EXPECT_TRUE(nhm1.isSame(CLIENT_A, RouteNextHopEntry(newHops)));
+  EXPECT_TRUE(nhm2.isSame(CLIENT_A, RouteNextHopEntry(origHops)));
 }
 
 // Test serialization of RouteNextHopsMulti.
@@ -1388,33 +1490,32 @@ TEST(Route, listRanking) {
 
   auto list00 = newNextHops(3, "0.0.0.");
   auto list07 = newNextHops(3, "7.7.7.");
-  auto list10 = newNextHops(3, "10.10.10.");
+  auto list01 = newNextHops(3, "1.1.1.");
   auto list20 = newNextHops(3, "20.20.20.");
   auto list30 = newNextHops(3, "30.30.30.");
 
   RouteNextHopsMulti nhm;
-  nhm.update(ClientID(20), RouteNextHopEntry(list20));
-  nhm.update(ClientID(10), RouteNextHopEntry(list10));
+  nhm.update(ClientID(20), RouteNextHopEntry(list20,
+      AdminDistance::EBGP));
+  nhm.update(ClientID(1), RouteNextHopEntry(list01,
+        AdminDistance::STATIC_ROUTE));
   nhm.update(ClientID(30), RouteNextHopEntry(list30));
-  EXPECT_TRUE(nhm.getBestEntry().second->getNextHopSet() == list10);
+  EXPECT_TRUE(nhm.getBestEntry().second->getNextHopSet() == list01);
 
-  nhm.update(ClientID(0), RouteNextHopEntry(list00));
-  nhm.update(ClientID(7), RouteNextHopEntry(list07));
+  nhm.update(ClientID(10), RouteNextHopEntry(list00,
+        AdminDistance::DIRECTLY_CONNECTED));
   EXPECT_TRUE(nhm.getBestEntry().second->getNextHopSet() == list00);
 
-  nhm.delEntryForClient(ClientID(0));
-  EXPECT_TRUE(nhm.getBestEntry().second->getNextHopSet() == list07);
-
   nhm.delEntryForClient(ClientID(10));
-  EXPECT_TRUE(nhm.getBestEntry().second->getNextHopSet() == list07);
+  EXPECT_TRUE(nhm.getBestEntry().second->getNextHopSet() == list01);
 
-  nhm.delEntryForClient(ClientID(7));
+  nhm.delEntryForClient(ClientID(30));
+  EXPECT_TRUE(nhm.getBestEntry().second->getNextHopSet() == list01);
+
+  nhm.delEntryForClient(ClientID(1));
   EXPECT_TRUE(nhm.getBestEntry().second->getNextHopSet() == list20);
 
   nhm.delEntryForClient(ClientID(20));
-  EXPECT_TRUE(nhm.getBestEntry().second->getNextHopSet() == list30);
-
-  nhm.delEntryForClient(ClientID(30));
   EXPECT_THROW(nhm.getBestEntry().second->getNextHopSet(), FbossError);
 }
 
@@ -1460,11 +1561,13 @@ void expectFwdInfo(std::shared_ptr<RouteTableMap>& tables, RouterID rid,
 std::shared_ptr<RouteTableMap>&
 addNextHopsForClient(std::shared_ptr<RouteTableMap>& tables, RouterID rid,
                      RouteV4::Prefix prefix, int16_t clientId,
-                     std::string ipPrefix) {
+                     std::string ipPrefix,
+                     AdminDistance adminDistance= \
+                      AdminDistance::MAX_ADMIN_DISTANCE) {
       RouteUpdater u(tables);
       u.addRoute(rid, prefix.network, prefix.mask,
                  ClientID(clientId),
-                 RouteNextHopEntry(newNextHops(3, ipPrefix)));
+                 RouteNextHopEntry(newNextHops(3, ipPrefix), adminDistance));
       tables = u.updateDone();
       tables->publish();
       return tables;
@@ -1481,7 +1584,7 @@ deleteNextHopsForClient(std::shared_ptr<RouteTableMap>& tables, RouterID rid,
 }
 
 // Add and remove per-client NextHop lists to the same route, and make sure
-// the highest-priority client is the one that determines the forwarding info
+// the lowest admin distance is the one that determines the forwarding info
 TEST(Route, fwdInfoRanking) {
   auto stateV1 = make_shared<SwitchState>();
   stateV1->publish();
@@ -1501,7 +1604,8 @@ TEST(Route, fwdInfoRanking) {
               StdClientIds2ClientID(StdClientIds::INTERFACE_ROUTE),
               RouteNextHopEntry(
                   RouteNextHop::createInterfaceNextHop(
-                      IPAddress("10.10.0.1"), InterfaceID(9))));
+                      IPAddress("10.10.0.1"), InterfaceID(9)),
+                  AdminDistance::DIRECTLY_CONNECTED));
   u1.addRoute(rid, network, mask,
               ClientID(30), RouteNextHopEntry(newNextHops(3, "10.10.30.")));
   tables = u1.updateDone();
@@ -1513,7 +1617,8 @@ TEST(Route, fwdInfoRanking) {
   expectFwdInfo(tables, rid, prefix, "10.10.30.");
 
   // Add client 20
-  tables = addNextHopsForClient(tables, rid, prefix, 20, "10.10.20.");
+  tables = addNextHopsForClient(tables, rid, prefix, 20, "10.10.20.",
+      AdminDistance::EBGP);
 
   // Expect fwdInfo based on client 20
   assertClientsPresent(tables, rid, prefix, {20, 30});
@@ -1529,7 +1634,8 @@ TEST(Route, fwdInfoRanking) {
   expectFwdInfo(tables, rid, prefix, "10.10.20.");
 
   // Add client 10
-  tables = addNextHopsForClient(tables, rid, prefix, 10, "10.10.10.");
+  tables = addNextHopsForClient(tables, rid, prefix, 10, "10.10.10.",
+      AdminDistance::STATIC_ROUTE);
 
   // Expect fwdInfo based on client 10
   assertClientsPresent(tables, rid, prefix, {10, 20, 30, 40});

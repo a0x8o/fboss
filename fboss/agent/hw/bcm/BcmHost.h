@@ -77,6 +77,9 @@ class BcmHost {
   folly::dynamic toFollyDynamic() const;
   // TODO(samank): use getPort() instead of port_ member variable
   opennsl_port_t getPort() const { return port_; }
+  bool isPortOrTrunkSet() const {
+    return trunk_ != BcmTrunk::INVALID || port_ != 0;
+  }
  private:
   // no copy or assignment
   BcmHost(BcmHost const &) = delete;
@@ -230,7 +233,9 @@ class BcmHostTable {
   /*
    * Update port to egressIds mapping
    */
-  void updatePortEgressMapping(opennsl_if_t egressId, opennsl_port_t oldPort,
+  void updatePortToEgressMapping(
+      opennsl_if_t egressId,
+      opennsl_port_t oldPort,
       opennsl_port_t newPort);
   /*
    * Get port -> egressIds map
@@ -258,10 +263,30 @@ class BcmHostTable {
     ecmpHosts_.clear();
     hosts_.clear();
   }
-  opennsl_port_t egressIdPort(opennsl_if_t egressId) const;
+
+  bool isResolved(const opennsl_if_t egressId) const {
+    return resolvedEgresses_.find(egressId) != resolvedEgresses_.cend();
+  }
+  void resolved(const opennsl_if_t egressId) {
+    resolvedEgresses_.insert(egressId);
+  }
+  void unresolved(const opennsl_if_t egressId) {
+    resolvedEgresses_.erase(egressId);
+  }
 
   uint32_t numEcmpEgress() const {
     return numEcmpEgressProgrammed_;
+  }
+
+  void egressResolutionChangedHwLocked(
+      const Paths& affectedPaths,
+      BcmEcmpEgress::Action action);
+  void egressResolutionChangedHwLocked(
+      opennsl_if_t affectedPath,
+      BcmEcmpEgress::Action action) {
+    BcmEcmpEgress::Paths affectedPaths;
+    affectedPaths.insert(affectedPath);
+    egressResolutionChangedHwLocked(affectedPaths, action);
   }
 
  private:
@@ -270,7 +295,6 @@ class BcmHostTable {
    */
   void linkStateChangedMaybeLocked(opennsl_port_t port, bool up,
       bool locked);
-  void egressResolutionChangedHwLocked(const Paths& affectedPaths, bool up);
   static void egressResolutionChangedHwNotLocked(
       int unit,
       const Paths& affectedPaths,
@@ -314,8 +338,7 @@ class BcmHostTable {
    */
   std::shared_ptr<PortAndEgressIdsMap> portAndEgressIdsDontUseDirectly_;
   mutable folly::SpinLock portAndEgressIdsLock_;
-  // egressId -> port
-  boost::container::flat_map<opennsl_if_t, opennsl_port_t> egressId2Port_;
+  boost::container::flat_set<opennsl_if_t> resolvedEgresses_;
   uint32_t numEcmpEgressProgrammed_{0};
 
   boost::container::flat_map<

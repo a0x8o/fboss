@@ -10,7 +10,10 @@
 #include "fboss/agent/SwSwitch.h"
 
 #include <thrift/lib/cpp2/protocol/Serializer.h>
+#include <thrift/lib/cpp2/async/HeaderClientChannel.h>
+#include <thrift/lib/cpp2/async/RequestChannel.h>
 
+#include "common/stats/ServiceData.h"
 #include "fboss/agent/ArpHandler.h"
 #include "fboss/agent/Constants.h"
 #include "fboss/agent/IPv4Handler.h"
@@ -28,11 +31,14 @@
 #include "fboss/agent/SwitchStats.h"
 #include "fboss/agent/Utils.h"
 #include "fboss/agent/capture/PktCaptureManager.h"
+#include "fboss/pcap_distribution_service/if/gen-cpp2/PcapPushSubscriber.h"
+#include "fboss/pcap_distribution_service/if/gen-cpp2/pcap_pubsub_constants.h"
 #include "fboss/agent/packet/EthHdr.h"
 #include "fboss/agent/packet/IPv4Hdr.h"
 #include "fboss/agent/packet/IPv6Hdr.h"
 #include "fboss/agent/packet/PktUtil.h"
 #include "fboss/agent/state/AggregatePort.h"
+#include "fboss/agent/state/RouteUpdater.h"
 #include "fboss/agent/state/StateDelta.h"
 #include "fboss/agent/state/StateUpdateHelpers.h"
 #include "fboss/agent/state/SwitchState.h"
@@ -40,21 +46,26 @@
 #include "fboss/agent/LldpManager.h"
 #include "fboss/agent/PortRemediator.h"
 #include "fboss/agent/gen-cpp2/switch_config_types_custom_protocol.h"
-#include "common/stats/ServiceData.h"
+#include "fboss/agent/ThriftHandler.h"
 #include <folly/FileUtil.h>
 #include <folly/MacAddress.h>
 #include <folly/MapUtil.h>
 #include <folly/String.h>
+#include <folly/Logging.h>
+#include <folly/SocketAddress.h>
 #include <folly/Demangle.h>
 #include <chrono>
+#include <exception>
 #include <condition_variable>
 #include <glog/logging.h>
+#include <tuple>
 
 using folly::EventBase;
 using folly::io::Cursor;
 using folly::io::RWPrivateCursor;
 using std::make_unique;
 using folly::StringPiece;
+using folly::SocketAddress;
 using std::lock_guard;
 using std::map;
 using std::mutex;
@@ -62,11 +73,21 @@ using std::set;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::exception;
 
 using namespace std::chrono;
+using namespace apache::thrift;
+using namespace apache::thrift::transport;
+using namespace apache::thrift::protocol;
+using namespace apache::thrift::async;
+
 
 DEFINE_string(config, "", "The path to the local JSON configuration file");
 DEFINE_int32(thread_heartbeat_ms, 5000, "Thread hearbeat interval (ms)");
+DEFINE_int32(
+    distribution_timeout_ms,
+    1000,
+    "Timeout for sending to distribution_service (ms)");
 
 namespace {
 
@@ -145,10 +166,24 @@ inline void updatePortStatusCounters(const facebook::fboss::StateDelta& delta) {
 
 namespace facebook { namespace fboss {
 
+class ChannelCloser : public CloseCallback {
+ public:
+  explicit ChannelCloser(SwSwitch* s) : s_(s) {}
+
+  void channelClosed() override {
+    CHECK(s_);
+    s_->destroyPushClient();
+  }
+
+ private:
+  SwSwitch* s_ = nullptr;
+};
+
 SwSwitch::SwSwitch(std::unique_ptr<Platform> platform)
   : hw_(platform->getHwSwitch()),
     platform_(std::move(platform)),
     portRemediator_(new PortRemediator(this)),
+    closer_(new ChannelCloser(this)),
     arp_(new ArpHandler(this)),
     ipv4_(new IPv4Handler(this)),
     ipv6_(new IPv6Handler(this)),
@@ -159,10 +194,38 @@ SwSwitch::SwSwitch(std::unique_ptr<Platform> platform)
   // don't exist already.
   utilCreateDir(platform_->getVolatileStateDir());
   utilCreateDir(platform_->getPersistentStateDir());
+
+  // doesnt need to be guarded, only accessed by 1 event base
+  pcapPusher_ = nullptr;
+
   // Set the event base for platform to use
   // This means the platform is now able to do async events on the
   // background thread
   platform_->setEventBase(&backgroundEventBase_);
+}
+
+
+void SwSwitch::destroyPushClient(){
+  distributionServiceReady_.store(false);
+}
+
+void SwSwitch::constructPushClient(uint16_t port) {
+  auto creation = [&, port]() {
+    SocketAddress addr("::1", port);
+    auto socket = TAsyncSocket::newSocket(&pcapDistributionEvb_, addr, 2000);
+    auto chan = HeaderClientChannel::newChannel(socket);
+    chan->setTimeout(FLAGS_distribution_timeout_ms);
+    chan->setCloseCallback(closer_.get());
+    pcapPusher_ =
+        std::make_unique<PcapPushSubscriberAsyncClient>(std::move(chan));
+    distributionServiceReady_.store(true);
+  };
+  pcapDistributionEvb_.runInEventBaseThread(creation);
+}
+
+void SwSwitch::killDistributionProcess(){
+  pcapPusher_->future_kill();
+  LOG(INFO) << "KILLING DISTRIBUTION PROCESS FROM AGENT";
 }
 
 SwSwitch::~SwSwitch() {
@@ -311,6 +374,44 @@ void SwSwitch::clearWarmBootCache() {
   hw_->clearWarmBootCache();
 }
 
+void SwSwitch::publishRxPacket(RxPacket* pkt, uint16_t ethertype){
+  RxPacketData pubPkt;
+  pubPkt.srcPort = pkt->getSrcPort();
+  pubPkt.srcVlan = pkt->getSrcVlan();
+
+  for (const auto& r : pkt->getReasons()) {
+    RxReason reason;
+    reason.bytes = r.bytes;
+    reason.description = r.description;
+    pubPkt.reasons.push_back(reason);
+  }
+
+  folly::IOBuf buf_copy;
+  pkt->buf()->cloneInto(buf_copy);
+  pubPkt.packetData = buf_copy.moveToFbString();
+  auto onError = [&](std::runtime_error& /* unused */) {
+    stats()->pcapDistFailure();
+    FB_LOG_EVERY_MS(ERROR, 1000)
+        << "Unable to push packet to distribution service\n";
+  };
+  pcapPusher_->future_receiveRxPacket(pubPkt, ethertype)
+      .onError(std::move(onError));
+}
+
+void SwSwitch::publishTxPacket(TxPacket* pkt, uint16_t ethertype){
+  TxPacketData pubPkt;
+  folly::IOBuf copy_buf;
+  pkt->buf()->cloneInto(copy_buf);
+  pubPkt.packetData = copy_buf.moveToFbString();
+  auto onError = [&](std::runtime_error& /* unused */) {
+    stats()->pcapDistFailure();
+    FB_LOG_EVERY_MS(ERROR, 1000)
+        << "Unable to push packet to distribution service\n";
+  };
+  pcapPusher_->future_receiveTxPacket(pubPkt, ethertype)
+      .onError(std::move(onError));
+}
+
 void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
   flags_ = flags;
   auto hwInitRet = hw_->init(this);
@@ -324,9 +425,7 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
     hwInitRet.bootTime << " seconds; applying initial config";
 
   for (const auto& port : (*initialState->getPorts())) {
-    auto maxSpeed = getMaxPortSpeed(port->getID());
     fbData->setCounter(getPortUpName(port), 0);
-    port->setMaxSpeed(maxSpeed);
   }
 
   // Store the initial state
@@ -341,6 +440,32 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
     notifyStateObservers(
         StateDelta(std::make_shared<SwitchState>(), initialStateDesired));
   });
+
+  // In ALPM mode we need to make sure that the first route added is
+  // the default route and that the route table always contains a default
+  // route
+  RouteUpdater updater(initialStateDesired->getRouteTables());
+  updater.addRoute(RouterID(0), folly::IPAddressV4("0.0.0.0"), 0,
+      StdClientIds2ClientID(StdClientIds::STATIC_ROUTE),
+      RouteNextHopEntry(RouteForwardAction::DROP,
+        AdminDistance::MAX_ADMIN_DISTANCE));
+  updater.addRoute(RouterID(0), folly::IPAddressV6("::"), 0,
+      StdClientIds2ClientID(StdClientIds::STATIC_ROUTE),
+      RouteNextHopEntry(RouteForwardAction::DROP,
+        AdminDistance::MAX_ADMIN_DISTANCE));
+  auto newRt = updater.updateDone();
+  if (newRt) {
+    // If null default routes from above got added,
+    // send a state update to h/w
+    auto newState = initialStateDesired->clone();
+    newState->resetRouteTables(std::move(newRt));
+    newState->publish();
+
+    updateEventBase_.runInEventBaseThread(
+        [newState, initialStateDesired, this]() {
+          applyUpdate(initialStateDesired, newState);
+        });
+  }
 
   if (flags & SwitchFlags::ENABLE_TUN) {
     if (tunMgr) {
@@ -401,6 +526,8 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
   portRemediator_->init();
 
   setSwitchRunState(SwitchRunState::INITIALIZED);
+
+  constructPushClient(pcap_pubsub_constants::PCAP_PUBSUB_PORT());
 }
 
 void SwSwitch::initialConfigApplied(const steady_clock::time_point& startTime) {
@@ -675,7 +802,7 @@ void SwSwitch::handlePendingUpdates() {
       // as a state update at the beginning
       queueStateUpdateForGettingHwInSync(
           kOutOfSyncStateUpdate,
-          [newDesiredState](const std::shared_ptr<SwitchState>& oldState) {
+          [newDesiredState](const std::shared_ptr<SwitchState>& /*oldState*/) {
             return newDesiredState;
           });
       if (!isExiting() && !oldOutOfSync) {
@@ -840,14 +967,6 @@ map<int32_t, PortStatus> SwSwitch::getPortStatus() {
   return statusMap;
 }
 
-cfg::PortSpeed SwSwitch::getPortSpeed(PortID port) const {
-  return hw_->getPortSpeed(port);
-}
-
-cfg::PortSpeed SwSwitch::getMaxPortSpeed(PortID port) const {
-  return hw_->getMaxPortSpeed(port);
-}
-
 PortStatus SwSwitch::getPortStatus(PortID portID) {
   std::shared_ptr<Port> port = getState()->getPort(portID);
   return fillInPortStatus(*port, this);
@@ -918,6 +1037,10 @@ void SwSwitch::handlePacket(std::unique_ptr<RxPacket> pkt) {
     ethertype = c.readBE<uint16_t>();
   }
 
+  if (distributionServiceReady_.load()) {
+    publishRxPacket(pkt.get(), ethertype);
+  }
+
   VLOG(5) << "trapped packet: src_port=" << pkt->getSrcPort() << " srcAggPort="
           << (pkt->isFromAggregatePort()
                   ? folly::to<string>(pkt->getSrcAggregatePort())
@@ -985,12 +1108,15 @@ void SwSwitch::linkStateChanged(PortID portId, bool up) {
 }
 
 void SwSwitch::startThreads() {
-  backgroundThread_.reset(new std::thread([=] {
-      this->threadLoop("fbossBgThread", &backgroundEventBase_); }));
-  updateThread_.reset(new std::thread([=] {
-      this->threadLoop("fbossUpdateThread", &updateEventBase_); }));
-  fbossPktTxThread_.reset(new std::thread([=] {
-      this->threadLoop("fbossPktTxThread", &fbossPktTxEventBase_); }));
+  backgroundThread_.reset(new std::thread(
+      [=] { this->threadLoop("fbossBgThread", &backgroundEventBase_); }));
+  updateThread_.reset(new std::thread(
+      [=] { this->threadLoop("fbossUpdateThread", &updateEventBase_); }));
+  fbossPktTxThread_.reset(new std::thread(
+      [=] { this->threadLoop("fbossPktTxThread", &fbossPktTxEventBase_); }));
+  pcapDistributionThread_.reset(new std::thread([=] {
+    this->threadLoop("pcapDistributionThread", &pcapDistributionEvb_);
+  }));
 }
 
 void SwSwitch::stopThreads() {
@@ -1012,6 +1138,10 @@ void SwSwitch::stopThreads() {
     fbossPktTxEventBase_.runInEventBaseThread(
         [this] { fbossPktTxEventBase_.terminateLoopSoon(); });
   }
+  if (pcapDistributionThread_) {
+    pcapDistributionEvb_.runInEventBaseThread(
+        [this] { pcapDistributionEvb_.terminateLoopSoon(); });
+  }
   if (backgroundThread_) {
     backgroundThread_->join();
   }
@@ -1020,6 +1150,9 @@ void SwSwitch::stopThreads() {
   }
   if (fbossPktTxThread_) {
     fbossPktTxThread_->join();
+  }
+  if (pcapDistributionThread_) {
+    pcapDistributionThread_->join();
   }
 }
 
@@ -1048,6 +1181,22 @@ std::unique_ptr<TxPacket> SwSwitch::allocateL3TxPacket(uint32_t l3Len) {
 void SwSwitch::sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
                                    PortID portID) noexcept {
   pcapMgr_->packetSent(pkt.get());
+
+  Cursor c(pkt->buf());
+  // unused to parse the ethertype correctly
+  PktUtil::readMac(&c);
+  PktUtil::readMac(&c);
+  auto ethertype = c.readBE<uint16_t>();
+  if (ethertype == 0x8100) {
+    // 802.1Q
+    c += 2; // Advance over the VLAN tag.  We ignore it for now
+    ethertype = c.readBE<uint16_t>();
+  }
+
+  if (distributionServiceReady_.load()) {
+    publishTxPacket(pkt.get(), ethertype);
+  }
+
   if (!hw_->sendPacketOutOfPort(std::move(pkt), portID)) {
     // Just log an error for now.  There's not much the caller can do about
     // send failures--even on successful return from sendPacket*() the

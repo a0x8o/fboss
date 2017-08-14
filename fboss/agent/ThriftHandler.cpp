@@ -68,7 +68,6 @@ using std::shared_ptr;
 using std::string;
 using std::vector;
 using std::unique_ptr;
-using namespace apache::thrift::transport;
 using apache::thrift::server::TConnectionContext;
 
 using facebook::network::toBinaryAddress;
@@ -466,10 +465,11 @@ void ThriftHandler::setPortState(int32_t portNum, bool enable) {
   }
 
   cfg::PortState newPortState =
-    enable? cfg::PortState::UP: cfg::PortState::DOWN;
+      enable ? cfg::PortState::UP : cfg::PortState::POWER_DOWN;
 
   if (port->getState() == newPortState) {
-    VLOG(2) << "setPortState: port already in state " << (enable? "UP": "DOWN");
+    VLOG(2) << "setPortState: port already in state "
+            << (enable ? "UP" : "POWER_DOWN");
     return;
   }
 
@@ -776,6 +776,15 @@ void ThriftHandler::getRouteUpdateLoggingTrackedPrefixes(
   }
 }
 
+void ThriftHandler::beginPacketDump(int32_t port) {
+  // Client construction is serialized via SwSwitch event base
+  sw_->constructPushClient(port);
+}
+
+void ThriftHandler::killDistributionProcess(){
+  sw_->killDistributionProcess();
+}
+
 void ThriftHandler::sendPkt(int32_t port, int32_t vlan,
                             unique_ptr<fbstring> data) {
   ensureConfigured("sendPkt");
@@ -864,14 +873,16 @@ void ThriftHandler::getVlanBinaryAddressesByName(BinaryAddresses& addrs,
   getVlanAddresses(getVlan(*vlan), addrs, toBinaryAddress);
 }
 
-void ThriftHandler::getSfpDomInfo(map<int32_t, SfpDom>& domInfos,
-                                  unique_ptr<vector<int32_t>> ports) {
+void ThriftHandler::getSfpDomInfo(
+    map<int32_t, SfpDom>& /*domInfos*/,
+    unique_ptr<vector<int32_t>> /*ports*/) {
   throw FbossError(folly::to<std::string>("This call is no longer supported, ",
       "use getTransceiverInfo instead"));
 }
 
-void ThriftHandler::getTransceiverInfo(map<int32_t, TransceiverInfo>& info,
-                                  unique_ptr<vector<int32_t>> ids) {
+void ThriftHandler::getTransceiverInfo(
+    map<int32_t, TransceiverInfo>& /*info*/,
+    unique_ptr<vector<int32_t>> /*ids*/) {
   throw FbossError(folly::to<std::string>("This call is no longer supported, ",
       "please call the QsfpService instead"));
 }

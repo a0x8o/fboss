@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include "common/stats/MonotonicCounter.h"
 #include "fboss/agent/HwSwitch.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
@@ -30,7 +31,6 @@ extern "C" {
 
 namespace facebook { namespace fboss {
 
-struct AclEntryID;
 class AclEntry;
 class AggregatePort;
 class ArpEntry;
@@ -299,8 +299,6 @@ class BcmSwitch : public BcmSwitchIf {
   bool getAndClearNeighborHit(RouterID vrf,
                               folly::IPAddress& ip) override;
 
-  cfg::PortSpeed getPortSpeed(PortID port) const override;
-  cfg::PortSpeed getMaxPortSpeed(PortID port) const override;
   bool getPortFECConfig(PortID port) const override;
 
   bool isValidStateUpdate(const StateDelta& delta) const override;
@@ -315,6 +313,8 @@ class BcmSwitch : public BcmSwitchIf {
   bool isFineGrainedBufferStatLoggingEnabled() const {
     return fineGrainedBufferStatsEnabled_;
   }
+
+  opennsl_gport_t getCpuGPort() const;
 
  private:
   enum Flags : uint32_t {
@@ -505,9 +505,9 @@ class BcmSwitch : public BcmSwitchIf {
   void configureAdditionalEcmpHashSets();
 
   /*
-   * Disable linkscan thread. This should only be done on shutdown.
+   * Stop linkscan thread. This should only be done on shutdown.
    */
-  void disableLinkscan();
+  void stopLinkscanThread();
 
 
   /**
@@ -590,6 +590,18 @@ class BcmSwitch : public BcmSwitchIf {
    * Lock to synchronize access to all BCM* data structures
    */
   std::mutex lock_;
-};
 
+  /*
+   *  Counters tracking cpu or host bound packets
+   */
+  struct CpuPortCounter {
+    opennsl_cos_queue_t queueNum;
+    bool isDropCounter;
+    stats::MonotonicCounter counter;
+  };
+  std::vector<CpuPortCounter> cpuPortCounters_;
+
+  void updateCpuPortCounters();
+  void setupCpuPortCounters();
+};
 }} // facebook::fboss

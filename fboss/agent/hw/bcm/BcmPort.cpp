@@ -37,6 +37,8 @@ using std::chrono::system_clock;
 using std::string;
 using std::shared_ptr;
 
+using facebook::stats::MonotonicCounter;
+
 namespace {
 
 const string kInBytes = "in_bytes";
@@ -97,14 +99,10 @@ static const std::map<cfg::PortSpeed,
       {TransmitterTechnology::UNKNOWN, OPENNSL_PORT_IF_CAUI}
     }},
     {cfg::PortSpeed::FIFTYG, {
-      // TODO(aeckert): CR2 does not exist in opennsl 6.3.6.
-      // Remove this ifdef once fully on 6.4.6
-#if defined(OPENNSL_PORT_IF_CR2)
       {TransmitterTechnology::COPPER, OPENNSL_PORT_IF_CR2},
+      {TransmitterTechnology::OPTICAL, OPENNSL_PORT_IF_CAUI},
       // What to default to
-      {TransmitterTechnology::UNKNOWN, OPENNSL_PORT_IF_CR2},
-#endif
-      {TransmitterTechnology::OPTICAL, OPENNSL_PORT_IF_CAUI}
+      {TransmitterTechnology::UNKNOWN, OPENNSL_PORT_IF_CR2}
     }},
     {cfg::PortSpeed::FORTYG, {
       {TransmitterTechnology::COPPER, OPENNSL_PORT_IF_CR4},
@@ -147,7 +145,7 @@ void BcmPort::updateName(const std::string& newName) {
   reinitPortStats();
 }
 
-BcmPort::MonotonicCounter* BcmPort::getPortCounterIf(const string& statKey) {
+MonotonicCounter* BcmPort::getPortCounterIf(const string& statKey) {
   auto pcitr = portCounters_.find(statKey);
   return pcitr != portCounters_.end() ? &pcitr->second : nullptr;
 }
@@ -155,9 +153,11 @@ BcmPort::MonotonicCounter* BcmPort::getPortCounterIf(const string& statKey) {
 void BcmPort::reinitPortStat(const string& statKey) {
   auto stat = getPortCounterIf(statKey);
   if (!stat) {
-    portCounters_.emplace(statKey, MonotonicCounter({statName(statKey)}));
+    portCounters_.emplace(
+        statKey,
+        MonotonicCounter({statName(statKey), stats::SUM, stats::RATE}));
   } else {
-    MonotonicCounter newStat{statName(statKey)};
+    MonotonicCounter newStat{statName(statKey), stats::SUM, stats::RATE};
     stat->swap(newStat);
   }
 }
@@ -216,8 +216,6 @@ BcmPort::BcmPort(BcmSwitch* hw, opennsl_port_t port,
   // Initialize our stats data structures
   reinitPortStats();
 
-  setConfiguredMaxSpeed();
-
   VLOG(2) << "created BCM port:" << port_ << ", gport:" << gport_
           << ", FBOSS PortID:" << platformPort_->getPortID();
 }
@@ -245,11 +243,7 @@ void BcmPort::init(bool warmBoot) {
   getPlatformPort()->linkSpeedChanged(getSpeed());
   getPlatformPort()->linkStatusChanged(up, isEnabled());
 
-  // Linkscan should be enabled if the port is enabled already
-  auto linkscan = isEnabled() ? OPENNSL_LINKSCAN_MODE_SW :
-    OPENNSL_LINKSCAN_MODE_NONE;
-  auto rv = opennsl_linkscan_mode_set(unit_, port_, linkscan);
-  bcmCheckError(rv, "failed to set initial linkscan mode on port ", port_);
+  enableLinkscan();
 }
 
 bool BcmPort::supportsSpeed(cfg::PortSpeed speed) {
@@ -261,7 +255,7 @@ bool BcmPort::supportsSpeed(cfg::PortSpeed speed) {
   // not work correctly if we performed a warm boot and the config
   // file changed port speeds. However, this is not supported by
   // broadcom for warm boot so this approach should be alright.
-  return speed <= configuredMaxSpeed_;
+  return speed <= getMaxSpeed();
 }
 
 opennsl_pbmp_t BcmPort::getPbmp() {
@@ -288,12 +282,13 @@ void BcmPort::disable(const std::shared_ptr<Port>& swPort) {
   bcmCheckError(rv, "Unexpected error disabling counter DMA on port ",
                 swPort->getID());
 
-  // Disable linkscan
-  rv = opennsl_linkscan_mode_set(unit_, port_, OPENNSL_LINKSCAN_MODE_NONE);
-  bcmCheckError(rv, "Failed to disable linkscan on port ", swPort->getID());
-
   rv = opennsl_port_enable_set(unit_, port_, false);
   bcmCheckError(rv, "failed to disable port ", swPort->getID());
+}
+
+void BcmPort::disableLinkscan() {
+  int rv = opennsl_linkscan_mode_set(unit_, port_, OPENNSL_LINKSCAN_MODE_NONE);
+  bcmCheckError(rv, "Failed to disable linkscan on port ", port_);
 }
 
 bool BcmPort::isEnabled() {
@@ -301,6 +296,16 @@ bool BcmPort::isEnabled() {
   auto rv = opennsl_port_enable_get(unit_, port_, &enabled);
   bcmCheckError(rv, "Failed to determine if port is already disabled");
   return static_cast<bool>(enabled);
+}
+
+bool BcmPort::isUp() {
+  if (!isEnabled()) {
+    return false;
+  }
+  int linkStatus;
+  auto rv = opennsl_port_link_status_get(hw_->getUnit(), port_, &linkStatus);
+  bcmCheckError(rv, "could not find if the port ", port_, " is up or down...");
+  return linkStatus == OPENNSL_PORT_LINK_STATUS_UP;
 }
 
 void BcmPort::enable(const std::shared_ptr<Port>& swPort) {
@@ -342,14 +347,14 @@ void BcmPort::enable(const std::shared_ptr<Port>& swPort) {
                   swPort->getID());
   }
 
-  // Enable linkscan
-  rv = opennsl_linkscan_mode_set(unit_, port_, OPENNSL_LINKSCAN_MODE_SW);
-  bcmCheckError(rv, "Failed to enable linkscan on port ", swPort->getID());
-
   rv = opennsl_port_enable_set(unit_, port_, true);
   bcmCheckError(rv, "failed to enable port ", swPort->getID());
 }
 
+void BcmPort::enableLinkscan() {
+  int rv = opennsl_linkscan_mode_set(unit_, port_, OPENNSL_LINKSCAN_MODE_SW);
+  bcmCheckError(rv, "Failed to enable linkscan on port ", port_);
+}
 
 void BcmPort::program(const shared_ptr<Port>& port) {
   setIngressVlan(port);
@@ -393,7 +398,9 @@ TransmitterTechnology BcmPort::getTransmitterTechnology(
   if (name.find("fab") == 0) {
     transmitterTechnology_ = TransmitterTechnology::COPPER;
   } else {
-    transmitterTechnology_ = getPlatformPort()->getTransmitterTech().get();
+    folly::EventBase evb;
+    transmitterTechnology_ =
+        getPlatformPort()->getTransmitterTech(&evb).getVia(&evb);
   }
   return transmitterTechnology_;
 }
@@ -413,7 +420,7 @@ opennsl_port_if_t BcmPort::getDesiredInterfaceMode(cfg::PortSpeed speed,
   }
 }
 
-cfg::PortSpeed BcmPort::getSpeed() {
+cfg::PortSpeed BcmPort::getSpeed() const {
   int curSpeed{0};
   auto rv = opennsl_port_speed_get(unit_, port_, &curSpeed);
   bcmCheckError(
@@ -443,7 +450,7 @@ void BcmPort::setSpeed(const shared_ptr<Port>& swPort) {
 
   // If the port is down or disabled its safe to update mode and speed to
   // desired values
-  bool portDown = getState() != cfg::PortState::UP;
+  bool portUp = isUp();
 
   // Update to correct mode and speed settings if the port is down/disabled
   // or if the speed changed. Ideally we would like to always update to the
@@ -459,7 +466,7 @@ void BcmPort::setSpeed(const shared_ptr<Port>& swPort) {
   // separately. Once that is resolved, we can do a audit to see that if all
   // ports are in desired mode settings, we can make mode changes a first
   // class citizen as well.
-  if (portDown || curSpeed != desiredSpeed) {
+  if (!portUp || curSpeed != desiredSpeed) {
     opennsl_port_if_t desiredMode = getDesiredInterfaceMode(desiredPortSpeed,
                                                         swPort->getID(),
                                                         swPort->getName());
@@ -479,7 +486,7 @@ void BcmPort::setSpeed(const shared_ptr<Port>& swPort) {
           ret, "failed to set interface type for port ", swPort->getID());
     }
 
-    if (!portDown) {
+    if (portUp) {
       // Changing the port speed causes traffic disruptions, but not doing
       // it would cause inconsistency.  Warn the user.
       LOG(WARNING) << "Changing port speed on up port. This will "
@@ -713,21 +720,6 @@ void BcmPort::updatePktLenHist(
   auto guard = hist->makeLockGuard();
   for (int idx = 0; idx < stats.size(); ++idx) {
     hist->addValueLocked(guard, now.count(), idx, counters[idx]);
-  }
-}
-
-cfg::PortState BcmPort::getState() {
-  if (!isEnabled()) {
-    return cfg::PortState::POWER_DOWN;
-  }
-
-  int linkStatus;
-  auto rv = opennsl_port_link_status_get(hw_->getUnit(), port_, &linkStatus);
-  bcmCheckError(rv, "could not find if the port ", port_, " is up or down...");
-  if (linkStatus == OPENNSL_PORT_LINK_STATUS_UP) {
-    return cfg::PortState::UP;
-  } else {
-    return cfg::PortState::DOWN;
   }
 }
 

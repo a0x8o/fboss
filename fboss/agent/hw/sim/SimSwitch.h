@@ -28,30 +28,25 @@ class SimSwitch : public HwSwitch {
       std::unique_ptr<TxPacket> pkt,
       PortID portID) noexcept override;
 
-  void gracefulExit(folly::dynamic& switchState) override {}
+  void gracefulExit(folly::dynamic& /*switchState*/) override {}
 
   folly::dynamic toFollyDynamic() const override;
 
   void clearWarmBootCache() override {}
   void injectPacket(std::unique_ptr<RxPacket> pkt);
   void initialConfigApplied() override {}
-  cfg::PortSpeed getPortSpeed(PortID port) const override {
-    return cfg::PortSpeed::GIGE;
-  }
-  cfg::PortSpeed getMaxPortSpeed(PortID port) const override {
-    return cfg::PortSpeed::GIGE;
-  }
 
   // TODO
-  void updateStats(SwitchStats *switchStats) override {}
+  void updateStats(SwitchStats* /*switchStats*/) override {}
 
-  int getHighresSamplers(HighresSamplerList* samplers,
-                         const std::string& namespaceString,
-                         const std::set<CounterRequest>& counterSet) override {
+  int getHighresSamplers(
+      HighresSamplerList* /*samplers*/,
+      const std::string& /*namespaceString*/,
+      const std::set<CounterRequest>& /*counterSet*/) override {
     return 0;
   }
 
-  void fetchL2Table(std::vector<L2EntryThrift> *l2Table) override {
+  void fetchL2Table(std::vector<L2EntryThrift>* /*l2Table*/) override {
     return;
   }
 
@@ -65,19 +60,19 @@ class SimSwitch : public HwSwitch {
     // TODO
   }
 
-  bool getAndClearNeighborHit(RouterID vrf,
-                              folly::IPAddress& ip) override {
+  bool getAndClearNeighborHit(RouterID /*vrf*/, folly::IPAddress& /*ip*/)
+      override {
     //TODO
     return false;
   }
 
-  bool isPortUp(PortID port) const override {
+  bool isPortUp(PortID /*port*/) const override {
     // Should be called only from SwSwitch which knows whether
     // the port is enabled or not
     return true;
   }
 
-  bool isValidStateUpdate(const StateDelta& delta) const override {
+  bool isValidStateUpdate(const StateDelta& /*delta*/) const override {
     return true;
   }
 

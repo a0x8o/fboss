@@ -33,6 +33,7 @@ from thrift.transport.TTransport import TTransportException
 from neteng.fboss.ttypes import FbossBaseError
 from fboss.thrift_clients import FbossAgentClient
 
+DEFAULT_CLIENTID = 1
 
 class AliasedGroup(click.Group):
     """
@@ -58,10 +59,11 @@ class AliasedGroup(click.Group):
 
 class CliOptions(object):
     ''' Object for holding CLI state information '''
-    def __init__(self, hostname, port, timeout):
+    def __init__(self, hostname, file, port, timeout):
         self.hostname = hostname
         self.port = port
         self.timeout = timeout
+        self.snapshot_file = file
 
 
 class ArpCli(object):
@@ -316,6 +318,9 @@ class RouteCli(object):
         self.route.add_command(self._ip, name='ip')
         self.route.add_command(self._table, name='table')
         self.route.add_command(self._details, name='details')
+        self.route.add_command(self._add, name='add')
+        self.route.add_command(self._delete, name='delete')
+        self.route.add_command(self._flush, name='flush')
 
     @click.group(cls=AliasedGroup)
     def route():
@@ -334,31 +339,82 @@ class RouteCli(object):
     @click.command()
     @click.option('--client-id', type=int, default=None,
                   help='If pass, show all routes programmed by certain client')
+    @click.option('-4', '--ipv4', is_flag=True, default=False,
+                  help="Show IPv4 routes")
+    @click.option('-6', '--ipv6', is_flag=True, default=False,
+                  help="Show IPv6 routes")
     @click.pass_obj
-    def _table(cli_opts, client_id):
+    def _table(cli_opts, client_id, ipv4, ipv6):
         ''' Show the route table '''
-        route.RouteTableCmd(cli_opts).run(client_id)
+        route.RouteTableCmd(cli_opts).run(client_id, ipv4, ipv6)
 
     @click.command()
+    @click.option('-4', '--ipv4', is_flag=True, default=False,
+                  help="Show IPv4 routes")
+    @click.option('-6', '--ipv6', is_flag=True, default=False,
+                  help="Show IPv6 routes")
     @click.pass_obj
-    def _details(cli_opts):
+    def _details(cli_opts, ipv4, ipv6):
         ''' Show details of the route table '''
-        route.RouteTableDetailsCmd(cli_opts).run()
+        route.RouteTableDetailsCmd(cli_opts).run(ipv4, ipv6)
+
+    @click.command()
+    @click.argument('prefix', nargs=1, required=True)
+    @click.argument('nexthop', nargs=-1, required=True)
+    @click.option('-c', '--client-id', type=int, default=DEFAULT_CLIENTID,
+                  help='The client ID used to manipulate the routes')
+    @click.option('-d', '--admin-distance', type=int, default=None,
+                  help='DIRECTLY_CONNECTED=0, STATIC_ROUTE=1, '
+                        'EBGP=20, IBGP=200, '
+                        'MAX_ADMIN_DISTANCE=255')
+    @click.pass_obj
+    def _add(cli_opts, client_id, admin_distance, prefix, nexthop):
+        '''
+        Add a new route or change an existing route
+
+        PREFIX - The route prefix, i.e. "1.1.1.0/24" or "2001::0/64\n
+        NEXTHOP - The nexthops of the route, i.e "10.1.1.1" or "2002::1"
+        '''
+        route.RouteAddCmd(cli_opts).run(client_id, admin_distance, prefix,
+                                        nexthop)
+
+    @click.command()
+    @click.option('-c', '--client-id', type=int, default=DEFAULT_CLIENTID,
+                  help='The client ID used to manipulate the routes')
+    @click.argument('prefix')
+    @click.pass_obj
+    def _delete(cli_opt, client_id, prefix):
+        '''
+        Delete an existing route
+
+        PREFIX - The route prefix, i.e. "1.1.1.0/24" or "2001::0/64"
+        '''
+        route.RouteDelCmd(cli_opt).run(client_id, prefix)
+
+    @click.command()
+    @click.option('-c', '--client-id', type=int, default=DEFAULT_CLIENTID,
+                  help='The client ID used to manipulate the routes')
+    @click.pass_obj
+    def _flush(cli_opt, client_id):
+        '''Flush all existing non-interface routes'''
+        route.RouteFlushCmd(cli_opt).run(client_id)
 
 
 # -- Main Command Group -- #
 @click.group(cls=AliasedGroup)
 @click.option('--hostname', '-H', default='::1',
         type=str, help='Host to connect to (default = ::1)')
+@click.option('--file', '-F', default=None,
+        type=str, help='Snapshot file to read from')
 @click.option('--port', '-p', default=None,
         type=int, help='Thrift port to connect to')
 @click.option('--timeout', '-t', default=None,
         type=int, help='Thrift client timeout in seconds')
 @click.pass_context
-def main(ctx, hostname, port, timeout):
+def main(ctx, hostname, file, port, timeout):
     ''' Main CLI options, all options are passed to children via the context obj
         "ctx" and can be accessed accordingly '''
-    ctx.obj = CliOptions(hostname, port, timeout)
+    ctx.obj = CliOptions(hostname, file, port, timeout)
 
 
 def add_modules(main_func):

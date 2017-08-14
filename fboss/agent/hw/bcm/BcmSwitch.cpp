@@ -129,19 +129,6 @@ namespace facebook { namespace fboss {
  * Get current port speed from BCM SDK and convert to
  * cfg::PortSpeed
  */
-cfg::PortSpeed BcmSwitch::getPortSpeed(PortID port) const {
-  int portSpeed;
-  auto ret = opennsl_port_speed_get(unit_, port, &portSpeed);
-  bcmCheckError(ret, "failed to get current speed for port", port);
-  return cfg::PortSpeed(portSpeed);
-}
-
-cfg::PortSpeed BcmSwitch::getMaxPortSpeed(PortID port) const {
-  int maxPortSpeed = 0;
-  auto ret = opennsl_port_speed_max(unit_, port, &maxPortSpeed);
-  bcmCheckError(ret, "failed to get max speed for port", port);
-  return cfg::PortSpeed(maxPortSpeed);
-}
 
 bool BcmSwitch::getPortFECConfig(PortID port) const {
   // relies on getBcmPort() to throw an if not found
@@ -159,7 +146,7 @@ BcmSwitch::BcmSwitch(BcmPlatform *platform, HashMode hashMode)
     hostTable_(new BcmHostTable(this)),
     routeTable_(new BcmRouteTable(this)),
     aclTable_(new BcmAclTable(this)),
-    bcmTableStats_(new BcmTableStats(this)),
+    bcmTableStats_(new BcmTableStats(this, isAlpmEnabled())),
     bufferStatsLogger_(createBufferStatsLogger()),
     trunkTable_(new BcmTrunkTable(this)) {
   dumpConfigMap(BcmAPI::getHwConfig(), platform->getHwConfigDumpFile());
@@ -221,7 +208,7 @@ void BcmSwitch::unregisterCallbacks() {
     CHECK(OPENNSL_SUCCESS(rv)) << "failed to unregister BcmSwitch linkscan "
       "callback: " << opennsl_errmsg(rv);
 
-    disableLinkscan();
+    stopLinkscanThread();
     flags_ &= ~LINKSCAN_REGISTERED;
   }
 }
@@ -386,12 +373,17 @@ std::shared_ptr<SwitchState> BcmSwitch::getColdBootSwitchState() const {
   // On cold boot all ports are in Vlan 1
   auto vlan = make_shared<Vlan>(VlanID(1), "InitVlan");
   Vlan::MemberPorts memberPorts;
-  opennsl_port_t idx;
-  OPENNSL_PBMP_ITER(pcfg.port, idx) {
-    PortID portID = portTable_->getPortId(idx);
+  for (const auto& kv : *portTable_) {
+    PortID portID = kv.first;
+    BcmPort* bcmPort = kv.second;
     string name = folly::to<string>("port", portID);
-    bootState->registerPort(portID, name);
-    memberPorts.insert(make_pair(PortID(idx), false));
+
+    auto swPort = make_shared<Port>(portID, name);
+    swPort->setSpeed(bcmPort->getSpeed());
+    swPort->setMaxSpeed(bcmPort->getMaxSpeed());
+    bootState->addPort(swPort);
+
+    memberPorts.insert(make_pair(portID, false));
   }
   vlan->setPorts(memberPorts);
   bootState->addVlan(vlan);
@@ -400,20 +392,12 @@ std::shared_ptr<SwitchState> BcmSwitch::getColdBootSwitchState() const {
 
 std::shared_ptr<SwitchState> BcmSwitch::getWarmBootSwitchState() const {
   auto warmBootState = getColdBootSwitchState();
-  for (auto port:  *warmBootState->getPorts()) {
+  for (auto port :  *warmBootState->getPorts()) {
     int portEnabled;
     auto ret = opennsl_port_enable_get(unit_, port->getID(), &portEnabled);
     bcmCheckError(ret, "Failed to get current state for port", port->getID());
-    port->setState(portEnabled == 1 ? cfg::PortState::UP: cfg::PortState::DOWN);
-
-    auto speed = getPortSpeed(port->getID());
-    auto maxSpeed = getMaxPortSpeed(port->getID());
-    if (speed > maxSpeed) {
-      LOG(FATAL) << "Invalid port speed:" << (int) speed << " for port:"
-        << port->getID()<< " max:" << (int) maxSpeed;
-    }
-    port->setSpeed(speed);
-    port->setMaxSpeed(maxSpeed);
+    port->setState(
+        portEnabled == 1 ? cfg::PortState::UP : cfg::PortState::POWER_DOWN);
   }
   warmBootState->resetIntfs(warmBootCache_->reconstructInterfaceMap());
   warmBootState->resetVlans(warmBootCache_->reconstructVlanMap());
@@ -449,17 +433,18 @@ HwInitResult BcmSwitch::init(Callback* callback) {
   // Add callbacks for unit and parity errors as early as possible to handle
   // critical events
   BcmSwitchEventUtils::initUnit(unit_);
-  auto unitErrorCallback = make_shared<BcmSwitchEventUnitFatalErrorCallback>();
+  auto fatalCob = make_shared<BcmSwitchEventUnitFatalErrorCallback>();
+  auto nonFatalCob = make_shared<BcmSwitchEventUnitNonFatalErrorCallback>();
   BcmSwitchEventUtils::registerSwitchEventCallback(
-      unit_, OPENNSL_SWITCH_EVENT_STABLE_FULL, unitErrorCallback);
+      unit_, OPENNSL_SWITCH_EVENT_STABLE_FULL, fatalCob);
   BcmSwitchEventUtils::registerSwitchEventCallback(
-      unit_, OPENNSL_SWITCH_EVENT_STABLE_ERROR, unitErrorCallback);
+      unit_, OPENNSL_SWITCH_EVENT_STABLE_ERROR, fatalCob);
   BcmSwitchEventUtils::registerSwitchEventCallback(
-      unit_, OPENNSL_SWITCH_EVENT_UNCONTROLLED_SHUTDOWN, unitErrorCallback);
+      unit_, OPENNSL_SWITCH_EVENT_UNCONTROLLED_SHUTDOWN, fatalCob);
   BcmSwitchEventUtils::registerSwitchEventCallback(
-      unit_, OPENNSL_SWITCH_EVENT_WARM_BOOT_DOWNGRADE, unitErrorCallback);
+      unit_, OPENNSL_SWITCH_EVENT_WARM_BOOT_DOWNGRADE, fatalCob);
   BcmSwitchEventUtils::registerSwitchEventCallback(
-      unit_, OPENNSL_SWITCH_EVENT_PARITY_ERROR, unitErrorCallback);
+      unit_, OPENNSL_SWITCH_EVENT_PARITY_ERROR, nonFatalCob);
 
   platform_->onUnitAttach(unit_);
 
@@ -516,9 +501,6 @@ HwInitResult BcmSwitch::init(Callback* callback) {
 
   initFieldProcessor(warmBoot);
 
-  if (isAlpmEnabled()) {
-    routeTable_->addDefaultRoutes(warmBoot);
-  }
   createAclGroup();
   dropDhcpPackets();
   dropIPv6RAs();
@@ -526,6 +508,7 @@ HwInitResult BcmSwitch::init(Callback* callback) {
   configureRxRateLimiting();
   copyIPv6LinkLocalMcastPackets();
   mmuState_ = queryMmuState();
+  setupCpuPortCounters();
 
   if (FLAGS_enable_port_aggregation) {
     setupTrunking();
@@ -770,12 +753,6 @@ void BcmSwitch::pickupLinkStatusChanges(const StateDelta& delta) {
       delta.getPortsDelta(),
       [&](const std::shared_ptr<Port>& oldPort,
           const std::shared_ptr<Port>& newPort) {
-        // Presently, isAdminDisabled means DOWN || POWER_DOWN
-        // we clearly don't care about DOWN->POWER_DOWN or
-        // POWER_DOWN->DOWN changes here. In the future, if it has some
-        // more meaningful semantics, this is still reasonable, as we
-        // don't need to do anything on a disabled port
-        // (though we should be able to remove this code)
         if (oldPort->isAdminDisabled() && newPort->isAdminDisabled()) {
           return;
         }
@@ -1312,6 +1289,8 @@ void BcmSwitch::updateStats(SwitchStats *switchStats) {
   }
   // Update global statistics.
   updateGlobalStats();
+  // Update cpu or host bound packet stats
+  updateCpuPortCounters();
 }
 
 shared_ptr<BcmSwitchEventCallback> BcmSwitch::registerSwitchEventCallback(
@@ -1324,12 +1303,13 @@ void BcmSwitch::unregisterSwitchEventCallback(opennsl_switch_event_t eventID) {
   return BcmSwitchEventUtils::unregisterSwitchEventCallback(unit_, eventID);
 }
 
-void BcmSwitch::updateThreadLocalSwitchStats(SwitchStats *switchStats) {
+void BcmSwitch::updateThreadLocalSwitchStats(SwitchStats* /*switchStats*/) {
   // TODO
 }
 
-void BcmSwitch::updateThreadLocalPortStats(PortID portID,
-    PortStats *portStats) {
+void BcmSwitch::updateThreadLocalPortStats(
+    PortID /*portID*/,
+    PortStats* /*portStats*/) {
   // TODO
 }
 
@@ -1353,14 +1333,16 @@ opennsl_if_t BcmSwitch::getToCPUEgressId() const {
   }
 }
 
-bool BcmSwitch::getAndClearNeighborHit(RouterID vrf,
-                                       folly::IPAddress& ip) {
-  std::lock_guard<std::mutex> g(lock_);
-  auto host = hostTable_->getBcmHostIf(vrf, ip);
-  if (!host) {
-    return false;
-  }
-  return host->getAndClearHitBit();
+bool BcmSwitch::getAndClearNeighborHit(
+    RouterID /*vrf*/,
+    folly::IPAddress& /*ip*/) {
+  // TODO(aeckert): t20059623 This should look in the host table and
+  // check the hit bit, but that currently requires grabbing the main
+  // lock and opens up the possibility of bg thread getting stuck
+  // behind update thread.  For now, stub this out to return true and
+  // work on adding a better way to communicate hit bit + stale entry
+  // garbage collection.
+  return true;
 }
 
 void BcmSwitch::exitFatal() const {

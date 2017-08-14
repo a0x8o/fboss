@@ -190,7 +190,7 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
     return getFields()->routeTables;
   }
 
-  std::shared_ptr<AclEntry> getAcl(AclEntryID id) const;
+  std::shared_ptr<AclEntry> getAcl(const std::string& name) const;
 
   const std::shared_ptr<AclMap>& getAcls() const {
     return getFields()->acls;
@@ -263,6 +263,7 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
    */
 
   void registerPort(PortID id, const std::string& name);
+  void addPort(const std::shared_ptr<Port>& port);
   void resetPorts(std::shared_ptr<PortMap> ports);
   void resetAggregatePorts(std::shared_ptr<AggregatePortMap> aggPorts);
   void resetVlans(std::shared_ptr<VlanMap> vlans);

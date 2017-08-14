@@ -44,11 +44,9 @@ void WedgePort::setBcmPort(BcmPort* port) {
  * handling code open source.
  */
 
-void WedgePort::preDisable(bool temporary) {
-}
+void WedgePort::preDisable(bool /*temporary*/) {}
 
-void WedgePort::postDisable(bool temporary) {
-}
+void WedgePort::postDisable(bool /*temporary*/) {}
 
 void WedgePort::preEnable() {
 }
@@ -66,16 +64,19 @@ folly::Future<TransceiverInfo> WedgePort::getTransceiverInfo(
     evb = platform_->getEventBase();
   }
   auto clientFuture = QsfpClient::createClient(evb);
-  auto transceiverId = static_cast<int32_t>(*getTransceiverID());
+  folly::Optional<TransceiverID> transceiverId = getTransceiverID();
   auto getTransceiverInfo =
       [transceiverId](std::unique_ptr<QsfpServiceAsyncClient> client) {
+        // This will throw if there is no transceiver on this port
+        auto t = static_cast<int32_t>(transceiverId.value());
         auto options = QsfpClient::getRpcOptions();
-        // std::map<int32_t, TransceiverInfo> info_map;
-        return client->future_getTransceiverInfo(options, {transceiverId});
+        return client->future_getTransceiverInfo(options, {t});
       };
   auto fromMap =
       [transceiverId](std::map<int, facebook::fboss::TransceiverInfo> infoMap) {
-        return infoMap[transceiverId];
+        // This will throw if there is no transceiver on this port
+        auto t = static_cast<int32_t>(transceiverId.value());
+        return infoMap[t];
       };
   return clientFuture.via(evb).then(getTransceiverInfo).then(fromMap);
 }
@@ -85,16 +86,13 @@ folly::Future<TransmitterTechnology> WedgePort::getTransmitterTech(
   if (!evb) {
     evb = platform_->getEventBase();
   }
-  auto trans = getTransceiverID();
-  int32_t transID = static_cast<int32_t>(*trans);
-
-  // If null means that there's no transceiver because this is likely
-  // a backplane port. However, we know these are using copper, so
-  // pass that along
-  if (!trans) {
+  // If there's no transceiver this is a backplane port.
+  // However, we know these are using copper, so pass that along
+  if (!supportsTransceiver()) {
     return folly::makeFuture<TransmitterTechnology>(
         TransmitterTechnology::COPPER);
   }
+  int32_t transID = static_cast<int32_t>(getTransceiverID().value());
   auto getTech = [](TransceiverInfo info) {
     if (info.__isset.cable && info.cable.__isset.transmitterTech) {
       return info.cable.transmitterTech;
@@ -106,12 +104,17 @@ folly::Future<TransmitterTechnology> WedgePort::getTransmitterTech(
                << " Exception: " << folly::exceptionStr(e);
     return TransmitterTechnology::UNKNOWN;
   };
-  return getTransceiverInfo(evb).then(getTech).onError(std::move(handleError));
+  return getTransceiverInfo(evb).via(evb).then(getTech).onError(
+      std::move(handleError));
 }
 
-void WedgePort::statusIndication(bool enabled, bool link,
-                                 bool ingress, bool egress,
-                                 bool discards, bool errors) {
+void WedgePort::statusIndication(
+    bool enabled,
+    bool link,
+    bool /*ingress*/,
+    bool /*egress*/,
+    bool /*discards*/,
+    bool /*errors*/) {
   linkStatusChanged(link, enabled);
 }
 
@@ -135,6 +138,13 @@ bool WedgePort::isControllingPort() const {
   return bcmPort_->getPortGroup()->controllingPort() == bcmPort_;
 }
 
+bool WedgePort::isInSingleMode() const {
+  if (!bcmPort_ || !bcmPort_->getPortGroup()) {
+    return false;
+  }
+  return bcmPort_->getPortGroup()->laneMode() == BcmPortGroup::LaneMode::SINGLE;
+}
+
 bool WedgePort::shouldCustomizeTransceiver() const {
   auto trans = getTransceiverID();
   if (!trans) {
@@ -143,12 +153,13 @@ bool WedgePort::shouldCustomizeTransceiver() const {
             << " as it has no transceiver.";
     return false;
   } else if (!isControllingPort()) {
-    auto channel = getChannel();
-    auto chan = channel ? folly::to<std::string>(*channel) : "Unknown";
-
     // We only want to customise on the first channel - this is the actual
     // speed the transceiver should be configured for
     // Other channels may be disabled with other speeds set
+    return false;
+  } else if (!isInSingleMode()) {
+    // If we are not in single mode (all 4 S gbps lanes treated as one
+    // 4xS port) then customizing risks restarting other non-broken lanes
     return false;
   } else if (speed_ == cfg::PortSpeed::DEFAULT) {
     // This should be resolved in BcmPort before calling

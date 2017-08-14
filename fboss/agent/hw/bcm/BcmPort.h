@@ -50,7 +50,9 @@ class BcmPort {
   void init(bool warmBoot);
 
   void enable(const std::shared_ptr<Port>& swPort);
+  void enableLinkscan();
   void disable(const std::shared_ptr<Port>& swPort);
+  void disableLinkscan();
   void program(const std::shared_ptr<Port>& swPort);
 
   /*
@@ -86,8 +88,21 @@ class BcmPort {
   LaneSpeeds supportedLaneSpeeds() const;
 
   bool supportsSpeed(cfg::PortSpeed speed);
+
+  /*
+   * Methods for retreiving the administrative and operational state of the
+   * port according to the SDK.
+   * Both port state methods (isEnabled and isUp) can throw if there is an
+   * error talking to the SDK.
+   */
+  // Return whether we have enabled the port
   bool isEnabled();
-  cfg::PortSpeed getSpeed();
+  // Return whether the link status of the port is actually up.
+  // Note: if it is not enabled, return false
+  bool isUp();
+
+  cfg::PortSpeed getSpeed() const;
+  cfg::PortSpeed getMaxSpeed() const;
 
   /*
    * Setters.
@@ -100,12 +115,6 @@ class BcmPort {
    * Update this port's statistics.
    */
   void updateStats();
-
-  /**
-   * Get the state of the port. If there is an error in finding the port state,
-   * then an BcmError() exception is thrown.
-   */
-  cfg::PortState getState();
 
   /**
    * Take actions on this port (especially if it is up), so that it will not
@@ -128,21 +137,11 @@ class BcmPort {
   void linkStatusChanged(const std::shared_ptr<Port>& port);
 
  private:
-  class MonotonicCounter : public stats::MonotonicCounter {
-   public:
-    // Inherit stats::MonotonicCounter constructors
-    using stats::MonotonicCounter::MonotonicCounter;
-
-    // Export SUM and RATE by default
-    explicit MonotonicCounter(const std::string& name)
-      : stats::MonotonicCounter(name, stats::SUM, stats::RATE) {}
-  };
-
   // no copy or assignment
   BcmPort(BcmPort const &) = delete;
   BcmPort& operator=(BcmPort const &) = delete;
 
-  MonotonicCounter* getPortCounterIf(const std::string& statName);
+  stats::MonotonicCounter* getPortCounterIf(const std::string& statName);
   bool shouldReportStats() const;
   void reinitPortStats();
   void reinitPortStat(const std::string& newName);
@@ -159,7 +158,6 @@ class BcmPort {
   std::string statName(folly::StringPiece name) const;
 
   void disablePause();
-  void setConfiguredMaxSpeed();
   opennsl_port_if_t getDesiredInterfaceMode(cfg::PortSpeed speed,
                                             PortID id,
                                             const std::string& name);
@@ -178,7 +176,6 @@ class BcmPort {
   // The gport_ is logically a const, but needs to be initialized as a parameter
   // to SDK call.
   opennsl_gport_t gport_;  // Broadcom global port number
-  cfg::PortSpeed configuredMaxSpeed_;
   BcmPlatformPort* const platformPort_{nullptr};
   int unit_{-1};
   std::string portName_{""};
@@ -187,7 +184,7 @@ class BcmPort {
   // The port group this port is a part of
   BcmPortGroup* portGroup_{nullptr};
 
-  std::map<std::string, MonotonicCounter> portCounters_;
+  std::map<std::string, stats::MonotonicCounter> portCounters_;
 
   stats::ExportedStatMapImpl::LockableStat outQueueLen_;
   stats::ExportedHistogramMapImpl::LockableHistogram inPktLengths_;

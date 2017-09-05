@@ -32,6 +32,7 @@ enum class SffField {
   CHANNEL_RX_PWR,
   CHANNEL_TX_BIAS,
   CHANNEL_TX_PWR,
+  TX_DISABLE,
   RATE_SELECT_RX,
   RATE_SELECT_TX,
   POWER_CONTROL,
@@ -45,6 +46,9 @@ enum class SffField {
   LENGTH_OM2,
   LENGTH_OM1,
   LENGTH_COPPER,
+  LENGTH_COPPER_DECIMETERS,
+  DAC_GAUGE,
+
   DEVICE_TECHNOLOGY, // Device or cable technology of free side device
   OPTIONS, // Variety of options, including rate select support
   VENDOR_NAME, // QSFP Vendor Name (ASCII)

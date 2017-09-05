@@ -8,6 +8,9 @@
  *
  */
 #pragma once
+
+#include <boost/container/flat_map.hpp>
+
 #include <folly/Optional.h>
 #include <folly/futures/Future.h>
 
@@ -57,16 +60,16 @@ class WedgePort : public BcmPlatformPort {
   virtual folly::Optional<ChannelID> getChannel() const {
     return channel_;
   }
+
+  std::vector<int32_t> getChannels() const;
+
   folly::Future<TransmitterTechnology> getTransmitterTech(
       folly::EventBase* evb) const override;
   folly::Future<TransceiverInfo> getTransceiverInfo(
       folly::EventBase* evb) const override;
+  folly::Future<folly::Optional<TxSettings>> getTxSettings(
+      folly::EventBase* evb) const override;
   void customizeTransceiver() override;
-
- private:
-  // Forbidden copy constructor and assignment operator
-  WedgePort(WedgePort const &) = delete;
-  WedgePort& operator=(WedgePort const &) = delete;
 
  protected:
   bool isControllingPort() const;
@@ -79,6 +82,15 @@ class WedgePort : public BcmPlatformPort {
   folly::Optional<TransceiverID> frontPanelPort_;
   folly::Optional<ChannelID> channel_;
   BcmPort* bcmPort_{nullptr};
+
+ private:
+  // Forbidden copy constructor and assignment operator
+  WedgePort(WedgePort const &) = delete;
+  WedgePort& operator=(WedgePort const &) = delete;
+
+  virtual TxOverrides getTxOverrides() const override {
+    return TxOverrides();
+  }
 };
 
 }} // facebook::fboss

@@ -136,6 +136,9 @@ class BcmPort {
    */
   void linkStatusChanged(const std::shared_ptr<Port>& port);
 
+  static opennsl_gport_t asGPort(opennsl_port_t port);
+  static bool isValidLocalPort(opennsl_gport_t gport);
+
  private:
   // no copy or assignment
   BcmPort(BcmPort const &) = delete;
@@ -157,7 +160,6 @@ class BcmPort {
   void setAdditionalStats(std::chrono::seconds now, HwPortStats* curPortStats);
   std::string statName(folly::StringPiece name) const;
 
-  void disablePause();
   opennsl_port_if_t getDesiredInterfaceMode(cfg::PortSpeed speed,
                                             PortID id,
                                             const std::string& name);
@@ -167,6 +169,8 @@ class BcmPort {
 
   void setKR4Ability();
   void setFEC(const std::shared_ptr<Port>& swPort);
+  void setPause(const std::shared_ptr<Port>& swPort);
+  void setTxSetting(const std::shared_ptr<Port>& swPort);
   bool isMmuLossy() const;
 
   static constexpr auto kOutCongestionDiscards = "out_congestion_discards";

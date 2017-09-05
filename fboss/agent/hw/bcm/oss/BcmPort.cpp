@@ -18,10 +18,11 @@ extern "C" {
 namespace facebook { namespace fboss {
 
 // stubbed out
-void BcmPort::disablePause() {}
 void BcmPort::setKR4Ability() {}
 void BcmPort::prepareForGracefulExit() {}
 void BcmPort::setFEC(const std::shared_ptr<Port>& /*swPort*/) {}
+void BcmPort::setPause(const std::shared_ptr<Port>& swPort) {}
+void BcmPort::setTxSetting(const std::shared_ptr<Port>& /*swPort*/) {}
 
 bool BcmPort::isFECEnabled() {
   return false;
@@ -41,6 +42,14 @@ cfg::PortSpeed BcmPort::getMaxSpeed() const {
   auto rv = opennsl_port_speed_max(hw_->getUnit(), port_, &speed);
   bcmCheckError(rv, "Failed to get max speed for port ", port_);
   return cfg::PortSpeed(speed);
+}
+
+opennsl_gport_t BcmPort::asGPort(opennsl_port_t port) {
+  return static_cast<opennsl_gport_t>(0);
+}
+
+bool BcmPort::isValidLocalPort(opennsl_gport_t gport) {
+  return false;
 }
 
 }} // namespace facebook::fboss

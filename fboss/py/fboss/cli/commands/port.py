@@ -92,6 +92,14 @@ class PortDetailsCmd(cmds.FbossCmd):
         else:
             fec_status = "DISABLED"
 
+        pause = ''
+        if port_info.txPause:
+            pause = 'TX '
+        if port_info.rxPause:
+            pause = pause + 'RX'
+        if pause == '':
+            pause = 'None'
+
         fmt = '{:.<50}{}'
         lines = [
             ('Name', port_info.name.strip()),
@@ -101,6 +109,7 @@ class PortDetailsCmd(cmds.FbossCmd):
             ('Speed', '{:.0f} {}'.format(speed, suffix)),
             ('VLANs', vlans),
             ('Forward Error Correction', fec_status),
+            ('Pause', pause),
         ]
 
         print()
@@ -285,7 +294,6 @@ class PortStatusCmd(cmds.FbossCmd):
                 "Could not get status of ports {}".format(missing_port_status)))
 
 
-
 class PortStatusDetailCmd(object):
     ''' Print detailed/verbose port status '''
 
@@ -324,7 +332,8 @@ class PortStatusDetailCmd(object):
         ''' Get channel detail for port '''
 
         channels = status.transceiverIdx.channels
-        if not channels:
+        if channels is None:
+            # TODO(aeckert): rm after next agent push
             channels = self._get_port_channels(
                 port, status.transceiverIdx)
 

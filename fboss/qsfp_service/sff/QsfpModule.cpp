@@ -17,15 +17,17 @@
 #include "fboss/qsfp_service/sff/SffFieldInfo.h"
 #include "fboss/lib/usb/TransceiverI2CApi.h"
 
+#include <folly/io/IOBuf.h>
+
 namespace facebook { namespace fboss {
   using std::memcpy;
   using std::mutex;
   using std::lock_guard;
+  using folly::IOBuf;
 
 static const time_t kQsfpMinReadIntervalSecs = 10;
 
-// As per SFF-8436, QSFP+ 10 Gbs 4X PLUGGABLE TRANSCEIVER spec
-
+// As per SFF-8636
 static SffFieldInfo::SffFieldMap qsfpFields = {
   // Base page values, including alarms and sensors
   {SffField::IDENTIFIER, {QsfpPages::LOWER, 0, 1} },
@@ -40,6 +42,7 @@ static SffFieldInfo::SffFieldMap qsfpFields = {
   {SffField::CHANNEL_RX_PWR, {QsfpPages::LOWER, 34, 8} },
   {SffField::CHANNEL_TX_BIAS, {QsfpPages::LOWER, 42, 8} },
   {SffField::CHANNEL_TX_PWR, {QsfpPages::LOWER, 50, 8} },
+  {SffField::TX_DISABLE, {QsfpPages::LOWER, 86, 1} },
   {SffField::RATE_SELECT_RX, {QsfpPages::LOWER, 87, 1} },
   {SffField::RATE_SELECT_TX, {QsfpPages::LOWER, 88, 1} },
   {SffField::POWER_CONTROL, {QsfpPages::LOWER, 93, 1} },
@@ -66,6 +69,10 @@ static SffFieldInfo::SffFieldMap qsfpFields = {
   {SffField::DIAGNOSTIC_MONITORING_TYPE, {QsfpPages::PAGE0, 220, 1} },
   {SffField::ENHANCED_OPTIONS, {QsfpPages::PAGE0, 221, 1} },
 
+  // These are custom fields FB gets cable vendors to populate.
+  // TODO: add support for turning off these fields via a command-line flag
+  {SffField::LENGTH_COPPER_DECIMETERS, {QsfpPages::PAGE0, 236, 1}},
+  {SffField::DAC_GAUGE, {QsfpPages::PAGE0, 237, 1}},
 
   // Page 3 values, including alarm and warning threshold values:
   {SffField::TEMPERATURE_THRESH, {QsfpPages::PAGE3, 128, 8} },
@@ -80,6 +87,7 @@ static SffFieldMultiplier qsfpMultiplier = {
   {SffField::LENGTH_OM2, 1},
   {SffField::LENGTH_OM1, 1},
   {SffField::LENGTH_COPPER, 1},
+  {SffField::LENGTH_COPPER_DECIMETERS, 0.1},
 };
 
 void getQsfpFieldAddress(SffField field, int &dataAddress,
@@ -88,6 +96,10 @@ void getQsfpFieldAddress(SffField field, int &dataAddress,
   dataAddress = info.dataAddress;
   offset = info.offset;
   length = info.length;
+}
+
+TransceiverID QsfpModule::getID() const {
+  return TransceiverID(qsfpImpl_->getNum());
 }
 
 /*
@@ -120,6 +132,40 @@ FlagLevels QsfpModule::getQsfpSensorFlags(SffField fieldName) {
   getQsfpFieldAddress(fieldName, dataAddress, offset, length);
   const uint8_t *data = getQsfpValuePtr(dataAddress, offset, length);
   return getQsfpFlags(data, 4);
+}
+
+double QsfpModule::getQsfpDACLength() const {
+  auto base = getQsfpCableLength(SffField::LENGTH_COPPER);
+  auto fractional = getQsfpCableLength(SffField::LENGTH_COPPER_DECIMETERS);
+  if (fractional < 0) {
+    // fractional value not populated, fall back to integer value
+    return base;
+  } else if (fractional >= 1) {
+    // some vendors misunderstood and expressed the full length in terms of dm
+    return fractional;
+  } else {
+    return base + fractional;
+  }
+}
+
+int QsfpModule::getQsfpDACGauge() const {
+  auto info = SffFieldInfo::getSffFieldAddress(qsfpFields, SffField::DAC_GAUGE);
+  const uint8_t *val = getQsfpValuePtr(info.dataAddress,
+                                       info.offset, info.length);
+  //Guard against FF default value
+  auto gauge = *val;
+  if (gauge == EEPROM_DEFAULT) {
+    return 0;
+  } else if (gauge > MAX_GAUGE) {
+    // HACK: We never use cables with more than 30 (in decimal) gauge
+    // However, some vendors put in hex values. For example, some put
+    // 0x28 to represent 28 gauge cable (why?!?), which we would
+    // incorrectly interpret as 40 if using decimal. This converts
+    // values > 30 to the hex value.
+    return (gauge / HEX_BASE) * DECIMAL_BASE + gauge % HEX_BASE;
+  } else{
+    return gauge;
+  }
 }
 
 bool QsfpModule::getSensorInfo(GlobalSensors& info) {
@@ -157,6 +203,23 @@ void QsfpModule::getCableInfo(Cable &cable) {
   cable.__isset.om1 = (cable.om1 != 0);
   cable.copper = getQsfpCableLength(SffField::LENGTH_COPPER);
   cable.__isset.copper = (cable.copper != 0);
+
+  if (!cable.__isset.copper) {
+    // length and gauge fields currently only supported for copper
+    // TODO: migrate all cable types
+    return;
+  }
+
+  auto overrideDacCableInfo = getDACCableOverride();
+  if (overrideDacCableInfo) {
+    cable.length = overrideDacCableInfo->first;
+    cable.gauge = overrideDacCableInfo->second;
+  } else {
+    cable.length = getQsfpDACLength();
+    cable.gauge = getQsfpDACGauge();
+  }
+  cable.__isset.length = (cable.length != 0);
+  cable.__isset.gauge = (cable.gauge != 0);
 }
 
 /*
@@ -397,7 +460,7 @@ bool QsfpModule::getSensorsPerChanInfo(std::vector<Channel>& channels) {
   return true;
 }
 
-std::string QsfpModule::getQsfpString(SffField field) {
+std::string QsfpModule::getQsfpString(SffField field) const {
   int offset;
   int length;
   int dataAddress;
@@ -429,15 +492,16 @@ double QsfpModule::getQsfpSensor(SffField field,
  * value of the appropriate magnitude to communicate that to thrift
  * clients.
  */
-int QsfpModule::getQsfpCableLength(SffField field) {
-  int length;
+double QsfpModule::getQsfpCableLength(SffField field) const {
+  double length;
   auto info = SffFieldInfo::getSffFieldAddress(qsfpFields, field);
   const uint8_t *data = getQsfpValuePtr(info.dataAddress,
                                         info.offset, info.length);
   auto multiplier = qsfpMultiplier.at(field);
   length = *data * multiplier;
-  if (*data == MAX_CABLE_LEN) {
-    length = -(MAX_CABLE_LEN - 1) * multiplier;
+  if (*data == EEPROM_DEFAULT) {
+    // TODO: does this really mean the cable is too long?
+    length = -(EEPROM_DEFAULT - 1) * multiplier;
   }
   return length;
 }
@@ -588,6 +652,21 @@ TransceiverInfo QsfpModule::getTransceiverInfo() {
   return info;
 }
 
+RawDOMData QsfpModule::getRawDOMData() {
+  lock_guard<std::mutex> g(qsfpModuleMutex_);
+  refreshCacheIfPossibleLocked();
+  RawDOMData data;
+  if (present_) {
+    data.lower = IOBuf::wrapBufferAsValue(qsfpIdprom_, MAX_QSFP_PAGE_SIZE);
+    data.page0 = IOBuf::wrapBufferAsValue(qsfpPage0_, MAX_QSFP_PAGE_SIZE);
+    if (!flatMem_) {
+      data.__isset.page3 = true;
+      data.page3 = IOBuf::wrapBufferAsValue(qsfpPage3_, MAX_QSFP_PAGE_SIZE);
+    }
+  }
+  return data;
+}
+
 // Must be called with lock held on qsfpModuleMutex_
 void QsfpModule::refreshCacheIfPossibleLocked() {
   // Check whether we should refresh data
@@ -613,12 +692,11 @@ void QsfpModule::detectTransceiverLocked() {
   setPresent(currentQsfpStatus);
   if (currentQsfpStatus) {
     updateQsfpData();
-    customizeTransceiverLocked();
   }
 }
 
 int QsfpModule::getFieldValue(SffField fieldName,
-                             uint8_t* fieldValue) {
+                              uint8_t* fieldValue) {
   lock_guard<std::mutex> g(qsfpModuleMutex_);
   int offset;
   int length;
@@ -695,6 +773,10 @@ void QsfpModule::customizeTransceiverLocked(cfg::PortSpeed speed) {
 
     // We want this on regardless of speed
     setPowerOverrideIfSupported(settings.powerControl);
+
+    // make sure TX is enabled on the transceiver
+    ensureTxEnabled();
+
     if (speed == cfg::PortSpeed::DEFAULT) {
       LOG(INFO) << "Port speed is not set. Not customizing further.";
       return;
@@ -891,6 +973,23 @@ void QsfpModule::setPowerOverrideIfSupported(PowerControlState currentState) {
             << ": QSFP set to power setting "
             << _PowerControlState_VALUES_TO_NAMES.find(desiredSetting)->second
             << " (" << int(power) << ")";
+}
+
+void QsfpModule::ensureTxEnabled() {
+  // Sometimes transceivers lock up and disable TX. When we customize
+  // the transceiver let's also ensure that tx is enabled. We have
+  // even seen transceivers report to have tx enabled in the DOM, but
+  // no traffic was flowing. When we forcibly set the tx_enable bits
+  // again, traffic began flowing.  Because of this, we ALWAYS set the
+  // bits (even if they report enabled).
+  int offset;
+  int length;
+  int dataAddress;
+  getQsfpFieldAddress(SffField::TX_DISABLE, dataAddress, offset, length);
+
+  std::array<uint8_t, 1> buf = {{0}};
+  qsfpImpl_->writeTransceiver(
+    TransceiverI2CApi::ADDR_QSFP, offset, 1, buf.data());
 }
 
 }} //namespace facebook::fboss

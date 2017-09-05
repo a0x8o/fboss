@@ -160,7 +160,9 @@ BcmSwitch::BcmSwitch(BcmPlatform *platform, unique_ptr<BcmUnit> unit)
   unit_ = unitObject_->getNumber();
 }
 
-BcmSwitch::~BcmSwitch() {}
+BcmSwitch::~BcmSwitch() {
+  LOG(ERROR) << "Destroying BcmSwitch";
+}
 
 unique_ptr<BcmUnit> BcmSwitch::releaseUnit() {
   std::lock_guard<std::mutex> g(lock_);
@@ -329,6 +331,8 @@ void BcmSwitch::ecmpHashSetup() {
 }
 
 void BcmSwitch::gracefulExit(folly::dynamic& switchState) {
+  steady_clock::time_point begin = steady_clock::now();
+  LOG(INFO) << "[Exit] Starting BCM Switch graceful exit";
   // Ideally, preparePortsForGracefulExit() would run in update EVB of the
   // SwSwitch, but it does not really matter at the graceful exit time. If
   // this is a concern, this can be moved to the updateEventBase_ of SwSwitch.
@@ -342,6 +346,8 @@ void BcmSwitch::gracefulExit(folly::dynamic& switchState) {
   unitObject_->detach(platform_->getWarmBootSwitchStateFile(),
       switchState);
   unitObject_.reset();
+  LOG(INFO) <<"[Exit] BRCM Graceful Exit time " <<
+    duration_cast<duration<float>>(steady_clock::now() - begin).count();
 }
 
 folly::dynamic BcmSwitch::toFollyDynamic() const {
@@ -405,6 +411,18 @@ std::shared_ptr<SwitchState> BcmSwitch::getWarmBootSwitchState() const {
   return warmBootState;
 }
 
+void BcmSwitch::runBcmScriptPreAsicInit() const {
+  std::string filename = platform_->getScriptPreAsicInit();
+  std::ifstream scriptFile(filename);
+
+  if (!scriptFile.good()) {
+    return;
+  }
+
+  LOG(INFO) << "Run script " << filename;
+  printDiagCmd(folly::to<string>("rcload ", filename));
+}
+
 HwInitResult BcmSwitch::init(Callback* callback) {
   HwInitResult ret;
 
@@ -424,6 +442,9 @@ HwInitResult BcmSwitch::init(Callback* callback) {
   if (!unitObject_->isAttached()) {
     unitObject_->attach(platform_->getWarmBootDir());
   }
+
+  // Possibly run pre-init bcm shell script before ASIC init.
+  runBcmScriptPreAsicInit();
 
   ret.initializedTime =
     duration_cast<duration<float>>(steady_clock::now() - begin).count();
@@ -724,6 +745,12 @@ void BcmSwitch::processEnabledPorts(const StateDelta& delta) {
 void BcmSwitch::processChangedPorts(const StateDelta& delta) {
   forEachChanged(delta.getPortsDelta(),
     [&] (const shared_ptr<Port>& oldPort, const shared_ptr<Port>& newPort) {
+
+      auto bcmPort = portTable_->getBcmPort(newPort->getID());
+      if (oldPort->getName() != newPort->getName()) {
+        bcmPort->updateName(newPort->getName());
+      }
+
       if (!oldPort->isEnabled() && !newPort->isEnabled()) {
         // No need to process changes on disabled ports. We will pick up changes
         // should the port ever become enabled.
@@ -732,17 +759,8 @@ void BcmSwitch::processChangedPorts(const StateDelta& delta) {
 
       auto speedChanged = oldPort->getSpeed() != newPort->getSpeed();
       auto vlanChanged = oldPort->getIngressVlan() != newPort->getIngressVlan();
-      auto nameChanged = oldPort->getName() != newPort->getName();
-      if (!nameChanged && !speedChanged && !vlanChanged) {
-        return;
-      }
-
-      auto bcmPort = portTable_->getBcmPort(newPort->getID());
-      if (nameChanged) {
-        bcmPort->updateName(newPort->getName());
-      }
-
-      if (speedChanged || vlanChanged) {
+      auto pauseChanged = oldPort->getPause() != newPort->getPause();
+      if (speedChanged || vlanChanged || pauseChanged) {
         bcmPort->program(newPort);
       }
     });
@@ -1223,17 +1241,24 @@ void BcmSwitch::linkscanCallback(int unit,
   }
 }
 
-void BcmSwitch::linkStateChangedHwNotLocked(opennsl_port_t bcmPortId,
+void BcmSwitch::linkStateChangedHwNotLocked(
+    opennsl_port_t bcmPortId,
     opennsl_port_info_t* info) {
   // TODO: We should eventually define a more robust hardware independent
   // LinkStatus enum, so we can expose more detailed information to to the
   // callback about why the link is down.
   bool up = info->linkstatus == OPENNSL_PORT_LINK_STATUS_UP;
   if (!up) {
+    auto trunk = trunkTable_->linkDownHwNotLocked(bcmPortId);
+    if (trunk != BcmTrunk::INVALID) {
+      LOG(INFO) << "Shrinking ECMP entries egressing over trunk " << trunk;
+      hostTable_->trunkDownHwNotLocked(trunk);
+    }
+    hostTable_->linkDownHwNotLocked(bcmPortId);
+  } else {
     // For port up events we wait till ARP/NDP entries
     // are re resolved after port up before adding them
     // back. Adding them earlier leads to packet loss.
-    hostTable_->linkDownHwNotLocked(bcmPortId);
   }
   callback_->linkStateChanged(portTable_->getPortId(bcmPortId), up);
 }

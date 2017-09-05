@@ -11,20 +11,9 @@
 
 namespace facebook { namespace fboss {
 
-void QsfpModule::getDACCableInfo(Cable &cable) {
-  //Can update the gauge and length information for DAC Cables
-  cable.dacLength = 0;
-  cable.gauge = 0;
-}
-
-int QsfpModule::getQsfpDACGauge() {
-  // Need special custom fields for determining this information
-  return 0;
-}
-
-float QsfpModule::getQsfpDACLength(){
-  // Need special custom fields for determining this information
-  return 0.0;
+const folly::Optional<QsfpModule::LengthAndGauge>
+QsfpModule::getDACCableOverride() const {
+  return folly::none;
 }
 
 }} //namespace facebook::fboss

@@ -11,6 +11,7 @@
 #include "fboss/agent/platforms/wedge/WedgePort.h"
 
 #include <folly/futures/Future.h>
+#include <folly/gen/Base.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/EventBaseManager.h>
 
@@ -108,6 +109,43 @@ folly::Future<TransmitterTechnology> WedgePort::getTransmitterTech(
       std::move(handleError));
 }
 
+// Get correct transmitter setting.
+folly::Future<folly::Optional<TxSettings>> WedgePort::getTxSettings(
+    folly::EventBase* evb) const {
+  auto txOverrides = getTxOverrides();
+  if (txOverrides.empty()) {
+    return folly::makeFuture<folly::Optional<TxSettings>>(folly::none);
+  }
+
+  if (!evb) {
+    evb = platform_->getEventBase();
+  }
+
+  auto getTx = [overrides = std::move(txOverrides)](TransceiverInfo info)
+      -> folly::Optional<TxSettings> {
+    if (info.__isset.cable && info.cable.__isset.transmitterTech) {
+      if (!info.cable.__isset.length) {
+        return folly::Optional<TxSettings>();
+      }
+      auto cableMeters = std::max(1.0, std::min(3.0, info.cable.length));
+      const auto it = overrides.find(
+        std::make_pair(info.cable.transmitterTech, cableMeters));
+      if (it != overrides.cend()) {
+        return it->second;
+      }
+    }
+    // not enough cable info. return the default value
+    return folly::Optional<TxSettings>();
+  };
+  auto transID = getTransceiverID();
+  auto handleErr = [transID](const std::exception& e) {
+    LOG(ERROR) << "Error retrieving cable info for transceiver " << *transID
+               << " Exception: " << folly::exceptionStr(e);
+    return folly::Optional<TxSettings>();
+  };
+  return getTransceiverInfo(evb).then(evb, getTx).onError(std::move(handleErr));
+}
+
 void WedgePort::statusIndication(
     bool enabled,
     bool link,
@@ -143,6 +181,36 @@ bool WedgePort::isInSingleMode() const {
     return false;
   }
   return bcmPort_->getPortGroup()->laneMode() == BcmPortGroup::LaneMode::SINGLE;
+}
+
+std::vector<int32_t> WedgePort::getChannels() const {
+  // TODO(aeckert): this is pretty hacky... we should really model
+  // port groups in switch state somehow so this can be served purely
+  // from switch state.
+  if (!getChannel().hasValue()) {
+    return {};
+  }
+
+  auto base = static_cast<int32_t>(*getChannel());
+
+  uint8_t numChannels = 1;
+  if (bcmPort_ && bcmPort_->getPortGroup()) {
+    auto pg = bcmPort_->getPortGroup();
+    if (pg->laneMode() == BcmPortGroup::LaneMode::SINGLE) {
+      if (base != 0) {
+        return {};
+      }
+      numChannels = 4;
+    } else if (pg->laneMode() == BcmPortGroup::LaneMode::DUAL) {
+      if (base != 0 && base != 2) {
+        return {};
+      }
+      numChannels = 2;
+    }
+  }
+
+  return folly::gen::range(base, base + numChannels)
+    | folly::gen::as<std::vector>();
 }
 
 bool WedgePort::shouldCustomizeTransceiver() const {

@@ -57,7 +57,7 @@ function build_cmake() {
             cmake .. $CMAKEFLAGS || die "Cmake failed for $1"
             make -j "$NPROC" || die "Failed to build $1"
         else
-	    die "No CmakeLists.txt found for $1"
+      die "No CmakeLists.txt found for $1"
         fi
     )
 }

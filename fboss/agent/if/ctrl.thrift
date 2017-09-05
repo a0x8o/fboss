@@ -1,5 +1,6 @@
 namespace cpp2 facebook.fboss
 namespace d neteng.fboss.ctrl
+namespace go neteng.fboss.ctrl
 namespace php fboss
 namespace py neteng.fboss.ctrl
 namespace py.asyncio neteng.fboss.asyncio.ctrl
@@ -150,6 +151,8 @@ struct PortInfoThrift {
   12: string name,
   13: string description,
   14: bool fecEnabled, // Forward Error Correction port setting
+  15: bool txPause = false,
+  16: bool rxPause = false,
 }
 
 struct NdpEntryThrift {

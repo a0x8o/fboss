@@ -14,16 +14,17 @@ extern "C" {
 #include <opennsl/l3.h>
 }
 
-#include <folly/dynamic.h>
 #include <folly/IPAddress.h>
 #include <folly/MacAddress.h>
 #include <folly/SpinLock.h>
-#include "fboss/agent/types.h"
+#include <folly/dynamic.h>
 #include "fboss/agent/hw/bcm/BcmEgress.h"
+#include "fboss/agent/hw/bcm/BcmPort.h"
 #include "fboss/agent/hw/bcm/BcmTrunk.h"
 #include "fboss/agent/hw/bcm/PortAndEgressIdsMap.h"
-#include "fboss/agent/state/RouteNextHopEntry.h"
 #include "fboss/agent/state/NeighborEntry.h"
+#include "fboss/agent/state/RouteNextHopEntry.h"
+#include "fboss/agent/types.h"
 
 #include <boost/container/flat_map.hpp>
 #include <boost/container/flat_set.hpp>
@@ -80,6 +81,14 @@ class BcmHost {
   bool isPortOrTrunkSet() const {
     return trunk_ != BcmTrunk::INVALID || port_ != 0;
   }
+  opennsl_gport_t getSetPortAsGPort() {
+    if (trunk_ != BcmTrunk::INVALID) {
+      return BcmTrunk::asGPort(trunk_);
+    } else {
+      return BcmPort::asGPort(port_);
+    }
+  }
+
  private:
   // no copy or assignment
   BcmHost(BcmHost const &) = delete;
@@ -215,7 +224,12 @@ class BcmHostTable {
    * explains why we can't hold this lock here.
    */
   void linkDownHwNotLocked(opennsl_port_t port) {
-    linkStateChangedMaybeLocked(port, false /*down*/, false /*not locked*/);
+    linkStateChangedMaybeLocked(
+        BcmPort::asGPort(port), false /*down*/, false /*not locked*/);
+  }
+  void trunkDownHwNotLocked(opennsl_trunk_t trunk) {
+    linkStateChangedMaybeLocked(
+        BcmTrunk::asGPort(trunk), false /*down*/, false /*not locked*/);
   }
   void linkDownHwLocked(opennsl_port_t port) {
     // Just call the non locked counterpart here.
@@ -228,7 +242,8 @@ class BcmHostTable {
    * while holding hw lock.
    */
   void linkUpHwLocked(opennsl_port_t port) {
-    linkStateChangedMaybeLocked(port, true /*up*/, true /*locked*/);
+    linkStateChangedMaybeLocked(
+        BcmPort::asGPort(port), true /*up*/, true /*locked*/);
   }
   /*
    * Update port to egressIds mapping
@@ -293,8 +308,7 @@ class BcmHostTable {
   /*
    * Called both while holding and not holding the hw lock.
    */
-  void linkStateChangedMaybeLocked(opennsl_port_t port, bool up,
-      bool locked);
+  void linkStateChangedMaybeLocked(opennsl_port_t port, bool up, bool locked);
   static void egressResolutionChangedHwNotLocked(
       int unit,
       const Paths& affectedPaths,

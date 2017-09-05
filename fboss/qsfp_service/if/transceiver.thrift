@@ -1,5 +1,6 @@
 namespace cpp2 facebook.fboss
 namespace d neteng.fboss.transceiver
+namespace go neteng.fboss.transceiver
 namespace php fboss
 namespace py neteng.fboss.transceiver
 namespace py.asyncio neteng.fboss.asyncio.transceiver
@@ -78,6 +79,8 @@ struct Cable {
   5: optional i32 om1,
   6: optional i32 copper,
   7: TransmitterTechnology transmitterTech,
+  8: optional double length,
+  9: optional i32 gauge,
 }
 
 struct Channel {
@@ -145,4 +148,18 @@ struct TransceiverInfo {
   10: optional Cable cable,
   12: list<Channel> channels,
   13: optional TransceiverSettings settings,
+}
+
+typedef binary (cpp2.type = "folly::IOBuf") IOBuf
+
+struct RawDOMData {
+  // The SFF DOM exposes at most 256 bytes at a time and is divided in
+  // to two 128 byte "pages". The lower page is always the same, but
+  // you can swap in different pages for the upper 128 bytes. The only
+  // ones we use now are upper pages 0 and 3. Page 0 is required of
+  // every transceiver, but the rest are optional. If we need other
+  // fields in the future we can add support for other pages.
+  1: IOBuf lower,
+  2: IOBuf page0,
+  3: optional IOBuf page3,
 }

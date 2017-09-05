@@ -15,12 +15,13 @@ extern "C" {
 #include <opennsl/types.h>
 }
 
+#include "fboss/agent/state/AggregatePort.h"
 #include "fboss/agent/types.h"
+#include "folly/Optional.h"
 
 namespace facebook {
 namespace fboss {
 
-class AggregatePort;
 class BcmSwitch;
 
 class BcmTrunk {
@@ -32,13 +33,35 @@ class BcmTrunk {
   explicit BcmTrunk(const BcmSwitch* hw) : hw_(hw) {}
   ~BcmTrunk();
 
+  opennsl_trunk_t id() const { return bcmTrunkID_; }
+
   void init(const std::shared_ptr<AggregatePort>& aggPort);
   void program(
       const std::shared_ptr<AggregatePort>& oldAggPort,
       const std::shared_ptr<AggregatePort>& newAggPort);
 
+  static void shrinkTrunkGroupHwNotLocked(
+      int unit,
+      opennsl_trunk_t trunk,
+      opennsl_port_t toDisable);
+  static int getEnabledMemberPortsCountHwNotLocked(
+      int unit,
+      opennsl_trunk_t trunk,
+      opennsl_port_t port);
+  static folly::Optional<int> findTrunk(int, opennsl_module_t, opennsl_port_t);
+
+  static opennsl_gport_t asGPort(opennsl_trunk_t trunk);
+  static bool isValidTrunkPort(opennsl_gport_t gPort);
+
  private:
+  void programSubports(
+      AggregatePort::SubportsConstRange oldMembersRange,
+      AggregatePort::SubportsConstRange newMembersRange);
+  void programForwardingState(
+      AggregatePort::SubportAndForwardingStateConstRange oldRange,
+      AggregatePort::SubportAndForwardingStateConstRange newRange);
   void modifyMemberPortChecked(bool added, PortID memberPort);
+  void modifyMemberPort(bool added, PortID memberPort);
   // Forbidden copy constructor and assignment operator
   BcmTrunk(const BcmTrunk&) = delete;
   BcmTrunk& operator=(const BcmTrunk&) = delete;

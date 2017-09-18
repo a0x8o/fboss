@@ -12,6 +12,7 @@
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/state/NodeBase.h"
+#include "fboss/agent/state/TrafficPolicy.h"
 
 #include <boost/container/flat_map.hpp>
 #include <string>
@@ -60,6 +61,11 @@ struct PortFields {
   cfg::PortSpeed maxSpeed{cfg::PortSpeed::DEFAULT};
   cfg::PortPause pause;
   VlanMembership vlans;
+  // settings for ingress/egress sFlow sampling rate; we sample every 1:N'th
+  // packets randomly based on those settings. Zero means no sampling.
+  int64_t sFlowIngressRate{0};
+  int64_t sFlowEgressRate{0};
+  std::shared_ptr<TrafficPolicy> trafficPolicy;
 };
 
 /*
@@ -157,6 +163,15 @@ class Port : public NodeBaseT<Port, PortFields> {
     writableFields()->vlans.swap(vlans);
   }
 
+  const std::shared_ptr<TrafficPolicy> getTrafficPolicy() {
+    return getFields()->trafficPolicy;
+  }
+
+  void resetTrafficPolicy(
+      std::shared_ptr<TrafficPolicy> trafficPolicy) {
+    writableFields()->trafficPolicy.swap(trafficPolicy);
+  }
+
   VlanID getIngressVlan() const {
     return getFields()->ingressVlan;
   }
@@ -191,6 +206,20 @@ class Port : public NodeBaseT<Port, PortFields> {
   }
   void setPause(cfg::PortPause pause) {
     writableFields()->pause = pause;
+  }
+
+  int64_t getSflowIngressRate() const {
+    return getFields()->sFlowIngressRate;
+  }
+  void setSflowIngressRate(int64_t ingressRate) {
+    writableFields()->sFlowIngressRate = ingressRate;
+  }
+
+  int64_t getSflowEgressRate() const {
+    return getFields()->sFlowEgressRate;
+  }
+  void setSflowEgressRate(int64_t egressRate) {
+    writableFields()->sFlowEgressRate = egressRate;
   }
 
   Port* modify(std::shared_ptr<SwitchState>* state);

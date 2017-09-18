@@ -84,7 +84,22 @@ add_executable(wedge_agent
     fboss/agent/platforms/wedge/oss/WedgePlatform.cpp
 )
 
+add_executable(qsfp_service
+    fboss/qsfp_service/oss/QsfpServer.cpp
+    fboss/qsfp_service/Main.cpp
+    fboss/qsfp_service/QsfpServiceHandler.cpp
+    fboss/qsfp_service/sff/QsfpModule.cpp
+    fboss/qsfp_service/sff/SffFieldInfo.cpp
+    fboss/qsfp_service/sff/oss/QsfpModule.cpp
+    fboss/qsfp_service/platforms/wedge/WedgeManager.cpp
+    fboss/qsfp_service/platforms/wedge/WedgeQsfp.cpp
+    fboss/qsfp_service/platforms/wedge/Wedge100Manager.cpp
+    fboss/qsfp_service/platforms/wedge/GalaxyManager.cpp
+    fboss/qsfp_service/platforms/wedge/Wedge40Manager.cpp
+)
+
 target_link_libraries(wedge_agent fboss_agent)
+target_link_libraries(qsfp_service fboss_agent)
 
 add_library(fboss_agent STATIC
     common/stats/ServiceData.cpp
@@ -115,6 +130,7 @@ add_library(fboss_agent STATIC
     fboss/agent/hw/bcm/BcmPortTable.cpp
     fboss/agent/hw/bcm/BcmRoute.cpp
     fboss/agent/hw/bcm/BcmRxPacket.cpp
+    fboss/agent/hw/bcm/BcmSflowExporter.cpp
     fboss/agent/hw/bcm/BcmStats.cpp
     fboss/agent/hw/bcm/BcmSwitch.cpp
     fboss/agent/hw/bcm/BcmSwitchEventCallback.cpp
@@ -132,6 +148,7 @@ add_library(fboss_agent STATIC
     fboss/agent/hw/bcm/oss/BcmPortGroup.cpp
     fboss/agent/hw/bcm/oss/BcmPortTable.cpp
     fboss/agent/hw/bcm/oss/BcmSwitch.cpp
+    fboss/agent/hw/bcm/oss/BcmSwitchEventCallback.cpp
     fboss/agent/hw/bcm/oss/BcmTrunk.cpp
     fboss/agent/hw/bcm/oss/BcmUnit.cpp
     fboss/agent/hw/bcm/oss/BcmWarmBootHelper.cpp
@@ -196,7 +213,9 @@ add_library(fboss_agent STATIC
     fboss/agent/platforms/wedge/Wedge100Port.cpp
     fboss/agent/platforms/wedge/WedgeProductInfo.cpp
     fboss/agent/platforms/wedge/WedgePlatformInit.cpp
+    fboss/agent/PortRemediator.cpp
     fboss/agent/PortStats.cpp
+    fboss/agent/PortUpdateHandler.cpp
     fboss/agent/PortRemediator.cpp
     fboss/agent/QsfpClient.cpp
     fboss/agent/RestClient.cpp
@@ -211,6 +230,7 @@ add_library(fboss_agent STATIC
     fboss/agent/state/ArpTable.cpp
     fboss/agent/state/Interface.cpp
     fboss/agent/state/InterfaceMap.cpp
+    fboss/agent/state/MatchToActionEntry.cpp
     fboss/agent/state/NdpEntry.cpp
     fboss/agent/state/NdpResponseTable.cpp
     fboss/agent/state/NdpTable.cpp
@@ -228,9 +248,12 @@ add_library(fboss_agent STATIC
     fboss/agent/state/RouteTableRib.cpp
     fboss/agent/state/RouteTypes.cpp
     fboss/agent/state/RouteUpdater.cpp
+    fboss/agent/state/SflowCollector.cpp
+    fboss/agent/state/SflowCollectorMap.cpp
     fboss/agent/state/StateDelta.cpp
     fboss/agent/state/StateUtils.cpp
     fboss/agent/state/SwitchState.cpp
+    fboss/agent/state/TrafficPolicy.cpp
     fboss/agent/state/Vlan.cpp
     fboss/agent/state/VlanMap.cpp
     fboss/agent/state/VlanMapDelta.cpp
@@ -265,6 +288,7 @@ add_library(fboss_agent STATIC
     fboss/qsfp_service/platforms/wedge/WedgeI2CBusLock.cpp
 
 
+
     # generated sources
     ${CMAKE_BINARY_DIR}/gen/fboss/agent/hw/bcm/gen-cpp2/packettrace_data.cpp
     ${CMAKE_BINARY_DIR}/gen/fboss/agent/hw/bcm/gen-cpp2/packettrace_types.cpp
@@ -288,6 +312,9 @@ add_library(fboss_agent STATIC
     ${CMAKE_BINARY_DIR}/gen/fboss/agent/hw/sim/gen-cpp2/sim_ctrl_constants.cpp
     ${CMAKE_BINARY_DIR}/gen/fboss/agent/if/gen-cpp2/optic_data.cpp
     ${CMAKE_BINARY_DIR}/gen/fboss/agent/if/gen-cpp2/optic_types.cpp
+    ${CMAKE_BINARY_DIR}/gen/fboss/agent/if/gen-cpp2/sflow_data.cpp
+    ${CMAKE_BINARY_DIR}/gen/fboss/agent/if/gen-cpp2/sflow_types.cpp
+    ${CMAKE_BINARY_DIR}/gen/fboss/agent/if/gen-cpp2/sflow_constants.cpp
     ${CMAKE_BINARY_DIR}/gen/fboss/agent/if/gen-cpp2/ctrl_data.cpp
     ${CMAKE_BINARY_DIR}/gen/fboss/agent/if/gen-cpp2/ctrl_types.cpp
     ${CMAKE_BINARY_DIR}/gen/fboss/agent/if/gen-cpp2/FbossCtrl.cpp
@@ -346,6 +373,22 @@ target_link_libraries(fboss_agent
     ${CURL}
     ${NUMA}
     ${ZSTD}
+)
+
+target_link_libraries(qsfp_service
+    ${ZSTD}
+    ${GLOG}
+    ${SSL}
+    ${ZLIB}
+    ${FOLLY}
+    ${WANGLE}
+    ${GFLAGS}
+    ${GLOG}
+    ${PTHREAD}
+    ${THRIFT}
+    ${THRIFTPROTO}
+    ${THRIFTCPP2}
+    ${EVENT}
 )
 
 find_program(THRIFT1 thrift1)
@@ -411,6 +454,7 @@ fboss_add_thrift(THRIFTSRC fboss/agent/if/ctrl.thrift
 fboss_add_thrift(THRIFTSRC fboss/agent/if/fboss.thrift)
 fboss_add_thrift(THRIFTSRC fboss/agent/if/highres.thrift SERVICES FbossHighresClient)
 fboss_add_thrift(THRIFTSRC fboss/agent/if/optic.thrift)
+fboss_add_thrift(THRIFTSRC fboss/agent/if/sflow.thrift)
 fboss_add_thrift(THRIFTSRC fboss/agent/hw/bcm/packettrace.thrift)
 fboss_add_thrift(THRIFTSRC fboss/agent/hw/bcm/bcmswitch.thrift)
 fboss_add_thrift(THRIFTSRC fboss/agent/hw/bcm/hardware_stats.thrift)

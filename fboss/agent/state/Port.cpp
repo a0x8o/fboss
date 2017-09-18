@@ -32,6 +32,9 @@ constexpr auto kVlanMemberships = "vlanMemberShips";
 constexpr auto kVlanId = "vlanId";
 constexpr auto kVlanInfo = "vlanInfo";
 constexpr auto kTagged = "tagged";
+constexpr auto kSflowIngressRate = "sFlowIngressRate";
+constexpr auto kSflowEgressRate = "sFlowEgressRate";
+constexpr auto kTrafficPolicy = "trafficPolicy";
 }
 namespace facebook { namespace fboss {
 
@@ -86,6 +89,11 @@ folly::dynamic PortFields::toFollyDynamic() const {
     port[kVlanMemberships][to<string>(vlan.first)] =
       vlan.second.toFollyDynamic();
   }
+  port[kSflowIngressRate] = sFlowIngressRate;
+  port[kSflowEgressRate] = sFlowEgressRate;
+  if (trafficPolicy) {
+    port[kTrafficPolicy] = trafficPolicy->toFollyDynamic();
+  }
   return port;
 }
 
@@ -128,6 +136,16 @@ PortFields PortFields::fromFollyDynamic(const folly::dynamic& portJson) {
   for (const auto& vlanInfo: portJson[kVlanMemberships].items()) {
     port.vlans.emplace(VlanID(to<uint32_t>(vlanInfo.first.asString())),
       VlanInfo::fromFollyDynamic(vlanInfo.second));
+  }
+  if (portJson.count(kSflowIngressRate) > 0) {
+    port.sFlowIngressRate = portJson[kSflowIngressRate].asInt();
+  }
+  if (portJson.count(kSflowEgressRate) > 0) {
+    port.sFlowEgressRate = portJson[kSflowEgressRate].asInt();
+  }
+  if (portJson.find(kTrafficPolicy) != portJson.items().end()) {
+    port.trafficPolicy =
+      TrafficPolicy::fromFollyDynamic(portJson[kTrafficPolicy]);
   }
   return port;
 }

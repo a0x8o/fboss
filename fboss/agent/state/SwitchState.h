@@ -28,11 +28,14 @@ class Interface;
 class InterfaceMap;
 class Port;
 class PortMap;
+class TrafficPolicy;
 class RouteTable;
 class RouteTableMap;
 class Vlan;
 class VlanMap;
 template <typename AddressT> class Route;
+class SflowCollector;
+class SflowCollectorMap;
 
 struct SwitchStateFields {
   SwitchStateFields();
@@ -61,7 +64,10 @@ struct SwitchStateFields {
   std::shared_ptr<InterfaceMap> interfaces;
   std::shared_ptr<RouteTableMap> routeTables;
   std::shared_ptr<AclMap> acls;
+  std::shared_ptr<SflowCollectorMap> sFlowCollectors;
   VlanID defaultVlan{0};
+  std::shared_ptr<TrafficPolicy> trafficPolicy;
+
 
   // Timeout settings
   // TODO(aeckert): Figure out a nicer way to store these config fields
@@ -200,6 +206,10 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
     return getFields()->arpTimeout;
   }
 
+  const std::shared_ptr<SflowCollectorMap>& getSflowCollectors() const {
+    return getFields()->sFlowCollectors;
+  }
+
   void setArpTimeout(std::chrono::seconds timeout);
 
   std::chrono::seconds getNdpTimeout() const {
@@ -254,6 +264,14 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
   void setDhcpV6ReplySrc(folly::IPAddressV6 v6ReplySrc) {
      writableFields()->dhcpV6ReplySrc = v6ReplySrc;
   }
+  const std::shared_ptr<TrafficPolicy> getTrafficPolicy() {
+    return getFields()->trafficPolicy;
+  }
+
+  void resetTrafficPolicy(
+      std::shared_ptr<TrafficPolicy> trafficPolicy) {
+    writableFields()->trafficPolicy.swap(trafficPolicy);
+  }
 
   /*
    * The following functions modify the static state.
@@ -274,6 +292,8 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
   void resetRouteTables(std::shared_ptr<RouteTableMap> rts);
   void addAcl(const std::shared_ptr<AclEntry>& acl);
   void resetAcls(std::shared_ptr<AclMap> acls);
+  void resetSflowCollectors(
+      const std::shared_ptr<SflowCollectorMap>& collectors);
 
  private:
   // Inherit the constructor required for clone()

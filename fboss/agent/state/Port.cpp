@@ -8,6 +8,7 @@
  *
  */
 #include "fboss/agent/state/Port.h"
+#include "fboss/agent/state/PortQueue.h"
 #include "fboss/agent/state/StateUtils.h"
 #include "fboss/agent/state/SwitchState.h"
 #include <folly/Conv.h>
@@ -34,8 +35,10 @@ constexpr auto kVlanInfo = "vlanInfo";
 constexpr auto kTagged = "tagged";
 constexpr auto kSflowIngressRate = "sFlowIngressRate";
 constexpr auto kSflowEgressRate = "sFlowEgressRate";
-constexpr auto kTrafficPolicy = "trafficPolicy";
+constexpr auto kQueues = "queues";
+constexpr auto kPortFEC = "portFEC";
 }
+
 namespace facebook { namespace fboss {
 
 
@@ -55,23 +58,8 @@ folly::dynamic PortFields::toFollyDynamic() const {
   port[kPortId] = static_cast<uint16_t>(id);
   port[kPortName] = name;
   port[kPortDescription] = description;
-  // For backwards compatibility, we must keep writing out the old strings
-  // otherwise, if we were to try to roll back with a warm boot, the old
-  // agent would crash failing to find "ENABLED" or "DISABLED" in
-  // the VALUES_TO_NAMES map. After the agent everywhere is capable of
-  // reading in either UP/POWER_DOWN or ENABLED/DISABLED,
-  // then we can remove this.
-  // Finally, after a release like that, we can remove the code that reads in
-  // "POWER_DOWN" and "UP".
-  std::unordered_map<cfg::PortState, std::string> transitionAdminStateMap{
-      {cfg::PortState::DISABLED, "POWER_DOWN"},
-      {cfg::PortState::ENABLED, "UP"},
-      // There should be no instances of DOWN, but leave it in the map just
-      // in case to avoid crashes if we missed deprecating it somewhere.
-      {cfg::PortState::DOWN, "POWER_DOWN"},
-  };
-  auto itrAdminState  = transitionAdminStateMap.find(adminState);
-  CHECK(itrAdminState != transitionAdminStateMap.end());
+  auto itrAdminState  = cfg::_PortState_VALUES_TO_NAMES.find(adminState);
+  CHECK(itrAdminState != cfg::_PortState_VALUES_TO_NAMES.end());
   port[kPortState] = itrAdminState->second;
   port[kPortOperState] = operState == OperState::UP;
   port[kIngressVlan] = static_cast<uint16_t>(ingressVlan);
@@ -82,6 +70,10 @@ folly::dynamic PortFields::toFollyDynamic() const {
   CHECK(itr_max_speed != cfg::_PortSpeed_VALUES_TO_NAMES.end())
      << "Unexpected max speed: " << static_cast<int>(maxSpeed);
   port[kPortMaxSpeed] = itr_max_speed->second;
+  auto itr_port_fec  = cfg::_PortFEC_VALUES_TO_NAMES.find(fec);
+  CHECK(itr_port_fec != cfg::_PortFEC_VALUES_TO_NAMES.end())
+     << "Unexpected port FEC: " << static_cast<int>(fec);
+  port[kPortFEC] = itr_port_fec->second;
   port[kPortTxPause] = pause.tx;
   port[kPortRxPause] = pause.rx;
   port[kVlanMemberships] = folly::dynamic::object;
@@ -91,8 +83,9 @@ folly::dynamic PortFields::toFollyDynamic() const {
   }
   port[kSflowIngressRate] = sFlowIngressRate;
   port[kSflowEgressRate] = sFlowEgressRate;
-  if (trafficPolicy) {
-    port[kTrafficPolicy] = trafficPolicy->toFollyDynamic();
+  port[kQueues] = folly::dynamic::array;
+  for (const auto& queue : queues) {
+    port[kQueues].push_back(queue.second->toFollyDynamic());
   }
   return port;
 }
@@ -101,8 +94,11 @@ PortFields PortFields::fromFollyDynamic(const folly::dynamic& portJson) {
   PortFields port(PortID(portJson[kPortId].asInt()),
       portJson[kPortName].asString());
   port.description = portJson[kPortDescription].asString();
-  // see note in toFollyDynamic for an explanation of the ugprade path
-  // to get rid of this backwards compatibility hack.
+  // For backwards compatibility, we still need the ability to read in
+  // both possible names for the admin port state. The production agent
+  // still writes out POWER_DOWN/UP instead of DISABLED/ENABLED. After
+  // another release, where we only write ENABLED/DISABLED we can get rid
+  // of this and use the NAMES_TO_VALUES map directly.
   std::unordered_map<std::string, cfg::PortState> transitionAdminStateMap{
       {"DISABLED", cfg::PortState::DISABLED},
       {"POWER_DOWN", cfg::PortState::DISABLED},
@@ -111,20 +107,24 @@ PortFields PortFields::fromFollyDynamic(const folly::dynamic& portJson) {
       {"UP", cfg::PortState::ENABLED},
   };
   auto itrAdminState = transitionAdminStateMap.find(
-      util::getCpp2EnumName(portJson[kPortState].asString()).c_str());
+    portJson[kPortState].asString());
   CHECK(itrAdminState != transitionAdminStateMap.end());
   port.adminState = itrAdminState->second;
   port.operState =
       OperState(portJson.getDefault(kPortOperState, false).asBool());
   port.ingressVlan = VlanID(portJson[kIngressVlan].asInt());
   auto itr_speed  = cfg::_PortSpeed_NAMES_TO_VALUES.find(
-      util::getCpp2EnumName(portJson[kPortSpeed].asString()).c_str());
+      portJson[kPortSpeed].asString().c_str());
   CHECK(itr_speed != cfg::_PortSpeed_NAMES_TO_VALUES.end());
   port.speed = cfg::PortSpeed(itr_speed->second);
-  auto itr_max_speed  = cfg::_PortSpeed_NAMES_TO_VALUES.find(
-      util::getCpp2EnumName(portJson[kPortMaxSpeed].asString()).c_str());
+  auto itr_max_speed = cfg::_PortSpeed_NAMES_TO_VALUES.find(
+      portJson[kPortMaxSpeed].asString().c_str());
   CHECK(itr_max_speed != cfg::_PortSpeed_NAMES_TO_VALUES.end());
   port.maxSpeed = cfg::PortSpeed(itr_max_speed->second);
+  auto itr_port_fec = cfg::_PortFEC_NAMES_TO_VALUES.find(
+    portJson.getDefault(kPortFEC, "OFF").asString().c_str());
+  CHECK(itr_port_fec != cfg::_PortFEC_NAMES_TO_VALUES.end());
+  port.fec = cfg::PortFEC(itr_port_fec->second);
   auto tx_pause_itr = portJson.find(kPortTxPause);
   if (tx_pause_itr != portJson.items().end()) {
     port.pause.tx = tx_pause_itr->second.asBool();
@@ -143,9 +143,11 @@ PortFields PortFields::fromFollyDynamic(const folly::dynamic& portJson) {
   if (portJson.count(kSflowEgressRate) > 0) {
     port.sFlowEgressRate = portJson[kSflowEgressRate].asInt();
   }
-  if (portJson.find(kTrafficPolicy) != portJson.items().end()) {
-    port.trafficPolicy =
-      TrafficPolicy::fromFollyDynamic(portJson[kTrafficPolicy]);
+  if (portJson.find(kQueues) != portJson.items().end()) {
+    for (const auto& queue : portJson[kQueues]) {
+      auto madeQueue = PortQueue::fromFollyDynamic(queue);
+      port.queues.emplace(std::make_pair(madeQueue->getID(), madeQueue));
+    }
   }
   return port;
 }

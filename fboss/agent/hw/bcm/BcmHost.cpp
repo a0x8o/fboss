@@ -21,18 +21,16 @@
 #include "fboss/agent/hw/bcm/BcmWarmBootCache.h"
 
 namespace {
-constexpr auto kVrf = "vrf";
-constexpr auto kIp = "ip";
+constexpr auto kIntf = "intf";
 constexpr auto kPort = "port";
 constexpr auto kNextHops = "nexthops";
-constexpr auto kEgress = "egress";
 
 std::string hostStr(const opennsl_l3_host_t& host) {
   std::ostringstream os;
   os << "is v6: " << (host.l3a_flags & OPENNSL_L3_IP6 ? "yes" : "no")
-    << " is multipath: "
+    << ", is multipath: "
     << (host.l3a_flags & OPENNSL_L3_MULTIPATH ? "yes": "no")
-    << " vrf: " << host.l3a_vrf << " intf: " << host.l3a_intf;
+    << ", vrf: " << host.l3a_vrf << ", intf: " << host.l3a_intf;
   return os.str();
 }
 }
@@ -44,30 +42,52 @@ using std::shared_ptr;
 using folly::MacAddress;
 using folly::IPAddress;
 
-BcmHost::BcmHost(const BcmSwitch* hw, opennsl_vrf_t vrf, const IPAddress& addr,
-    opennsl_if_t referenced_egress)
-      : hw_(hw), vrf_(vrf), addr_(addr),
-      egressId_(referenced_egress) {
-  hw_->writableHostTable()->incEgressReference(egressId_);
+void BcmHost::setEgressId(opennsl_if_t eid) {
+  if (eid == egressId_) {
+    // This could happen for loopback interface route.
+    // For example, for the loopback interface address, 1.1.1.1/32.
+    // The route's nexthop is 1.1.1.1. We will first create a BcmHost for
+    // the nexthop, 1.1.1.1, and assign the egress ID to this BcmHost.
+    // Then, the interface route, 1.1.1.1/32, will be represented by the
+    // same BcmHost and BcmHost::setEgressId() will be called with the
+    // egress ID retrieved from the nexthop BcmHost, which is exactly the same
+    // as the BcmHost object.
+    return;
+  }
+  if (egressId_ != BcmEgressBase::INVALID) {
+    hw_->writableHostTable()->derefEgress(egressId_);
+  }
+  hw_->writableHostTable()->incEgressReference(eid);
+  VLOG(3) << "set host object for " << key_.str()
+          << " to @egress " << eid
+          << " from @egress " << egressId_;
+  egressId_ = eid;
 }
 
 void BcmHost::initHostCommon(opennsl_l3_host_t *host) const {
   opennsl_l3_host_t_init(host);
-  if (addr_.isV4()) {
-    host->l3a_ip_addr = addr_.asV4().toLongHBO();
+  const auto& addr = key_.addr();
+  if (addr.isV4()) {
+    host->l3a_ip_addr = addr.asV4().toLongHBO();
   } else {
-    memcpy(&host->l3a_ip6_addr, addr_.asV6().toByteArray().data(),
+    memcpy(&host->l3a_ip6_addr, addr.asV6().toByteArray().data(),
            sizeof(host->l3a_ip6_addr));
     host->l3a_flags |= OPENNSL_L3_IP6;
   }
-  host->l3a_vrf = vrf_;
+  host->l3a_vrf = key_.getVrf();
   host->l3a_intf = getEgressId();
 }
 
-void BcmHost::addBcmHost(bool isMultipath, bool replace) {
-  if (added_) {
+void BcmHost::addToBcmHostTable(bool isMultipath, bool replace) {
+  if (addedInHW_) {
     return;
   }
+  const auto& addr = key_.addr();
+  if (addr.isV6() && addr.isLinkLocal()) {
+    // For v6 link-local BcmHost, do not add it to the HW table
+    return;
+  }
+
   opennsl_l3_host_t host;
   initHostCommon(&host);
   if (isMultipath) {
@@ -77,7 +97,7 @@ void BcmHost::addBcmHost(bool isMultipath, bool replace) {
     host.l3a_flags |= OPENNSL_L3_REPLACE;
   }
   const auto warmBootCache = hw_->getWarmBootCache();
-  auto vrfIp2HostCitr = warmBootCache->findHost(vrf_, addr_);
+  auto vrfIp2HostCitr = warmBootCache->findHost(key_.getVrf(), addr);
   if (vrfIp2HostCitr != warmBootCache->vrfAndIP2Host_end()) {
     // Lambda to compare if hosts are equivalent
     auto equivalent =
@@ -94,22 +114,22 @@ void BcmHost::addBcmHost(bool isMultipath, bool replace) {
         existingHost.l3a_intf == newHost.l3a_intf;
     };
     if (!equivalent(host, vrfIp2HostCitr->second)) {
-      LOG (FATAL) << "Host entries should never change, addr: " << addr_
+      LOG (FATAL) << "Host entries should never change, addr: " << addr
         <<" existing: " << hostStr(vrfIp2HostCitr->second)
         <<" new: " << hostStr(host);
     } else {
-      VLOG(1) << "Host entry for : " << addr_ << " already exists";
+      VLOG(1) << "Host entry for : " << addr << " already exists";
     }
     warmBootCache->programmed(vrfIp2HostCitr);
   } else {
-    VLOG(3) << "Adding host entry for : " << addr_;
+    VLOG(3) << "Adding host entry for : " << addr;
     auto rc = opennsl_l3_host_add(hw_->getUnit(), &host);
-    bcmCheckError(rc, "failed to program L3 host object for ", addr_.str(),
+    bcmCheckError(rc, "failed to program L3 host object for ", key_.str(),
       " @egress ", getEgressId());
-    VLOG(3) << "created L3 host object for " << addr_.str()
+    VLOG(3) << "created L3 host object for " << key_.str()
     << " @egress " << getEgressId();
   }
-  added_ = true;
+  addedInHW_ = true;
 }
 
 void BcmHost::program(opennsl_if_t intf, const MacAddress* mac,
@@ -125,13 +145,15 @@ void BcmHost::program(opennsl_if_t intf, const MacAddress* mac,
       hw_->writableHostTable()->getEgressObjectIf(egressId_));
   }
   CHECK(egressPtr);
+  const auto& addr = key_.addr();
+  const auto vrf = key_.getVrf();
   if (mac) {
-    egressPtr->programToPort(intf, vrf_, addr_, *mac, port);
+    egressPtr->programToPort(intf, vrf, addr, *mac, port);
   } else {
     if (action == DROP) {
-      egressPtr->programToDrop(intf, vrf_, addr_);
+      egressPtr->programToDrop(intf, vrf, addr);
     } else {
-      egressPtr->programToCPU(intf, vrf_, addr_);
+      egressPtr->programToCPU(intf, vrf, addr);
     }
   }
   if (createdEgress) {
@@ -140,8 +162,8 @@ void BcmHost::program(opennsl_if_t intf, const MacAddress* mac,
   }
 
   // if no host was added already, add one pointing to the egress object
-  if (!added_) {
-    addBcmHost();
+  if (!addedInHW_) {
+    addToBcmHostTable();
   }
 
   VLOG(1) << "Updating egress " << egressPtr->getID() << " from "
@@ -224,7 +246,7 @@ void BcmHost::programToTrunk(opennsl_if_t intf,
   }
   CHECK(egress);
 
-  egress->programToTrunk(intf, vrf_, addr_, mac, trunk);
+  egress->programToTrunk(intf, key_.getVrf(), key_.addr(), mac, trunk);
 
   if (createdEgress) {
     egressId_ = createdEgress->getID();
@@ -232,8 +254,8 @@ void BcmHost::programToTrunk(opennsl_if_t intf,
   }
 
   // if no host was added already, add one pointing to the egress object
-  if (!added_) {
-    addBcmHost();
+  if (!addedInHW_) {
+    addToBcmHostTable();
   }
 
   VLOG(1) << "Updating egress " << egress->getID() << " from "
@@ -258,14 +280,19 @@ bool BcmHost::isTrunk() const {
 }
 
 BcmHost::~BcmHost() {
-  if (!added_) {
+  if (addedInHW_) {
+    opennsl_l3_host_t host;
+    initHostCommon(&host);
+    auto rc = opennsl_l3_host_delete(hw_->getUnit(), &host);
+    bcmLogFatal(rc, hw_, "failed to delete L3 host object for ", key_.str());
+    VLOG(3) << "deleted L3 host object for " << key_.str();
+  } else {
+    VLOG(3) << "No need to delete L3 host object for " << key_.str()
+            << " as it was not added to the HW before";
+  }
+  if (egressId_ == BcmEgressBase::INVALID) {
     return;
   }
-  opennsl_l3_host_t host;
-  initHostCommon(&host);
-  auto rc = opennsl_l3_host_delete(hw_->getUnit(), &host);
-  bcmLogFatal(rc, hw_, "failed to delete L3 host object for ", addr_.str());
-  VLOG(3) << "deleted L3 host object for " << addr_.str();
   if (isPortOrTrunkSet()) {
     hw_->writableHostTable()->unresolved(egressId_);
   }
@@ -279,26 +306,24 @@ BcmHost::~BcmHost() {
   hw_->writableHostTable()->derefEgress(egressId_);
 }
 
-BcmEcmpHost::BcmEcmpHost(const BcmSwitch *hw, opennsl_vrf_t vrf,
-                         const RouteNextHopSet& fwd)
-    : hw_(hw), vrf_(vrf) {
+BcmEcmpHost::BcmEcmpHost(const BcmSwitchIf *hw,
+                         BcmEcmpHostKey key)
+    : hw_(hw), vrf_(key.first) {
+  auto& fwd = key.second;
   CHECK_GT(fwd.size(), 0);
   BcmHostTable *table = hw_->writableHostTable();
   BcmEcmpEgress::Paths paths;
-  RouteNextHopSet prog;
-  prog.reserve(fwd.size());
+  std::vector<const RouteNextHop *> prog;
   SCOPE_FAIL {
-    for (const auto& nhop : prog) {
-      table->derefBcmHost(vrf, nhop.addr());
+    for (auto nhopPtr : prog) {
+      table->derefBcmHost(BcmHostKey(vrf_, *nhopPtr));
     }
   };
   // allocate a BcmHost object for each path in this ECMP
   int total = 0;
   for (const auto& nhop : fwd) {
-    auto host = table->incRefOrCreateBcmHost(vrf, nhop.addr());
-    auto ret = prog.emplace(RouteNextHop::createForward(
-                                nhop.addr(), nhop.intf()));
-    CHECK(ret.second);
+    auto host = table->incRefOrCreateBcmHost(BcmHostKey(vrf_, nhop));
+    prog.push_back(&nhop);
     // TODO:
     // Ideally, we should have the nexthop resolved already and programmed in
     // HW. If not, SW can preemptively trigger neighbor discovery and then
@@ -320,7 +345,7 @@ BcmEcmpHost::BcmEcmpHost(const BcmSwitch *hw, opennsl_vrf_t vrf,
     ecmpEgressId_ = egressId_;
     hw_->writableHostTable()->insertBcmEgress(std::move(ecmp));
   }
-  fwd_ = std::move(prog);
+  fwd_ = std::move(fwd);
 }
 
 BcmEcmpHost::~BcmEcmpHost() {
@@ -330,11 +355,11 @@ BcmEcmpHost::~BcmEcmpHost() {
   hw_->writableHostTable()->derefEgress(ecmpEgressId_);
   BcmHostTable *table = hw_->writableHostTable();
   for (const auto& nhop : fwd_) {
-    table->derefBcmHost(vrf_, nhop.addr());
+    table->derefBcmHost(BcmHostKey(vrf_, nhop));
   }
 }
 
-BcmHostTable::BcmHostTable(const BcmSwitch *hw) : hw_(hw) {
+BcmHostTable::BcmHostTable(const BcmSwitchIf *hw) : hw_(hw) {
   auto port2EgressIds = std::make_shared<PortAndEgressIdsMap>();
   port2EgressIds->publish();
   setPort2EgressIdsInternal(port2EgressIds);
@@ -343,85 +368,79 @@ BcmHostTable::BcmHostTable(const BcmSwitch *hw) : hw_(hw) {
 BcmHostTable::~BcmHostTable() {
 }
 
-template<typename KeyT, typename HostT, typename... Args>
-HostT* BcmHostTable::incRefOrCreateBcmHost(
-    HostMap<KeyT, HostT>* map, const KeyT& key, Args... args) {
-  auto ret = map->emplace(key, std::make_pair(nullptr, 1));
-  auto& iter = ret.first;
-  if (!ret.second) {
+template<typename KeyT, typename HostT>
+HostT* BcmHostTable::incRefOrCreateBcmHostImpl(
+    HostMap<KeyT, HostT>* map,
+    const KeyT& key) {
+  auto iter = map->find(key);
+  if (iter != map->cend()) {
     // there was an entry already there
     iter->second.second++;  // increase the reference counter
     return iter->second.first.get();
   }
-  SCOPE_FAIL {
-    map->erase(iter);
-  };
-  auto newHost = std::make_unique<HostT>(hw_, key.first, key.second, args...);
+  auto newHost = std::make_unique<HostT>(hw_, key);
   auto hostPtr = newHost.get();
-  iter->second.first = std::move(newHost);
+  auto ret = map->emplace(key, std::make_pair(std::move(newHost), 1));
+  CHECK_EQ(ret.second, true)
+    << "must insert BcmHost/BcmEcmpHost as a new entry in this case";
   return hostPtr;
 }
 
-BcmHost* BcmHostTable::incRefOrCreateBcmHost(
-    opennsl_vrf_t vrf, const IPAddress& addr) {
-  return incRefOrCreateBcmHost(&hosts_, std::make_pair(vrf, addr));
-}
-
-BcmHost* BcmHostTable::incRefOrCreateBcmHost(
-    opennsl_vrf_t vrf, const IPAddress& addr, opennsl_if_t egressId) {
-  return incRefOrCreateBcmHost(&hosts_, std::make_pair(vrf, addr), egressId);
+BcmHost* BcmHostTable::incRefOrCreateBcmHost(const BcmHostKey& hostKey) {
+  return incRefOrCreateBcmHostImpl(&hosts_, hostKey);
 }
 
 BcmEcmpHost* BcmHostTable::incRefOrCreateBcmEcmpHost(
-    opennsl_vrf_t vrf, const RouteNextHopSet& fwd) {
-  return incRefOrCreateBcmHost(&ecmpHosts_, std::make_pair(vrf, fwd));
+    const BcmEcmpHostKey& key) {
+  return incRefOrCreateBcmHostImpl(&ecmpHosts_, key);
 }
 
-template<typename KeyT, typename HostT, typename... Args>
-HostT* BcmHostTable::getBcmHostIf(const HostMap<KeyT, HostT>* map,
-                                  Args... args) const {
-  KeyT key{args...};
+template<typename KeyT, typename HostT>
+HostT* BcmHostTable::getBcmHostIfImpl(
+    const HostMap<KeyT, HostT>* map,
+    const KeyT& key) const noexcept {
   auto iter = map->find(key);
-  if (iter == map->end()) {
+  if (iter == map->cend()) {
     return nullptr;
   }
   return iter->second.first.get();
 }
 
-BcmHost* BcmHostTable::getBcmHostIf(opennsl_vrf_t vrf,
-                                    const IPAddress& addr) const {
-  return getBcmHostIf(&hosts_, vrf, addr);
-}
-
 BcmHost* BcmHostTable::getBcmHost(
-    opennsl_vrf_t vrf, const IPAddress& addr) const {
-  auto host = getBcmHostIf(vrf, addr);
+    const BcmHostKey& key) const {
+  auto host = getBcmHostIf(key);
   if (!host) {
-    throw FbossError("Cannot find BcmHost vrf=", vrf, " addr=", addr);
+    throw FbossError("Cannot find BcmHost key=", key);
   }
   return host;
-}
-
-BcmEcmpHost* BcmHostTable::getBcmEcmpHostIf(
-    opennsl_vrf_t vrf, const RouteNextHopSet& fwd) const {
-  return getBcmHostIf(&ecmpHosts_, vrf, fwd);
 }
 
 BcmEcmpHost* BcmHostTable::getBcmEcmpHost(
-    opennsl_vrf_t vrf, const RouteNextHopSet& fwd) const {
-  auto host = getBcmEcmpHostIf(vrf, fwd);
+    const BcmEcmpHostKey& key) const {
+  auto host = getBcmEcmpHostIf(key);
   if (!host) {
-    throw FbossError("Cannot find BcmEcmpHost vrf=", vrf, " fwd=", fwd);
+    throw FbossError("Cannot find BcmEcmpHost vrf=", key.first,
+                     " fwd=", key.second);
   }
   return host;
 }
 
-template<typename KeyT, typename HostT, typename... Args>
-HostT* BcmHostTable::derefBcmHost(HostMap<KeyT, HostT>* map,
-                                  Args... args) noexcept {
-  KeyT key{args...};
+BcmHost* BcmHostTable::getBcmHostIf(
+    const BcmHostKey& key) const noexcept {
+  return getBcmHostIfImpl(&hosts_, key);
+}
+
+BcmEcmpHost* BcmHostTable::getBcmEcmpHostIf(
+    const BcmEcmpHostKey& key) const noexcept {
+  return getBcmHostIfImpl(&ecmpHosts_, key);
+}
+
+template<typename KeyT, typename HostT>
+HostT* BcmHostTable::derefBcmHostImpl(
+    HostMap<KeyT, HostT>* map,
+    const KeyT& key) noexcept {
   auto iter = map->find(key);
-  if (iter == map->end()) {
+  if (iter == map->cend()) {
     return nullptr;
   }
   auto& entry = iter->second;
@@ -434,13 +453,13 @@ HostT* BcmHostTable::derefBcmHost(HostMap<KeyT, HostT>* map,
 }
 
 BcmHost* BcmHostTable::derefBcmHost(
-    opennsl_vrf_t vrf, const IPAddress& addr) noexcept {
-  return derefBcmHost(&hosts_, vrf, addr);
+    const BcmHostKey& key) noexcept {
+  return derefBcmHostImpl(&hosts_, key);
 }
 
 BcmEcmpHost* BcmHostTable::derefBcmEcmpHost(
-    opennsl_vrf_t vrf, const RouteNextHopSet& fwd) noexcept {
-  return derefBcmHost(&ecmpHosts_, vrf, fwd);
+    const BcmEcmpHostKey& key) noexcept {
+  return derefBcmHostImpl(&ecmpHosts_, key);
 }
 
 BcmEgressBase* BcmHostTable::incEgressReference(opennsl_if_t egressId) {
@@ -566,8 +585,11 @@ void BcmHostTable::warmBootHostEntriesSynced() {
 
 folly::dynamic BcmHost::toFollyDynamic() const {
   folly::dynamic host = folly::dynamic::object;
-  host[kVrf] = vrf_;
-  host[kIp] = addr_.str();
+  host[kVrf] = key_.getVrf();
+  host[kIp] = key_.addr().str();
+  if (key_.intfID().hasValue()) {
+    host[kIntf] = static_cast<uint32_t>(key_.intfID().value());
+  }
   host[kPort] = port_;
   host[kEgressId] = egressId_;
   if (egressId_ != BcmEgressBase::INVALID &&
@@ -582,7 +604,7 @@ folly::dynamic BcmEcmpHost::toFollyDynamic() const {
   folly::dynamic ecmpHost = folly::dynamic::object;
   ecmpHost[kVrf] = vrf_;
   folly::dynamic nhops = folly::dynamic::array;
-  for (auto& nhop: fwd_) {
+  for (const auto& nhop : fwd_) {
     nhops.push_back(nhop.toFollyDynamic());
   }
   ecmpHost[kNextHops] = std::move(nhops);

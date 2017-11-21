@@ -9,8 +9,10 @@
  */
 #include "fboss/agent/state/AggregatePort.h"
 #include "fboss/agent/state/NodeBase-defs.h"
+#include "fboss/agent/state/SwitchState.h"
 
 #include <algorithm>
+#include <tuple>
 #include <utility>
 
 namespace {
@@ -18,24 +20,69 @@ constexpr auto kId = "id";
 constexpr auto kName = "name";
 constexpr auto kDescription = "description";
 constexpr auto kSubports = "subports";
+constexpr auto kSystemID = "systemID";
+constexpr auto kSystemPriority = "systemPriority";
+constexpr auto kPortID = "portId";
+constexpr auto kRate = "rate";
+constexpr auto kActivity = "activity";
+constexpr auto kPriority = "priority";
+} // namespace
+
+namespace facebook {
+namespace fboss {
+
+folly::dynamic AggregatePortFields::Subport::toFollyDynamic() const {
+  folly::dynamic subport = folly::dynamic::object;
+  subport[kPortID] = static_cast<uint16_t>(portID);
+  subport[kPriority] = static_cast<uint16_t>(priority);
+  subport[kRate] = rate == cfg::LacpPortRate::FAST ? "fast" : "slow";
+  subport[kActivity] =
+      activity == cfg::LacpPortActivity::ACTIVE ? "active" : "passive";
+  return subport;
 }
 
-namespace facebook { namespace fboss {
+AggregatePortFields::Subport AggregatePortFields::Subport::fromFollyDynamic(
+    const folly::dynamic& json) {
+  cfg::LacpPortRate rate;
+  if (json[kRate] == "fast") {
+    rate = cfg::LacpPortRate::FAST;
+  } else {
+    CHECK_EQ(json[kRate], "slow");
+    rate = cfg::LacpPortRate::SLOW;
+  }
+
+  cfg::LacpPortActivity activity;
+  if (json[kActivity] == "activity") {
+    activity = cfg::LacpPortActivity::ACTIVE;
+  } else {
+    CHECK_EQ(json[kActivity], "passive");
+    activity = cfg::LacpPortActivity::PASSIVE;
+  }
+
+  // TODO(samank): check widths match up
+  auto id = static_cast<PortID>(json[kPortID].asInt());
+  auto priority = static_cast<uint16_t>(json[kPriority].asInt());
+  return Subport(id, priority, rate, activity);
+}
 
 AggregatePortFields::AggregatePortFields(
     AggregatePortID id,
     const std::string& name,
     const std::string& description,
+    uint16_t systemPriority,
+    folly::MacAddress systemID,
     Subports&& ports,
     AggregatePortFields::Forwarding fwd)
     : id_(id),
       name_(name),
       description_(description),
+      systemPriority_(systemPriority),
+      systemID_(systemID),
       ports_(std::move(ports)),
       portToFwdState_() {
-  for (const auto& port : ports_) {
+  for (const auto& subport : ports_) {
     auto hint = portToFwdState_.end();
-    portToFwdState_.emplace_hint(hint, port, fwd);
+    portToFwdState_.emplace_hint(hint, subport.portID, fwd);
   }
 }
 
@@ -45,10 +92,12 @@ folly::dynamic AggregatePortFields::toFollyDynamic() const {
   aggPortFields[kName] = name_;
   aggPortFields[kDescription] = description_;
   folly::dynamic subports = folly::dynamic::array;
-  for (const auto& port : ports_) {
-    subports.push_back(static_cast<uint16_t>(port));
+  for (const auto& subport : ports_) {
+    subports.push_back(subport.toFollyDynamic());
   }
   aggPortFields[kSubports] = std::move(subports);
+  aggPortFields[kSystemID] = systemID_.toString();
+  aggPortFields[kSystemPriority] = static_cast<uint16_t>(systemPriority_);
   return aggPortFields;
 }
 
@@ -59,13 +108,15 @@ AggregatePortFields AggregatePortFields::fromFollyDynamic(
   ports.reserve(json[kSubports].size());
 
   for (auto const& port : json[kSubports]) {
-    ports.emplace_hint(ports.cend(), PortID(port.getInt()));
+    ports.emplace_hint(ports.cend(), Subport::fromFollyDynamic(port));
   }
 
   return AggregatePortFields(
       AggregatePortID(json[kId].getInt()),
       json[kName].getString(),
       json[kDescription].getString(),
+      json[kSystemPriority].getInt(),
+      MacAddress(json[kSystemID].getString()),
       std::move(ports));
 }
 
@@ -74,6 +125,44 @@ AggregatePort::SubportsDifferenceType AggregatePort::subportsCount() const {
   return std::distance(subportsRange.begin(), subportsRange.end());
 }
 
+uint32_t AggregatePort::forwardingSubportCount() const {
+  uint32_t count = 0;
+
+  AggregatePort::Forwarding fwdState;
+  for (const auto& portAndState : subportAndFwdState()) {
+    std::tie(std::ignore, fwdState) = portAndState;
+    if (fwdState == Forwarding::ENABLED) {
+      ++count;
+    }
+  }
+
+  return count;
+}
+
+bool AggregatePort::isMemberPort(PortID port) const {
+  for (const auto memberPort : getFields()->ports_) {
+    if (memberPort.portID == port) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+AggregatePort* AggregatePort::modify(std::shared_ptr<SwitchState>* state) {
+  if (!isPublished()) {
+    CHECK(!(*state)->isPublished());
+    return this;
+  }
+
+  AggregatePortMap* aggPorts = (*state)->getAggregatePorts()->modify(state);
+  auto newAggPort = clone();
+  auto* ptr = newAggPort.get();
+  aggPorts->updateAggregatePort(std::move(newAggPort));
+  return ptr;
+}
+
 template class NodeBaseT<AggregatePort, AggregatePortFields>;
 
-}} // facebook::fboss
+} // namespace fboss
+} // namespace facebook

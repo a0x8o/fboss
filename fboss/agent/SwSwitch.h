@@ -35,12 +35,14 @@ class ArpHandler;
 class ChannelCloser;
 class IPv4Handler;
 class IPv6Handler;
+class LinkAggregationManager;
 class LldpManager;
 class PcapPushSubscriberAsyncClient;
 class PktCaptureManager;
 class Platform;
 class Port;
 class PortStats;
+class PortUpdateHandler;
 class RxPacket;
 class SwitchState;
 class SwitchStats;
@@ -57,7 +59,8 @@ enum SwitchFlags : int {
   ENABLE_TUN = 1,
   ENABLE_LLDP = 2,
   PUBLISH_STATS = 4,
-  ENABLE_NHOPS_PROBER = 8
+  ENABLE_NHOPS_PROBER = 8,
+  ENABLE_LACP = 16
 };
 
 inline SwitchFlags operator|=(SwitchFlags& a, const SwitchFlags b) {
@@ -94,6 +97,9 @@ class SwSwitch : public HwSwitch::Callback {
     StateUpdateFn;
 
   typedef std::function<void(const StateDelta&)> StateUpdatedCallback;
+
+  using AllThreadsSwitchStats =
+    folly::ThreadLocalPtr<SwitchStats, SwSwitch>::Accessor;
 
   explicit SwSwitch(std::unique_ptr<Platform> platform);
   ~SwSwitch() override;
@@ -326,6 +332,13 @@ class SwSwitch : public HwSwitch::Callback {
     return createSwitchStats();
   }
 
+  /**
+   * Get all SwitchStats for all threads
+   */
+  AllThreadsSwitchStats getAllThreadsSwitchStats() {
+    return stats_.accessAllThreads();
+  }
+
   /*
    * Construct and destroy a client to dump packets to the packet distribution
    * service.
@@ -390,6 +403,13 @@ class SwSwitch : public HwSwitch::Callback {
    */
   folly::EventBase* getUpdateEVB() {
     return &updateEventBase_;
+  }
+
+  /*
+   * Get the EventBase over which LacpController and LacpMachines should execute
+   */
+  folly::EventBase* getLacpEvb() {
+    return getBackgroundEVB();
   }
 
   /**
@@ -608,6 +628,9 @@ class SwSwitch : public HwSwitch::Callback {
   void publishRxPacket(RxPacket* packet, uint16_t ethertype);
   void publishTxPacket(TxPacket* packet, uint16_t ethertype);
 
+  void fetchAggregatePortTable(
+      std::vector<AggregatePortEntryThrift> &aggregatePortTable);
+
  private:
   void queueStateUpdateForGettingHwInSync(
       folly::StringPiece name,
@@ -788,11 +811,14 @@ class SwSwitch : public HwSwitch::Callback {
   std::unique_ptr<PktCaptureManager> pcapMgr_;
   std::unique_ptr<RouteUpdateLogger> routeUpdateLogger_;
   std::unique_ptr<UnresolvedNhopsProber> unresolvedNhopsProber_;
+  std::unique_ptr<LinkAggregationManager> lagManager_;
+
   BootType bootType_{BootType::UNINITIALIZED};
   std::unique_ptr<LldpManager> lldpManager_;
   std::unique_ptr<ThreadHeartbeat> bgThreadHeartbeat_;
   std::unique_ptr<ThreadHeartbeat> updThreadHeartbeat_;
   std::unique_ptr<ThreadHeartbeat> fbossPktTxThreadHeartbeat_;
+  std::unique_ptr<PortUpdateHandler> portUpdateHandler_;
   SwitchFlags flags_{SwitchFlags::DEFAULT};
 };
 

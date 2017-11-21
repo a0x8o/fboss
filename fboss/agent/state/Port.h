@@ -12,13 +12,13 @@
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/state/NodeBase.h"
-#include "fboss/agent/state/TrafficPolicy.h"
 
 #include <boost/container/flat_map.hpp>
 #include <string>
 
 namespace facebook { namespace fboss {
 
+class PortQueue;
 class SwitchState;
 
 struct PortFields {
@@ -34,7 +34,9 @@ struct PortFields {
     static VlanInfo fromFollyDynamic(const folly::dynamic& json);
     bool tagged;
   };
-  typedef boost::container::flat_map<VlanID, VlanInfo> VlanMembership;
+  using VlanMembership = boost::container::flat_map<VlanID, VlanInfo>;
+  using QueueConfig =
+    boost::container::flat_map<int, std::shared_ptr<PortQueue> >;
 
   enum class OperState {
     DOWN = 0,
@@ -65,7 +67,8 @@ struct PortFields {
   // packets randomly based on those settings. Zero means no sampling.
   int64_t sFlowIngressRate{0};
   int64_t sFlowEgressRate{0};
-  std::shared_ptr<TrafficPolicy> trafficPolicy;
+  QueueConfig queues;
+  cfg::PortFEC fec{cfg::PortFEC::OFF};  // TODO: should this default to ON?
 };
 
 /*
@@ -73,9 +76,10 @@ struct PortFields {
  */
 class Port : public NodeBaseT<Port, PortFields> {
  public:
-  typedef PortFields::VlanInfo VlanInfo;
-  typedef PortFields::VlanMembership VlanMembership;
-  typedef PortFields::OperState OperState;
+  using VlanInfo = PortFields::VlanInfo;
+  using VlanMembership = PortFields::VlanMembership;
+  using OperState = PortFields::OperState;
+  using QueueConfig = PortFields::QueueConfig;
 
   Port(PortID id, const std::string& name);
 
@@ -163,13 +167,12 @@ class Port : public NodeBaseT<Port, PortFields> {
     writableFields()->vlans.swap(vlans);
   }
 
-  const std::shared_ptr<TrafficPolicy> getTrafficPolicy() {
-    return getFields()->trafficPolicy;
+  const QueueConfig& getPortQueues() {
+    return getFields()->queues;
   }
 
-  void resetTrafficPolicy(
-      std::shared_ptr<TrafficPolicy> trafficPolicy) {
-    writableFields()->trafficPolicy.swap(trafficPolicy);
+  void resetPortQueues(QueueConfig& queues) {
+    writableFields()->queues.swap(queues);
   }
 
   VlanID getIngressVlan() const {
@@ -207,6 +210,14 @@ class Port : public NodeBaseT<Port, PortFields> {
   void setPause(cfg::PortPause pause) {
     writableFields()->pause = pause;
   }
+
+  cfg::PortFEC getFEC() const {
+    return getFields()->fec;
+  }
+  void setFEC(cfg::PortFEC fec) {
+    writableFields()->fec = fec;
+  }
+
 
   int64_t getSflowIngressRate() const {
     return getFields()->sFlowIngressRate;

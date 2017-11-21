@@ -8,8 +8,10 @@
  *
  */
 #include "fboss/agent/SwSwitch.h"
+
+#include <folly/Format.h>
 #include <folly/Range.h>
-#include <folly/ThreadName.h>
+#include <folly/system/ThreadName.h>
 
 namespace facebook { namespace fboss {
 

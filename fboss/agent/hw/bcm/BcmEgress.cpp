@@ -22,6 +22,19 @@ namespace facebook { namespace fboss {
 using folly::IPAddress;
 using folly::MacAddress;
 
+bool operator==(
+    const opennsl_l3_egress_t& lhs,
+    const opennsl_l3_egress_t& rhs) {
+  bool sameMacs = !memcmp(lhs.mac_addr, rhs.mac_addr, sizeof(lhs.mac_addr));
+  bool lhsTrunk = lhs.flags & OPENNSL_L3_TGID;
+  bool rhsTrunk = rhs.flags & OPENNSL_L3_TGID;
+  bool sameTrunks = lhsTrunk && rhsTrunk && lhs.trunk == rhs.trunk;
+  bool samePhysicalPorts = !lhsTrunk && !rhsTrunk && rhs.port == lhs.port;
+  bool samePorts = sameTrunks || samePhysicalPorts;
+  return sameMacs && samePorts && rhs.intf == lhs.intf &&
+      rhs.flags == lhs.flags;
+}
+
 bool BcmEgress::alreadyExists(const opennsl_l3_egress_t& newEgress) const {
   if (id_ == INVALID) {
     return false;
@@ -29,15 +42,7 @@ bool BcmEgress::alreadyExists(const opennsl_l3_egress_t& newEgress) const {
   opennsl_l3_egress_t existingEgress;
   auto rv = opennsl_l3_egress_get(hw_->getUnit(), id_, &existingEgress);
   bcmCheckError(rv, "Egress object ", id_, " does not exist");
-  bool sameMacs = !memcmp(newEgress.mac_addr, existingEgress.mac_addr,
-                          sizeof(newEgress.mac_addr));
-  // Note that for the trunk field of an egress object to be valid,
-  // the object's flag must have its BCM_L3_TGID flag set. This is
-  // checked in the return expression.
-  bool samePorts = existingEgress.trunk == newEgress.trunk ||
-      existingEgress.port == newEgress.port;
-  return sameMacs && samePorts && existingEgress.intf == newEgress.intf &&
-      existingEgress.flags == newEgress.flags;
+  return newEgress == existingEgress;
 }
 
 void BcmEgress::verifyDropEgress(int unit) {
@@ -70,7 +75,8 @@ void BcmEgress::program(opennsl_if_t intfId, opennsl_vrf_t vrf,
   bool addOrUpdateEgress = false;
   const auto warmBootCache = hw_->getWarmBootCache();
   CHECK(warmBootCache);
-  auto egressId2EgressAndBoolCitr = warmBootCache->findEgress(vrf, ip);
+  auto egressId2EgressAndBoolCitr = warmBootCache->findEgressFromHost(
+      vrf, ip, intfId);
   if (egressId2EgressAndBoolCitr !=
       warmBootCache->egressId2EgressAndBool_end()) {
     // Lambda to compare with existing egress to know if should reprogram
@@ -108,10 +114,13 @@ void BcmEgress::program(opennsl_if_t intfId, opennsl_vrf_t vrf,
     id_ = existingEgressId;
     auto existingEgressObject = egressId2EgressAndBoolCitr->second.first;
     if (!equivalent(eObj, existingEgressObject)) {
-      VLOG(1) << "Updating egress object for next hop : " << ip;
+      VLOG(1) << "Updating egress object for next hop : " << ip
+              << " @ brcmif " << intfId;
       addOrUpdateEgress = true;
     } else {
-      VLOG(1) << "Egress object for : " << ip << " already exists";
+      VLOG(1) << "Egress object for : " << ip
+              << " @ brcmif " << intfId
+              << " already exists";
     }
   } else {
     addOrUpdateEgress = true;
@@ -119,7 +128,8 @@ void BcmEgress::program(opennsl_if_t intfId, opennsl_vrf_t vrf,
   if (addOrUpdateEgress) {
     if (egressId2EgressAndBoolCitr ==
         warmBootCache->egressId2EgressAndBool_end()) {
-      VLOG(1) << "Adding egress object for next hop : " << ip;
+      VLOG(1) << "Adding egress object for next hop : " << ip
+              << " @ brcmif " << intfId;
     }
     uint32_t flags = 0;
     if (id_ != INVALID) {
@@ -141,22 +151,26 @@ void BcmEgress::program(opennsl_if_t intfId, opennsl_vrf_t vrf,
           " on unit ", hw_->getUnit());
       VLOG(3) << "programmed L3 egress object " << id_ << " for "
               << ((mac) ? mac->toString() : "to CPU") << " on unit "
-              << hw_->getUnit() << " for ip: " << ip << " flags " << eObj.flags
+              << hw_->getUnit() << " for ip: " << ip
+              << " @ brcmif " << intfId
+              << " flags " << eObj.flags
               << " towards port " << eObj.port;
-      if (mac != nullptr) {
-        mac_ = *mac;
-      }
-      intfId_ = intfId;
     } else {
-      // TODO(t10268453): How can we get here? The entries were not equivalent
-      // when we entered this ' if (addOrUpdateEgress) ' condition. Is the
-      // difference between what is in BcmWarmBootCache and what is in the
-      // hardware?
-      VLOG(1) << "Identical egress object for : " << ip << " pointing to "
-        << (mac ? mac->toString() : "CPU ") << " already exists "
-        << "skipping egress programming ";
+      // This could happen when neighbor entry is confirmed with the same MAC
+      // after warmboot, as it will trigger another egress programming with the
+      // same MAC.
+      VLOG(1) << "Identical egress object for : " << ip
+              << " @ brcmif " << intfId
+              << " pointing to "
+              << (mac ? mac->toString() : "CPU ") << " already exists "
+              << "skipping egress programming ";
     }
   }
+  // update our internal fields
+  mac_ = (mac != nullptr) ? *mac : folly::MacAddress{};
+  intfId_ = intfId;
+
+  // update warmboot cache if needed
   if (egressId2EgressAndBoolCitr !=
       warmBootCache->egressId2EgressAndBool_end()) {
     warmBootCache->programmed(egressId2EgressAndBoolCitr);

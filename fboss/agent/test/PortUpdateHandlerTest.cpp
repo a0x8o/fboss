@@ -7,6 +7,9 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
+
+#include <gtest/gtest.h>
+
 #include "fboss/agent/SwitchStats.h"
 #include "fboss/agent/PortUpdateHandler.h"
 #include "fboss/agent/state/Port.h"
@@ -16,8 +19,6 @@
 #include "fboss/agent/test/CounterCache.h"
 #include "fboss/agent/test/TestUtils.h"
 #include "fboss/agent/test/HwTestHandle.h"
-
-#include <gtest/gtest.h>
 
 using namespace facebook::fboss;
 using std::string;
@@ -57,8 +58,6 @@ public:
   void expectPortCounterExist(CounterCache& counters,
                               std::shared_ptr<PortMap> ports) {
     for (const auto& port: *ports) {
-      EXPECT_TRUE(counters.checkExist(port->getName() +
-                                       ".link_state.flap.sum"));
       EXPECT_TRUE(counters.checkExist(port->getName() + ".up"));
       EXPECT_EQ(counters.value(port->getName() + ".up"), port->isUp());
     }
@@ -69,6 +68,10 @@ public:
     for (const auto& port: *ports) {
       EXPECT_FALSE(counters.checkExist(port->getName() + ".up"));
     }
+  }
+
+  void TearDown() override {
+    sw = nullptr;
   }
 
   SwSwitch* sw{nullptr};
@@ -101,7 +104,7 @@ TEST_F(PortUpdateHandlerTest, PortAdded) {
   // make sure original PortStats still exist
   expectPortCounterExist(counters, initPorts);
   // make sure PortStats for port 21 is also created
-  EXPECT_TRUE(counters.checkExist("port21.link_state.flap.sum"));
+  // EXPECT_TRUE(counters.checkExist("port21.link_state.flap.sum"));
   EXPECT_TRUE(counters.checkExist("port21.up"));
   EXPECT_EQ(counters.value("port21.up"), 0);
 }

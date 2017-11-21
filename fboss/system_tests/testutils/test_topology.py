@@ -4,6 +4,7 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 from fboss.thrift_clients import FbossAgentClient, QsfpServiceClient
+from fboss.netlink_manager.netlink_manager_client import NetlinkManagerClient
 from fboss.system_tests.testutils.test_client import TestClient
 from neteng.fboss.ttypes import FbossBaseError
 
@@ -91,8 +92,7 @@ class FBOSSTestTopology(object):
             qsfp_port = QsfpServiceClient.DEFAULT_PORT
         self.port = port
         self.qsfp_port = qsfp_port
-        self.log = logging.getLogger(__name__)
-        self.log.setLevel(logging.getLevelName('DEBUG'))
+        self.log = logging.getLogger("__main__")
         self.switch = switch
         self.test_hosts = {}
 
@@ -101,7 +101,7 @@ class FBOSSTestTopology(object):
         self.test_hosts[host.name] = host
 
     def remove_host(self, host):
-        if host in self.test_hosts:
+        if host in self.test_hosts.values():
             del self.test_hosts[host.name]
         else:
             raise FbossTestException("host not in test topology: %s" % host)
@@ -132,7 +132,7 @@ class FBOSSTestTopology(object):
                     if not client.status():
                         bad_hosts.append(host)
                     else:
-                        self.log.info("Verified host %s" % host.name)
+                        self.log.debug("Verified host %s" % host.name)
             except (FbossBaseError, TTransportException):
                 bad_hosts.append(host)
         if bad_hosts:
@@ -154,6 +154,9 @@ class FBOSSTestTopology(object):
     def qsfp_thrift(self):
         return QsfpServiceClient(self.switch, self.qsfp_port)
 
+    def netlink_manager_thrift(self):
+        return NetlinkManagerClient(self.switch, NetlinkManagerClient.DEFAULT_PORT)
+
     def hosts(self):
         return self.test_hosts.values()
 
@@ -169,3 +172,13 @@ class FBOSSTestTopology(object):
     def host_ips(self, hostname):
         self._valid_testhost(hostname)
         return self.test_hosts[hostname].ips()
+
+    def get_switch_port_id_from_ip(self, host_binary_ip):
+        # TODO(ashwinp): Add support for ARP.
+        with self.switch_thrift() as sw_client:
+                ndp_entries = sw_client.getNdpTable()
+                for ndp_entry in ndp_entries:
+                    if ndp_entry.ip == host_binary_ip:
+                        return ndp_entry.port
+
+        return None

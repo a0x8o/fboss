@@ -10,6 +10,8 @@
 
 #include "QsfpClient.h"
 
+#include <thrift/lib/cpp/async/TAsyncSocket.h>
+
 namespace facebook { namespace fboss {
 
 static constexpr int kQsfpServicePort = 5910;
@@ -30,7 +32,7 @@ QsfpClient::createClient(folly::EventBase* eb) {
     auto channel = apache::thrift::HeaderClientChannel::newChannel(socket);
     return std::make_unique<QsfpServiceAsyncClient>(std::move(channel));
   };
-  return folly::via(eb).then(createClient);
+  return folly::via(eb, createClient);
 }
 
 // static

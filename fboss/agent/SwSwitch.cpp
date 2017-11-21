@@ -16,6 +16,7 @@
 #include "common/stats/ServiceData.h"
 #include "fboss/agent/ArpHandler.h"
 #include "fboss/agent/Constants.h"
+#include "fboss/agent/LacpTypes.h"
 #include "fboss/agent/IPv4Handler.h"
 #include "fboss/agent/IPv6Handler.h"
 #include "fboss/agent/RouteUpdateLogger.h"
@@ -25,6 +26,7 @@
 #include "fboss/agent/HwSwitch.h"
 #include "fboss/agent/Platform.h"
 #include "fboss/agent/PortStats.h"
+#include "fboss/agent/PortUpdateHandler.h"
 #include "fboss/agent/RxPacket.h"
 #include "fboss/agent/TunManager.h"
 #include "fboss/agent/TxPacket.h"
@@ -33,6 +35,7 @@
 #include "fboss/agent/capture/PktCaptureManager.h"
 #include "fboss/pcap_distribution_service/if/gen-cpp2/PcapPushSubscriber.h"
 #include "fboss/pcap_distribution_service/if/gen-cpp2/pcap_pubsub_constants.h"
+#include "fboss/agent/LinkAggregationManager.h"
 #include "fboss/agent/packet/EthHdr.h"
 #include "fboss/agent/packet/IPv4Hdr.h"
 #include "fboss/agent/packet/IPv6Hdr.h"
@@ -133,32 +136,6 @@ facebook::fboss::PortStatus fillInPortStatus(
   }
   return status;
 }
-
-string getPortUpName(const shared_ptr<facebook::fboss::Port>& port) {
-  return port->getName().empty()
-    ? folly::to<string>("port", port->getID(), ".up")
-    : port->getName() + ".up";
-}
-
-inline void updatePortStatusCounters(const facebook::fboss::StateDelta& delta) {
-  facebook::fboss::DeltaFunctions::forEachChanged(
-      delta.getPortsDelta(),
-      [&](const shared_ptr<facebook::fboss::Port>& oldPort,
-          const shared_ptr<facebook::fboss::Port>& newPort) {
-        if (oldPort->getName() == newPort->getName()) {
-          return;
-        }
-        facebook::fbData->clearCounter(getPortUpName(oldPort));
-        facebook::fbData->setCounter(getPortUpName(newPort), newPort->isUp());
-      },
-      [&](const shared_ptr<facebook::fboss::Port>& newPort) {
-        facebook::fbData->setCounter(getPortUpName(newPort), newPort->isUp());
-      },
-      [&](const shared_ptr<facebook::fboss::Port>& oldPort) {
-        facebook::fbData->clearCounter(getPortUpName(oldPort));
-      });
-}
-
 } // anonymous namespace
 
 namespace facebook { namespace fboss {
@@ -186,7 +163,8 @@ SwSwitch::SwSwitch(std::unique_ptr<Platform> platform)
     ipv6_(new IPv6Handler(this)),
     nUpdater_(new NeighborUpdater(this)),
     pcapMgr_(new PktCaptureManager(this)),
-    routeUpdateLogger_(new RouteUpdateLogger(this)) {
+    routeUpdateLogger_(new RouteUpdateLogger(this)),
+    portUpdateHandler_(new PortUpdateHandler(this)) {
   // Create the platform-specific state directories if they
   // don't exist already.
   utilCreateDir(platform_->getVolatileStateDir());
@@ -255,10 +233,17 @@ void SwSwitch::stop() {
   // packet handling callback as well while stopping the switch.
   //
   portRemediator_.reset();
+
   nUpdater_.reset();
+
   if (lldpManager_) {
     lldpManager_->stop();
   }
+
+  if (lagManager_) {
+    lagManager_.reset();
+  }
+
   if (unresolvedNhopsProber_) {
     unresolvedNhopsProber_.reset();
   }
@@ -429,6 +414,34 @@ void SwSwitch::publishTxPacket(TxPacket* pkt, uint16_t ethertype){
       .onError(std::move(onError));
 }
 
+void SwSwitch::fetchAggregatePortTable(
+    std::vector<AggregatePortEntryThrift> &aggregatePortTable) {
+  auto aggrPorts = getState()->getAggregatePorts();
+  PortID subportID;
+  AggregatePort::Forwarding fwdState;
+  aggregatePortTable.clear();
+  aggregatePortTable.reserve(aggrPorts->size());
+  for (const auto& aggPort : *aggrPorts) {
+    AggregatePortEntryThrift aggrPortEntry;
+    aggrPortEntry.aggregatePortId = aggPort->getID();
+    std::vector<SubportThrift> subports;
+    auto subportAndFwdState = aggPort->subportAndFwdState();
+    subports.reserve(subportAndFwdState.size());
+    for (const auto& portAndState : subportAndFwdState) {
+      SubportThrift subport;
+      std::tie(subportID, fwdState) = portAndState;
+      if (!subportID) continue;
+      subport.id = subportID;
+      subport.isForwardingEnabled =
+          (fwdState == AggregatePortFields::Forwarding::ENABLED);
+      subports.push_back(subport);
+    }
+    aggrPortEntry.subports = subports;
+    aggregatePortTable.push_back(aggrPortEntry);
+  }
+}
+
+
 void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
   auto begin = steady_clock::now();
   flags_ = flags;
@@ -441,10 +454,6 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
 
   VLOG(0) << "hardware initialized in " <<
     hwInitRet.bootTime << " seconds; applying initial config";
-
-  for (const auto& port : (*initialState->getPorts())) {
-    fbData->setCounter(getPortUpName(port), 0);
-  }
 
   // Store the initial state
   initialState->publish();
@@ -519,6 +528,10 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
         StateDelta(std::make_shared<SwitchState>(), getState()));
   }
 
+  if (flags & SwitchFlags::ENABLE_LACP) {
+    lagManager_ = std::make_unique<LinkAggregationManager>(this);
+  }
+
   auto bgHeartbeatStatsFunc = [this] (int delay, int backLog) {
     stats()->bgHeartbeatDelay(delay);
     stats()->bgEventBacklog(backLog);
@@ -578,7 +591,7 @@ void SwSwitch::initialConfigApplied(const steady_clock::time_point& startTime) {
   }
 
   if (lldpManager_) {
-      lldpManager_->start();
+    lldpManager_->start();
   }
 
   if (flags_ & SwitchFlags::PUBLISH_STATS) {
@@ -655,7 +668,6 @@ void SwSwitch::notifyStateObservers(const StateDelta& delta) {
     // Make sure the SwSwitch is not already being destroyed
     return;
   }
-  updatePortStatusCounters(delta);
   for (auto observerName : stateObservers_) {
     try {
       auto observer = observerName.first;
@@ -823,8 +835,14 @@ void SwSwitch::handlePendingUpdates() {
       // as a state update at the beginning
       queueStateUpdateForGettingHwInSync(
           kOutOfSyncStateUpdate,
-          [newDesiredState](const std::shared_ptr<SwitchState>& /*oldState*/) {
-            return newDesiredState;
+          [newDesiredState, newAppliedState](
+              const std::shared_ptr<SwitchState>& /*oldState*/) {
+            // clone the newDesiredState and then inheritGeneration from
+            // newAppliedState otherwise the return state has a smaller gen#
+            // than the one of appliedState
+            auto hwOutOfSyncState = newDesiredState->clone();
+            hwOutOfSyncState->inheritGeneration(*newAppliedState);
+            return hwOutOfSyncState;
           });
       if (!isExiting() && !oldOutOfSync) {
         stats()->setHwOutOfSync();
@@ -972,11 +990,24 @@ std::shared_ptr<SwitchState> SwSwitch::applyUpdate(
 }
 
 PortStats* SwSwitch::portStats(PortID portID) {
-  return stats()->port(portID);
+  auto portStats = stats()->port(portID);
+  if (portStats) {
+    return portStats;
+  }
+  auto portIf = getState()->getPorts()->getPortIf(portID);
+  if (portIf) {
+    // get portName from current state
+    return stats()->createPortStats(
+      portID, getState()->getPort(portID)->getName());
+  } else {
+    // only for port0 case
+    VLOG(0) << "Port node doesn't exist, use default name=port" << portID;
+    return stats()->createPortStats(portID, folly::to<string>("port", portID));
+  }
 }
 
 PortStats* SwSwitch::portStats(const RxPacket* pkt) {
-  return stats()->port(pkt->getSrcPort());
+  return portStats(pkt->getSrcPort());
 }
 
 map<int32_t, PortStatus> SwSwitch::getPortStatus() {
@@ -1006,7 +1037,7 @@ void SwSwitch::setPortStatusCounter(PortID port, bool up) {
     // called during initialization
     return;
   }
-  fbData->setCounter(getPortUpName(state->getPort(port)), int(up));
+  portStats(port)->setPortStatus(up);
 }
 
 void SwSwitch::packetReceived(std::unique_ptr<RxPacket> pkt) noexcept {
@@ -1014,7 +1045,7 @@ void SwSwitch::packetReceived(std::unique_ptr<RxPacket> pkt) noexcept {
   try {
     handlePacket(std::move(pkt));
   } catch (const std::exception& ex) {
-    stats()->port(port)->pktError();
+    portStats(port)->pktError();
     LOG(ERROR) << "error processing trapped packet: " <<
       folly::exceptionStr(ex);
     // Return normally, without letting the exception propagate to our caller.
@@ -1035,7 +1066,7 @@ void SwSwitch::handlePacket(std::unique_ptr<RxPacket> pkt) {
     return;
   }
   PortID port = pkt->getSrcPort();
-  stats()->port(port)->trappedPkt();
+  portStats(port)->trappedPkt();
 
   pcapMgr_->packetReceived(pkt.get());
 
@@ -1043,7 +1074,7 @@ void SwSwitch::handlePacket(std::unique_ptr<RxPacket> pkt) {
   // Abort processing early if the packet is too short.
   auto len = pkt->getLength();
   if (len < 64) {
-    stats()->port(port)->pktBogus();
+    portStats(port)->pktBogus();
     return;
   }
 
@@ -1086,13 +1117,29 @@ void SwSwitch::handlePacket(std::unique_ptr<RxPacket> pkt) {
   case IPv6Handler::ETHERTYPE_IPV6:
     ipv6_->handlePacket(std::move(pkt), dstMac, srcMac, c);
     return;
+  case LACPDU::EtherType::SLOW_PROTOCOLS:
+  {
+    // The only supported protocol in the Ethernet suite's "Slow Protocols"
+    // is the Link Aggregation Control Protocol
+    auto subtype = c.readBE<uint8_t>();
+    if (subtype == LACPDU::EtherSubtype::LACP) {
+      if (lagManager_) {
+        lagManager_->handlePacket(std::move(pkt), c);
+      } else {
+        LOG_EVERY_N(WARNING, 60) << "Received LACP frame but LACP not enabled";
+      }
+    } else if (subtype == LACPDU::EtherSubtype::MARKER) {
+      LOG(WARNING) << "Received Marker frame but Marker Protocol not supported";
+    }
+  }
+    return;
   default:
     break;
   }
 
   // If we are still here, we don't know what to do with this packet.
   // Increment a counter and just drop the packet on the floor.
-  stats()->port(port)->pktUnhandled();
+  portStats(port)->pktUnhandled();
 }
 
 void SwSwitch::linkStateChanged(PortID portId, bool up) {
@@ -1102,7 +1149,7 @@ void SwSwitch::linkStateChanged(PortID portId, bool up) {
   }
 
   // Schedule an update for port's operational status
-  auto updateFn = [=] (const std::shared_ptr<SwitchState>& state) {
+  auto updateOperStateFn = [=](const std::shared_ptr<SwitchState>& state) {
     std::shared_ptr<SwitchState> newState(state);
     auto* port = newState->getPorts()->getPortIf(portId).get();
     if (not port) {
@@ -1114,18 +1161,13 @@ void SwSwitch::linkStateChanged(PortID portId, bool up) {
 
     return newState;
   };
-  updateState("Port OperState Update", std::move(updateFn));
+  updateStateNoCoalescing(
+      "Port OperState Update", std::move(updateOperStateFn));
 
   // Log event and update counters
   logLinkStateEvent(portId, up);
   setPortStatusCounter(portId, up);
-  stats()->port(portId)->linkStateChange();
-
-  // Fire explicit callback for purging neighbor entries.
-  if (not up) {
-    backgroundEventBase_.runInEventBaseThread(
-        [this, portId]() { nUpdater_->portDown(portId); });
-  }
+  portStats(portId)->linkStateChange();
 }
 
 void SwSwitch::startThreads() {
@@ -1237,8 +1279,8 @@ void SwSwitch::sendPacketOutOfPort(
     return;
   }
 
-  auto subports = aggPort->sortedSubports();
-  if (subports.begin() == subports.end()) {
+  auto subportAndFwdStates = aggPort->subportAndFwdState();
+  if (subportAndFwdStates.begin() == subportAndFwdStates.end()) {
     LOG(ERROR) << "failed to send packet out aggregate port " << aggPortID
                << ": aggregate port has no constituent physical ports";
     return;
@@ -1255,10 +1297,17 @@ void SwSwitch::sendPacketOutOfPort(
   // will avoid any issues related to packet reordering. Of course, this
   // will increase the load on the first physical sub-port of each aggregate
   // port, but this imbalance should be negligible.
-  auto out = *subports.begin();
-
-  // TODO(samank): Add logic to skip over down ports
-  sendPacketOutOfPort(std::move(pkt), out);
+  PortID subport;
+  AggregatePort::Forwarding fwdState;
+  for (auto elem : subportAndFwdStates) {
+    std::tie(subport, fwdState) = elem;
+    if (fwdState == AggregatePort::Forwarding::ENABLED) {
+      sendPacketOutOfPort(std::move(pkt), subport);
+      return;
+    }
+  }
+  LOG(INFO) << "failed to send packet out aggregate port" << aggPortID
+            << ": aggregate port has no enabled physical ports";
 }
 
 void SwSwitch::sendPacketSwitched(std::unique_ptr<TxPacket> pkt) noexcept {
@@ -1510,5 +1559,4 @@ AdminDistance SwSwitch::clientIdToAdminDistance(int clientId) const {
 
   return static_cast<AdminDistance>(distance->second);
 }
-
 }} // facebook::fboss

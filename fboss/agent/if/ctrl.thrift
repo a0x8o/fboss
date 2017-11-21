@@ -24,6 +24,7 @@ enum AdminDistance {
   STATIC_ROUTE = 1,
   EBGP = 20,
   IBGP = 200,
+  NETLINK_LISTENER = 225,
   MAX_ADMIN_DISTANCE = 255
 }
 
@@ -71,6 +72,16 @@ struct L2EntryThrift {
   1: string mac,
   2: i32 port,
   3: i32 vlanID,
+}
+
+struct SubportThrift {
+  1: required i32 id,
+  2: required bool isForwardingEnabled,
+}
+
+struct AggregatePortEntryThrift {
+  1: required i32 aggregatePortId,
+  2: required list<SubportThrift> subports,
 }
 
 struct InterfaceDetail {
@@ -245,6 +256,8 @@ enum StdClientIds {
   STATIC_ROUTE = 1,
   INTERFACE_ROUTE = 2,
   LINKLOCAL_ROUTE = 3,
+  NETLINK_LISTENER = 100,
+  OPENR = 786,
 }
 
 service FbossCtrl extends fb303.FacebookService {
@@ -424,6 +437,8 @@ service FbossCtrl extends fb303.FacebookService {
   list<NdpEntryThrift> getNdpTable()
     throws (1: fboss.FbossBaseError error)
   list<L2EntryThrift> getL2Table()
+    throws (1: fboss.FbossBaseError error)
+  list<AggregatePortEntryThrift> getAggregatePortTable()
     throws (1: fboss.FbossBaseError error)
 
   // Deprecated - use the qsfp_service instead

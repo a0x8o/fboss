@@ -13,8 +13,8 @@
 #include "fboss/agent/state/Port.h"
 #include "fboss/agent/state/StateDelta.h"
 #include "fboss/agent/state/SwitchState.h"
-#include "fboss/agent/PortStats.h"
 #include "fboss/agent/SwitchStats.h"
+#include "fboss/agent/PortStats.h"
 
 namespace facebook { namespace fboss {
 
@@ -24,33 +24,33 @@ PortUpdateHandler::PortUpdateHandler(SwSwitch* sw)
 }
 
 void PortUpdateHandler::stateUpdated(const StateDelta& delta) {
-  // For now, the stateUpdated here is used to update those counters which
-  // uses port name as their key.
+  // For now, the stateUpdated is only used to update the portName of PortStats
+  // for all threads.
   DeltaFunctions::forEachChanged(
-      delta.getPortsDelta(),
-      [&](const std::shared_ptr<Port>& oldPort,
-          const std::shared_ptr<Port>& newPort) {
-        if (oldPort->getName() == newPort->getName()) {
-          return;
-        }
-        // clear old portStats counter
-        PortStats* portStats = sw_->stats()->port(oldPort->getID());
-        portStats->clearPortStatusCounter();
-        // and then update new portStatus
-        sw_->upatePortStats(newPort->getID(), newPort->getName());
-        portStats = sw_->stats()->port(newPort->getID());
-        portStats->setPortStatusCounter(newPort->isUp());
-      },
-      [&](const std::shared_ptr<Port>& newPort) {
-        sw_->upatePortStats(newPort->getID(), newPort->getName());
-        PortStats* portStats = sw_->stats()->port(newPort->getID());
-        portStats->setPortStatusCounter(newPort->isUp());
-      },
-      [&](const std::shared_ptr<Port>& oldPort) {
-        PortStats* portStats = sw_->stats()->port(oldPort->getID());
-        portStats->clearPortStatusCounter();
-        sw_->deletePortStats(oldPort->getID());
-      });
-}
+    delta.getPortsDelta(),
+    [&](const std::shared_ptr<Port>& oldPort,
+        const std::shared_ptr<Port>& newPort) {
+      if (oldPort->getName() == newPort->getName()) {
+        return;
+      }
 
-}} // facebook::fboss
+      for (SwitchStats& switchStats: sw_->getAllThreadsSwitchStats()) {
+        // only update the portName when the portStatus exists
+        PortStats* portStats = switchStats.port(newPort->getID());
+        if (portStats) {
+          portStats->setPortName(newPort->getName());
+        }
+      }
+      sw_->portStats(newPort->getID())->setPortStatus(newPort->isUp());
+    },
+    [&](const std::shared_ptr<Port>& newPort) {
+      sw_->portStats(newPort->getID())->setPortStatus(newPort->isUp());
+    },
+    [&](const std::shared_ptr<Port>& oldPort) {
+      for (SwitchStats& switchStats: sw_->getAllThreadsSwitchStats()) {
+        switchStats.deletePortStats(oldPort->getID());
+      }
+    }
+  );
+}
+}}

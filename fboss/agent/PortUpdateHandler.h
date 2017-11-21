@@ -28,5 +28,4 @@ class PortUpdateHandler : public AutoRegisterStateObserver {
 
     SwSwitch* sw_{nullptr};
 };
-
 }} // facebook::fboss

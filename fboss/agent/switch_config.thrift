@@ -64,6 +64,21 @@ struct PortPause {
 }
 
 /**
+ * Using this as default is slightly better for generated bindings w/ nullable
+ * languages, most notably python. Setting this as default ensures that the
+ * attribute is non-null, but defaults both members to false.
+*/
+const PortPause NO_PAUSE = {
+  "tx": false,
+  "rx": false,
+}
+
+enum PortFEC {
+  ON = 1,
+  OFF = 2,
+}
+
+/**
  *  A Range for L4 port range checker
  *  Define a range bewteen [min, max]
  */
@@ -165,8 +180,6 @@ struct AclEntry {
   17: string name
 
   18: AclActionType actionType = PERMIT
-  // This is temporary and will be removed in the next diff that introduces QoS
-  19: optional i16 qosQueueNum
 }
 
 /*
@@ -252,7 +265,7 @@ struct Port {
    * The speed of the interface in mbps.
    * Value 0 means default setting based on the HW and port type.
    */
-  8: PortSpeed speed = DEFAULT;
+  8: PortSpeed speed = DEFAULT
 
   /**
    * A configurable string describing the name of the port. If this
@@ -270,7 +283,7 @@ struct Port {
    */
   11: optional TrafficPolicyConfig egressTrafficPolicy
 
-  /*
+  /**
    * There are multiple queues per port
    * This allows defining their attributes
    */
@@ -279,32 +292,59 @@ struct Port {
   /**
    * pause configuration
    */
-  13: PortPause pause
+  13: PortPause pause = NO_PAUSE
 
   /**
    * sFlow sampling rate for ingressing packets.
    * Every 1/sFlowIngressRate ingressing packets will be sampled.
    * 0 indicates no sampling while 1 indicates sampling all packets.
    */
-  14: i64 sFlowIngressRate = 0;
+  14: i64 sFlowIngressRate = 0
 
   /**
    * sFlow sampling rate for egressing packets.
    * Every 1/sFlowEgressRate egressing packets will be sampled.
    * 0 indicates no sampling while 1 indicates sampling all packets.
    */
-  15: i64 sFlowEgressRate = 0;
+  15: i64 sFlowEgressRate = 0
+
+  /**
+   * Should FEC be on for this port?
+   */
+  16: PortFEC fec = PortFEC.OFF
+}
+
+enum LacpPortRate {
+  SLOW = 0,
+  FAST = 1,
+}
+
+enum LacpPortActivity {
+  PASSIVE = 0,
+  ACTIVE = 1,
+}
+
+struct AggregatePortMember {
+  /**
+   * Member ports are identified according to their logicalID, as defined in
+   * struct Port.
+   */
+  1: i32 memberPortID
+  2: i32 priority
+  3: LacpPortRate rate = FAST
+  4: LacpPortActivity activity = ACTIVE
 }
 
 struct AggregatePort {
   1: i16 key
   2: string name
   3: string description
-  /**
-   * Physical ports are identified here according to their logicalID,
-   * as set in struct Port.
-   */
-  4: list<i32> physicalPorts
+  4: list<AggregatePortMember> memberPorts
+}
+
+struct Lacp {
+  1: string systemID    // = cpuMAC
+  2: i32 systemPriority // = (2 ^ 16) - 1
 }
 
 /**
@@ -519,8 +559,12 @@ struct SwitchConfig {
   13: optional list<StaticRouteNoNextHops> staticRoutesToNull = [];
   // Prefixes for which to send traffic to CPU
   14: optional list<StaticRouteNoNextHops> staticRoutesToCPU = [];
-  // These acls are not applied directly, instead they're used by TrafficPolicy
-  // to define policy matchers and actions
+  // List of all ACLs that are available for use by various agent components
+  // ACLs declared here can be referenced in other places in order to tie
+  // actions to them, e.g. as part of a MatchToAction
+  // Only DROP acls are applied directly, all others require being referenced
+  // elsewhere in order to be meaningful
+  // Ordering of DROP acls define their priority
   15: optional list<AclEntry> acls = []
   // Set max number of probes to a sufficiently high value
   // to allow for the cases where
@@ -543,8 +587,9 @@ struct SwitchConfig {
   // Predefined values for these can be found at
   // fboss/agent/if/ctrl.thrift
   19: map<i32, i32> clientIdToAdminDistance = {
-        0: 20,
-        1: 1,
+        0: 20,    // BGP
+        786: 10,  // OPENR
+        1: 1,     // Static routes from config
       }
   /* Override source IP for DHCP relay packet to the DHCP server */
   20: optional string dhcpRelaySrcOverrideV4
@@ -560,4 +605,5 @@ struct SwitchConfig {
   24: optional TrafficPolicyConfig globalEgressTrafficPolicy
   25: optional string config_version
   26: list<SflowCollector> sFlowCollectors = []
+  27: optional Lacp lacp
 }

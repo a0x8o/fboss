@@ -11,9 +11,11 @@
 
 #include "fboss/agent/hw/bcm/BcmPlatform.h"
 #include "fboss/agent/types.h"
+#include "fboss/agent/StateObserver.h"
 #include "fboss/agent/platforms/wedge/WedgeProductInfo.h"
 #include "fboss/agent/platforms/wedge/WedgePortMapping.h"
 #include "fboss/qsfp_service/platforms/wedge/WedgeI2CBusLock.h"
+#include "fboss/qsfp_service/lib/QsfpCache.h"
 
 #include <folly/MacAddress.h>
 #include <folly/Range.h>
@@ -28,13 +30,15 @@ namespace facebook { namespace fboss {
 class BcmSwitch;
 class WedgePort;
 
-class WedgePlatform : public BcmPlatform {
+class WedgePlatform : public BcmPlatform, public StateObserver {
  public:
   explicit WedgePlatform(std::unique_ptr<WedgeProductInfo> productInfo);
   ~WedgePlatform() override;
 
   void init();
   InitPortMap initPorts() override;
+
+  void stateUpdated(const StateDelta& /*delta*/) override;
 
   virtual std::unique_ptr<WedgePortMapping> createPortMapping() = 0;
 
@@ -65,6 +69,19 @@ class WedgePlatform : public BcmPlatform {
     // All wedge platforms have 208 byte cells
     return 208;
   }
+  bool isCosSupported() const override {
+// TODO: add support for CoS queue traverse in FakeSdk
+// (see D5644650 that broke FakeSdk build)
+#ifdef FAKE_SDK
+    return false;
+#else
+    return true;
+#endif
+  }
+
+  QsfpCache* getQsfpCache() const {
+    return qsfpCache_.get();
+  }
 
  protected:
   WedgePlatformMode getMode() const;
@@ -78,6 +95,7 @@ class WedgePlatform : public BcmPlatform {
   WedgePlatform& operator=(WedgePlatform const &) = delete;
 
   void initLocalMac();
+  void initLEDs();
   virtual std::map<std::string, std::string> loadConfig();
 
   virtual std::unique_ptr<BaseWedgeI2CBus> getI2CBus();
@@ -89,6 +107,7 @@ class WedgePlatform : public BcmPlatform {
   std::unique_ptr<BcmSwitch> hw_;
 
   const std::unique_ptr<WedgeProductInfo> productInfo_;
+  const std::unique_ptr<QsfpCache> qsfpCache_;
 };
 
 }} // namespace facebook::fboss

@@ -15,6 +15,8 @@
 #include "fboss/agent/state/PortMap.h"
 #include "fboss/agent/state/SwitchState.h"
 
+#include <folly/futures/Future.h>
+
 namespace {
 constexpr int kPortRemedyIntervalSec = 25;
 }
@@ -37,25 +39,12 @@ PortRemediator::getUnexpectedDownPorts() const {
   return unexpectedDownPorts;
 }
 
-folly::Future<std::vector<folly::Try<folly::Unit>>>
-PortRemediator::remediatePorts() {
-  auto unexpectedDownPorts = getUnexpectedDownPorts();
-  auto platform = sw_->getPlatform();
-  std::vector<folly::Future<folly::Unit>> futs;
-  for (const auto& portId : unexpectedDownPorts) {
-    auto platformPort = platform->getPlatformPort(portId);
-    if (!platformPort || !platformPort->supportsTransceiver()) {
-      continue;
-    }
-    auto infoFuture = platformPort->getTransceiverInfo();
-    futs.push_back(infoFuture.then(
-        sw_->getBackgroundEVB(), [platformPort](TransceiverInfo info) {
-          if (info.present) {
-            platformPort->customizeTransceiver();
-          }
-        }));
-  }
-  return collectAll(futs);
+void PortRemediator::remediatePorts() {
+  // fill in if we need to operate on unexpectedly down ports
+  // sample would be something like:
+  //
+  // auto downPorts = getUnexpectedDownPorts();
+  // for (auto down : downPorts) doSomething
 }
 
 void PortRemediator::timeoutExpired() noexcept {

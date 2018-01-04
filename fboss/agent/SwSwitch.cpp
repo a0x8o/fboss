@@ -125,7 +125,7 @@ facebook::fboss::PortStatus fillInPortStatus(
   facebook::fboss::PortStatus status;
   status.enabled = port.isEnabled();
   status.up = port.isUp();
-  status.speedMbps = static_cast<int>(port.getWorkingSpeed());
+  status.speedMbps = static_cast<int>(port.getSpeed());
 
   try {
     status.transceiverIdx = sw->getPlatform()->getPortMapping(port.getID());
@@ -172,11 +172,6 @@ SwSwitch::SwSwitch(std::unique_ptr<Platform> platform)
 
   // doesnt need to be guarded, only accessed by 1 event base
   pcapPusher_ = nullptr;
-
-  // Set the event base for platform to use
-  // This means the platform is now able to do async events on the
-  // background thread
-  platform_->setEventBase(&backgroundEventBase_);
 }
 
 
@@ -622,23 +617,15 @@ void SwSwitch::fibSynced() {
 void SwSwitch::registerStateObserver(StateObserver* observer,
                                      const string name) {
   VLOG(2) << "Registering state observer: " << name;
-  if (!updateEventBase_.isInEventBaseThread()) {
-    updateEventBase_.runInEventBaseThreadAndWait([=]() {
-        addStateObserver(observer, name);
-    });
-  } else {
-    addStateObserver(observer, name);
-  }
+  updateEventBase_.runImmediatelyOrRunInEventBaseThreadAndWait([=]() {
+      addStateObserver(observer, name);
+  });
 }
 
 void SwSwitch::unregisterStateObserver(StateObserver* observer) {
-  if (!updateEventBase_.isInEventBaseThread()) {
-    updateEventBase_.runInEventBaseThreadAndWait([=]() {
-      removeStateObserver(observer);
-    });
-  } else {
+  updateEventBase_.runImmediatelyOrRunInEventBaseThreadAndWait([=]() {
     removeStateObserver(observer);
-  }
+  });
 }
 
 bool SwSwitch::stateObserverRegistered(StateObserver* observer) {

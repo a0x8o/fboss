@@ -19,7 +19,6 @@
 #include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/state/PortMap.h"
 #include "fboss/agent/state/Port.h"
-#include "fboss/agent/state/PortQueue.h"
 #include "fboss/agent/hw/bcm/BcmError.h"
 #include "fboss/agent/hw/bcm/BcmPlatformPort.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
@@ -52,7 +51,6 @@ const string kInPause = "in_pause_frames";
 const string kInIpv4HdrErrors = "in_ipv4_header_errors";
 const string kInIpv6HdrErrors = "in_ipv6_header_errors";
 const string kInNonPauseDiscards = "in_non_pause_discards";
-const string kOutBytes = "out_bytes";
 const string kOutUnicastPkts = "out_unicast_pkts";
 const string kOutMulticastPkts = "out_multicast_pkts";
 const string kOutBroadcastPkts = "out_broadcast_pkts";
@@ -179,15 +177,19 @@ void BcmPort::reinitPortStats() {
   reinitPortStat(kInIpv6HdrErrors);
   reinitPortStat(kInNonPauseDiscards);
 
-  reinitPortStat(kOutBytes);
+  reinitPortStat(getkOutBytes());
   reinitPortStat(kOutUnicastPkts);
   reinitPortStat(kOutMulticastPkts);
   reinitPortStat(kOutBroadcastPkts);
   reinitPortStat(kOutDiscards);
   reinitPortStat(kOutErrors);
   reinitPortStat(kOutPause);
-  reinitPortStat(kOutCongestionDiscards);
-
+  reinitPortStat(getkOutCongestionDiscards());
+  for (int i = 0; i < getNumUnicastQueues(); i++) {
+    auto name = folly::to<std::string>("queue", i, ".");
+    reinitPortStat(folly::to<std::string>(name, getkOutCongestionDiscards()));
+    reinitPortStat(folly::to<std::string>(name, getkOutBytes()));
+  }
   // (re) init out queue length
   auto statMap = fbData->getStatMap();
   const auto expType = stats::AVG;
@@ -211,6 +213,8 @@ BcmPort::BcmPort(BcmSwitch* hw, opennsl_port_t port,
   // Obtain the gport handle from the port handle.
   int rv = opennsl_port_gport_get(unit_, port_, &gport_);
   bcmCheckError(rv, "Failed to get gport for BCM port ", port_);
+
+  pipe_ = determinePipe();
 
   // Initialize our stats data structures
   reinitPortStats();
@@ -358,13 +362,8 @@ void BcmPort::enableLinkscan() {
   bcmCheckError(rv, "Failed to enable linkscan on port ", port_);
 }
 
-void BcmPort::setupQueues(const QueueConfig& swQueues) {
-  for (const auto& queue : swQueues) {
-    // program in queue
-  }
-}
-
 void BcmPort::program(const shared_ptr<Port>& port) {
+  VLOG(1) << "Reprogramming BcmPort for port " << port->getID();
   setIngressVlan(port);
   setSpeed(port);
   setPause(port);
@@ -605,7 +604,8 @@ void BcmPort::updateStats() {
       &curPortStats.inPause_);
   // Egress Stats
   updateStat(
-      now, kOutBytes, opennsl_spl_snmpIfHCOutOctets, &curPortStats.outBytes_);
+      now, getkOutBytes(), opennsl_spl_snmpIfHCOutOctets,
+      &curPortStats.outBytes_);
   updateStat(
       now,
       kOutUnicastPkts,

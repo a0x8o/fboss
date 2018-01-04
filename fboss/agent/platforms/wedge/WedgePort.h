@@ -17,6 +17,7 @@
 #include "fboss/agent/hw/bcm/BcmPlatformPort.h"
 #include "fboss/agent/hw/bcm/BcmPort.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
+#include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 
 namespace facebook { namespace fboss {
 
@@ -27,8 +28,7 @@ class WedgePort : public BcmPlatformPort {
   WedgePort(PortID id,
             WedgePlatform* platform,
             folly::Optional<TransceiverID> frontPanelPort,
-            folly::Optional<ChannelID> channel,
-            const XPEs& egressXPEs);
+            folly::Optional<ChannelID> channel);
 
  public:
   PortID getPortID() const override { return id_; }
@@ -49,6 +49,8 @@ class WedgePort : public BcmPlatformPort {
   void linkSpeedChanged(const cfg::PortSpeed& speed) override;
   void linkStatusChanged(bool up, bool adminUp) override;
 
+  PortStatus toThrift(const std::shared_ptr<Port>& port);
+
   folly::Optional<TransceiverID> getTransceiverID() const override {
     return frontPanelPort_;
   }
@@ -63,18 +65,16 @@ class WedgePort : public BcmPlatformPort {
 
   std::vector<int32_t> getChannels() const;
 
+  TransceiverIdxThrift getTransceiverMapping() const;
+
   folly::Future<TransmitterTechnology> getTransmitterTech(
-      folly::EventBase* evb) const override;
-  folly::Future<TransceiverInfo> getTransceiverInfo(
       folly::EventBase* evb) const override;
   folly::Future<folly::Optional<TxSettings>> getTxSettings(
       folly::EventBase* evb) const override;
-  void customizeTransceiver() override;
 
  protected:
   bool isControllingPort() const;
   bool isInSingleMode() const;
-  bool shouldCustomizeTransceiver() const;
 
   PortID id_{0};
   WedgePlatform* platform_{nullptr};
@@ -91,6 +91,8 @@ class WedgePort : public BcmPlatformPort {
   virtual TxOverrides getTxOverrides() const override {
     return TxOverrides();
   }
+
+  folly::Future<TransceiverInfo> getTransceiverInfo() const;
 };
 
 }} // facebook::fboss

@@ -13,6 +13,7 @@
 
 #include "fboss/agent/PlatformPort.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
+#include "fboss/qsfp_service/if/gen-cpp2/transceiver_types.h"
 
 #include <vector>
 
@@ -49,8 +50,7 @@ class BcmPlatformPort : public PlatformPort {
   using TxOverrides = boost::container::flat_map<
     std::pair<TransmitterTechnology, double>, TxSettings>;
 
-  explicit BcmPlatformPort(const XPEs& egressXPEs)
-      : egressXPEs_(egressXPEs) {}
+  BcmPlatformPort() {}
   BcmPlatformPort(BcmPlatformPort&&) = default;
   BcmPlatformPort& operator=(BcmPlatformPort&&) = default;
 
@@ -68,13 +68,19 @@ class BcmPlatformPort : public PlatformPort {
   virtual LaneSpeeds supportedLaneSpeeds() const = 0;
 
   /*
+   * What type of cable is plugged in to the transceiver.
+   */
+  virtual folly::Future<TransmitterTechnology> getTransmitterTech(
+      folly::EventBase* evb = nullptr) const = 0;
+
+  /*
    * getTxSettings() returns the correct transmitter's amplitude control
    * parameter and Equalization control information.
    */
   virtual folly::Future<folly::Optional<TxSettings>> getTxSettings(
       folly::EventBase* evb = nullptr) const = 0;
 
-  const XPEs& getEgressXPEs() const { return egressXPEs_; }
+  virtual const XPEs getEgressXPEs() const = 0;
 
  private:
   // Forbidden copy constructor and assignment operator
@@ -82,15 +88,6 @@ class BcmPlatformPort : public PlatformPort {
   BcmPlatformPort& operator=(BcmPlatformPort const &) = delete;
 
   virtual TxOverrides getTxOverrides() const = 0;
-
-  /*
-   * Tomahawk onwards BRCM started dividing ASIC MMU into
-   * multiple blocks called XPEs. A subset of ports then
-   * get mapped to each XPE. For earlier ASICs (TD2),
-   * where the MMU is not subdivided, we consider entire
-   * MMU to be a single XPE
-  */
-  XPEs egressXPEs_;
 };
 
 }} // facebook::fboss

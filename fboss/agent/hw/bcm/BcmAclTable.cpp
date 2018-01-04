@@ -10,6 +10,7 @@
 #include "fboss/agent/hw/bcm/BcmAclTable.h"
 #include "fboss/agent/hw/bcm/BcmAclEntry.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
+#include "fboss/agent/hw/bcm/BcmWarmBootCache.h"
 #include "fboss/agent/FbossError.h"
 
 #include <folly/CppAttributes.h>
@@ -76,7 +77,20 @@ void BcmAclTable::processRemovedAcl(
     AclRange range(AclRange::DST_L4_PORT, r.getMin(), r.getMax());
     derefBcmAclRange(range);
   }
+  if (acl->getPktLenRange()) {
+    AclPktLenRange r = acl->getPktLenRange().value();
+    AclRange range(AclRange::PKT_LEN, r.getMin(), r.getMax());
+    derefBcmAclRange(range);
+  }
 
+}
+
+BcmAclEntry* FOLLY_NULLABLE BcmAclTable::getAclIf(int priority) const {
+  auto iter = aclEntryMap_.find(priority);
+  if (iter == aclEntryMap_.end()) {
+    return nullptr;
+  }
+  return iter->second.get();
 }
 
 BcmAclRange* FOLLY_NULLABLE BcmAclTable::getAclRangeIf(
@@ -98,6 +112,18 @@ uint32_t BcmAclTable::getAclRangeRefCount(const AclRange& range) const {
   }
 }
 
+folly::Optional<uint32_t> BcmAclTable::getAclRangeRefCountIf(
+    BcmAclRangeHandle handle) const {
+  folly::Optional<uint32_t> refCount{folly::none};
+  for (auto iter = aclRangeMap_.begin(); iter != aclRangeMap_.end(); iter++) {
+    if (iter->second.first->getHandle() == handle) {
+      refCount = iter->second.second;
+      break;
+    }
+  }
+  return refCount;
+}
+
 uint32_t BcmAclTable::getAclRangeCount() const {
   return aclRangeMap_.size();
 }
@@ -105,7 +131,7 @@ uint32_t BcmAclTable::getAclRangeCount() const {
 BcmAclRange* BcmAclTable::incRefOrCreateBcmAclRange(const AclRange& range) {
   auto iter = aclRangeMap_.find(range);
   if (iter == aclRangeMap_.end()) {
-    // if the range does not exist yet, create a new BcmAclRange
+    // If the range does not exist yet, create a new BcmAclRange
     BcmAclRange* r;
     std::unique_ptr<BcmAclRange> newRange =
       std::make_unique<BcmAclRange>(hw_, range);
@@ -113,7 +139,14 @@ BcmAclRange* BcmAclTable::incRefOrCreateBcmAclRange(const AclRange& range) {
     aclRangeMap_.emplace(range, std::make_pair(std::move(newRange), 1));
     return r;
   } else {
-    // otherwise increase the reference count on the existing entry
+    const auto warmBootCache = hw_->getWarmBootCache();
+    auto warmbootItr = warmBootCache->findBcmAclRange(range);
+    // If the range also exists in warmboot cache, call programmed() to decrease
+    // the reference count in warmboot cache
+    if (warmbootItr != warmBootCache->aclRange2BcmAclRangeHandle_end()) {
+      warmBootCache->programmed(warmbootItr);
+    }
+    // Increase the reference count of the existing entry in BcmAclTable
     iter->second.second++;
     return iter->second.first.get();
   }

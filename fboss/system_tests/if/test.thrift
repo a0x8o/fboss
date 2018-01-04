@@ -8,11 +8,24 @@ const i32 DEFAULT_PORT = 20121
 
 struct CapturedPacket {
   1: ctrl.fbbinary packet_data,
+  /* Depending on how the packet is captured, len(packet_data) is not
+     necessarily the same as packet_length,
+     Ex: For jumbo frames snaplen option would be smaller than the packet size
+  */
+  2: i32 packet_length,
   // TODO(rsher): add timestamp info and other pcap metadata
 }
 
+enum DeviceType {
+  LOOPBACK = 0
+}
+
 service TestService extends fb303.FacebookService {
-  bool ping(1: string ip) throws (1: fboss.FbossBaseError error)
+  bool ping(1: string ip,
+            2: optional list<string> options)
+            throws (1: fboss.FbossBaseError error)
+  i32 get_interface_mtu(1: string intf)
+      throws (1: fboss.FbossBaseError error)
   bool status();
 
   /* This will start capturing packets, but the buffer is small so if lots
@@ -67,4 +80,21 @@ service TestService extends fb303.FacebookService {
                        3: i32 numberOfFlaps)
                        throws (1: fboss.FbossBaseError error)
 
-}
+  /* This will add an interface to the host.
+     It will return True if succeeds, False if fails.
+   */
+  bool add_interface(1: string ifName, 2: DeviceType deviceType) throws
+                      (1: fboss.FbossBaseError error)
+
+
+  /* This will remove an interface to the host.
+     It will return True if succeeds, False if fails.
+   */
+  bool remove_interface(1: string ifName) throws
+                      (1: fboss.FbossBaseError error)
+
+  /* This will add an address to an interface
+     It will return True if succeeds, False if fails.
+   */
+  bool add_address(1: string address, 2: string ifName) throws
+                      (1: fboss.FbossBaseError error)}

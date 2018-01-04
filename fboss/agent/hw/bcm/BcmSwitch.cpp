@@ -93,6 +93,8 @@ DEFINE_int32(linkscan_interval_us, 250000,
              "The Broadcom linkscan interval");
 DEFINE_bool(flexports, false,
             "Load the agent with flexport support enabled");
+DEFINE_bool(enable_fine_grained_buffer_stats, false,
+            "Enable fine grained buffer stats collection by default");
 
 enum : uint8_t {
   kRxCallbackPriority = 1,
@@ -139,6 +141,7 @@ bool BcmSwitch::getPortFECConfig(PortID port) const {
 BcmSwitch::BcmSwitch(BcmPlatform *platform, HashMode hashMode)
     : platform_(platform),
       hashMode_(hashMode),
+      fineGrainedBufferStatsEnabled_(FLAGS_enable_fine_grained_buffer_stats),
       mmuBufferBytes_(platform->getMMUBufferBytes()),
       mmuCellBytes_(platform->getMMUCellBytes()),
       warmBootCache_(new BcmWarmBootCache(this)),
@@ -387,7 +390,6 @@ std::shared_ptr<SwitchState> BcmSwitch::getColdBootSwitchState() const {
 
     auto swPort = make_shared<Port>(portID, name);
     swPort->setSpeed(bcmPort->getSpeed());
-    swPort->setMaxSpeed(bcmPort->getMaxSpeed());
     bootState->addPort(swPort);
 
     memberPorts.insert(make_pair(portID, false));
@@ -400,15 +402,19 @@ std::shared_ptr<SwitchState> BcmSwitch::getColdBootSwitchState() const {
 std::shared_ptr<SwitchState> BcmSwitch::getWarmBootSwitchState() const {
   auto warmBootState = getColdBootSwitchState();
   for (auto port :  *warmBootState->getPorts()) {
-    int portEnabled;
-    auto ret = opennsl_port_enable_get(unit_, port->getID(), &portEnabled);
-    bcmCheckError(ret, "Failed to get current state for port", port->getID());
-    port->setAdminState(
-        portEnabled == 1 ? cfg::PortState::ENABLED : cfg::PortState::DISABLED);
+    auto bcmPort = portTable_->getBcmPort(port->getID());
+    port->setOperState(bcmPort->isUp());
+    port->setAdminState(bcmPort->isEnabled() ?
+                        cfg::PortState::ENABLED : cfg::PortState::DISABLED);
+
+    VLOG(1) << "Recovered port " << port->getID() << " after warm boot."
+            << " AdminState=" << ((port->isEnabled()) ? "Enabled" : "Disabled")
+            << " OperState=" << ((port->isUp()) ? "Up" : "Down");
   }
   warmBootState->resetIntfs(warmBootCache_->reconstructInterfaceMap());
   warmBootState->resetVlans(warmBootCache_->reconstructVlanMap());
   warmBootState->resetRouteTables(warmBootCache_->reconstructRouteTables());
+  warmBootState->resetAcls(warmBootCache_->reconstructAclMap());
   return warmBootState;
 }
 
@@ -521,16 +527,16 @@ HwInitResult BcmSwitch::init(Callback* callback) {
   // Setup hash functions for ECMP
   ecmpHashSetup();
 
-  initFieldProcessor(warmBoot);
+  // initialize field processor and field groups
+  if (!warmBoot) {
+    initFieldProcessor();
+    createAclGroup();
+    dropIPv6RAs();
+    copyIPv6LinkLocalMcastPackets();
+  }
 
-  createAclGroup();
   dropDhcpPackets();
-  dropIPv6RAs();
-  setupCos();
-  configureRxRateLimiting();
-  copyIPv6LinkLocalMcastPackets();
   mmuState_ = queryMmuState();
-  setupCpuPortCounters();
 
   // enable IPv4 and IPv6 on CPU port
   opennsl_port_t idx;
@@ -557,12 +563,27 @@ HwInitResult BcmSwitch::init(Callback* callback) {
 
   portTable_->initPorts(&pcfg, warmBoot);
 
-  bcmCheckError(rv, "failed to set linkscan ports");
+  setupCos();
+  configureRxRateLimiting();
+  setupCpuPortCounters();
+  if (fineGrainedBufferStatsEnabled_) {
+    startFineGrainedBufferStatLogging();
+  }
+
   rv = opennsl_linkscan_register(unit_, linkscanCallback);
   bcmCheckError(rv, "failed to register for linkscan events");
   flags_ |= LINKSCAN_REGISTERED;
   rv = opennsl_linkscan_enable_set(unit_, FLAGS_linkscan_interval_us);
   bcmCheckError(rv, "failed to enable linkscan");
+
+  // If warm booting, force a scan of all ports. Unfortunately
+  // opennsl_enable_set will enable all of the ports and return before
+  // the first loop on the link thread has updated the link status of
+  // ports. This will guarantee we have performed at least one scan of
+  // all ports before proceeding.
+  if (warmBoot) {
+    forceLinkscanOn(pcfg.port);
+  }
 
   // Set the spanning tree state of all ports to forwarding.
   // TODO: Eventually the spanning tree state should be part of the Port
@@ -745,8 +766,8 @@ void BcmSwitch::processEnabledPorts(const StateDelta& delta) {
 void BcmSwitch::processChangedPorts(const StateDelta& delta) {
   forEachChanged(delta.getPortsDelta(),
     [&] (const shared_ptr<Port>& oldPort, const shared_ptr<Port>& newPort) {
-
-      auto bcmPort = portTable_->getBcmPort(newPort->getID());
+      auto id = newPort->getID();
+      auto bcmPort = portTable_->getBcmPort(id);
       if (oldPort->getName() != newPort->getName()) {
         bcmPort->updateName(newPort->getName());
       }
@@ -758,16 +779,37 @@ void BcmSwitch::processChangedPorts(const StateDelta& delta) {
       }
 
       auto speedChanged = oldPort->getSpeed() != newPort->getSpeed();
+      VLOG_IF(1, speedChanged) << "New speed on port " << id;
+
       auto vlanChanged = oldPort->getIngressVlan() != newPort->getIngressVlan();
+      VLOG_IF(1, vlanChanged) << "New ingress vlan on port " << id;
+
       auto pauseChanged = oldPort->getPause() != newPort->getPause();
+      VLOG_IF(1, pauseChanged) << "New pause settings on port " << id;
+
       auto sFlowChanged =
           (oldPort->getSflowIngressRate() != newPort->getSflowIngressRate()) ||
           (oldPort->getSflowEgressRate() != newPort->getSflowEgressRate());
+      VLOG_IF(1, sFlowChanged) << "New sFlow settings on port " << id;
+
       auto fecChanged = oldPort->getFEC() != newPort->getFEC();
+      VLOG_IF(1, fecChanged) << "New FEC settings on port " << id;
 
       if (speedChanged || vlanChanged || pauseChanged || sFlowChanged ||
           fecChanged) {
         bcmPort->program(newPort);
+      }
+
+      auto queuesChanged = oldPort->getPortQueues() !=
+        newPort->getPortQueues();
+      VLOG_IF(1, queuesChanged) << "New cos queue settings on port " << id;
+
+      if (queuesChanged) {
+        if (!platform_->isCosSupported()) {
+          throw FbossError("Changing settings for cos queues not supported on ",
+              "this platform");
+        }
+        bcmPort->setupQueues(newPort->getPortQueues());
       }
     });
 }
@@ -780,12 +822,24 @@ void BcmSwitch::pickupLinkStatusChanges(const StateDelta& delta) {
         if (!oldPort->isEnabled() && !newPort->isEnabled()) {
           return;
         }
+        auto id = newPort->getID();
+
         auto adminStateChanged =
-            oldPort->getAdminState() != newPort->getAdminState();
+          oldPort->getAdminState() != newPort->getAdminState();
+        if (adminStateChanged) {
+          auto adminStr = (newPort->isEnabled()) ? "ENABLED" : "DISABLED";
+          VLOG(1) << "Admin state changed on port " << id << ": " << adminStr;
+        }
+
         auto operStateChanged =
-            oldPort->getOperState() != newPort->getOperState();
+          oldPort->getOperState() != newPort->getOperState();
+        if (operStateChanged) {
+          auto operStr = (newPort->isUp()) ? "UP" : "DOWN";
+          VLOG(1) << "Oper state changed on port " << id << ": " << operStr;
+        }
+
         if (adminStateChanged || operStateChanged) {
-          auto bcmPort = portTable_->getBcmPort(newPort->getID());
+          auto bcmPort = portTable_->getBcmPort(id);
           bcmPort->linkStatusChanged(newPort);
         }
       });

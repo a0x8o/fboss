@@ -88,7 +88,7 @@ void BcmSwitch::fetchL2Table(std::vector<L2EntryThrift>* /*l2Table*/) {
   return;
 }
 
-void BcmSwitch::initFieldProcessor(bool /*isWarmBoot*/) const {
+void BcmSwitch::initFieldProcessor() const {
   // API not available in opennsl
 }
 
@@ -136,5 +136,7 @@ std::unique_ptr<BufferStatsLogger> BcmSwitch::createBufferStatsLogger() {
 }
 
 void BcmSwitch::printDiagCmd(const std::string& cmd) const {}
+
+void BcmSwitch::forceLinkscanOn(opennsl_pbmp_t ports) {}
 
 }} //facebook::fboss

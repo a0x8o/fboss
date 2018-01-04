@@ -180,6 +180,14 @@ foreach(lang ${THRIFT_LANGS})
         "${CMAKE_SOURCE_DIR}/fboss/qsfp_service/if" #file_path
         "${THRIFT_DIR}/fboss/qsfp_service/if" #output_path
         )
+        my_thrift_library(
+            "netlink_manager_service" #file_name
+            "NetlinkManagerService" #services
+            "${lang}" #language
+            "" #options
+            "${CMAKE_SOURCE_DIR}/fboss/netlink_manager/if" #file_path
+            "${THRIFT_DIR}/fboss/netlink_manager/if" #output_path
+        )
 endforeach(lang)
 
 include_directories(${THRIFT_DIR})
@@ -250,9 +258,18 @@ add_executable(wedge_agent
     fboss/agent/platforms/wedge/WedgePlatform.cpp
     fboss/agent/platforms/wedge/WedgeProductInfo.cpp
     fboss/agent/platforms/wedge/WedgePort.cpp
-    fboss/agent/platforms/wedge/wedge_ctrl.cpp
+    fboss/agent/platforms/wedge/wedge_agent.cpp
     fboss/agent/platforms/wedge/oss/WedgePort.cpp
     fboss/agent/platforms/wedge/oss/WedgePlatform.cpp
+)
+
+add_executable(netlink_manager
+    fboss/netlink_manager/NlResources.cpp
+    fboss/netlink_manager/NetlinkManager.cpp
+    fboss/netlink_manager/NetlinkPoller.cpp
+    fboss/netlink_manager/main.cpp
+    fboss/netlink_manager/utils/AddressUtils.cpp
+    fboss/netlink_manager/NetlinkManagerHandler.cpp
 )
 
 add_executable(qsfp_service
@@ -287,6 +304,7 @@ add_library(fboss_agent STATIC
     fboss/agent/HighresCounterSubscriptionHandler.cpp
     fboss/agent/HighresCounterUtil.cpp
     fboss/agent/hw/BufferStatsLogger.cpp
+    fboss/agent/hw/bcm/BcmAclEntry.cpp
     fboss/agent/hw/bcm/BcmAclTable.cpp
     fboss/agent/hw/bcm/BcmAPI.cpp
     fboss/agent/hw/bcm/BcmEgress.cpp
@@ -319,8 +337,8 @@ add_library(fboss_agent STATIC
     fboss/agent/hw/bcm/oss/BcmSwitch.cpp
     fboss/agent/hw/bcm/oss/BcmSwitchEventCallback.cpp
     fboss/agent/hw/bcm/oss/BcmTrunk.cpp
-    fboss/agent/hw/bcm/oss/BcmTrunkTable.cpp
     fboss/agent/hw/bcm/oss/BcmUnit.cpp
+    fboss/agent/hw/bcm/oss/BcmWarmBootCache.cpp
     fboss/agent/hw/bcm/oss/BcmWarmBootHelper.cpp
     fboss/agent/hw/bcm/oss/BcmTableStats.cpp
     fboss/agent/hw/bcm/Utils.cpp
@@ -378,7 +396,7 @@ add_library(fboss_agent STATIC
     fboss/agent/platforms/wedge/oss/Wedge40Port.cpp
     fboss/agent/platforms/wedge/oss/Wedge100Port.cpp
     fboss/agent/platforms/wedge/oss/WedgeProductInfo.cpp
-    fboss/agent/platforms/wedge/wedge_ctrl.cpp
+    fboss/agent/platforms/wedge/wedge_agent.cpp
     fboss/agent/platforms/wedge/WedgePlatform.cpp
     fboss/agent/platforms/wedge/Wedge40Platform.cpp
     fboss/agent/platforms/wedge/Wedge100Platform.cpp
@@ -391,7 +409,6 @@ add_library(fboss_agent STATIC
     fboss/agent/PortRemediator.cpp
     fboss/agent/PortStats.cpp
     fboss/agent/PortUpdateHandler.cpp
-    fboss/agent/QsfpClient.cpp
     fboss/agent/RestClient.cpp
     fboss/agent/RouteUpdateLogger.cpp
     fboss/agent/RouteUpdateLoggingPrefixTracker.cpp
@@ -460,6 +477,9 @@ add_library(fboss_agent STATIC
 
     fboss/qsfp_service/oss/StatsPublisher.cpp
     fboss/qsfp_service/platforms/wedge/WedgeI2CBusLock.cpp
+    fboss/qsfp_service/lib/QsfpClient.cpp
+    fboss/qsfp_service/lib/QsfpCache.cpp
+
 )
 
 set(ALL_THRIFT_LIBS
@@ -515,6 +535,10 @@ set(LIBFBOSS_AGENT_DEPS
 
 target_link_libraries(fboss_agent "${LIBFBOSS_AGENT_DEPS}")
 target_link_libraries(wedge_agent
+                        fboss_agent
+                        "${LIBFBOSS_AGENT_DEPS}"
+                    )
+target_link_libraries(netlink_manager
                         fboss_agent
                         "${LIBFBOSS_AGENT_DEPS}"
                     )

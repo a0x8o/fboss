@@ -14,6 +14,7 @@
 #include "fboss/agent/types.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/hw/bcm/BcmAclTable.h"
+#include "fboss/agent/hw/bcm/BcmCosManager.h"
 #include "fboss/agent/hw/bcm/BcmSwitchEventCallback.h"
 #include "fboss/agent/hw/bcm/gen-cpp2/packettrace_types.h"
 #include <folly/dynamic.h>
@@ -34,7 +35,6 @@ namespace facebook { namespace fboss {
 class AclEntry;
 class AggregatePort;
 class ArpEntry;
-class BcmCosManager;
 class BcmEgress;
 class BcmHostTable;
 class BcmIntfTable;
@@ -202,6 +202,9 @@ class BcmSwitch : public BcmSwitchIf {
   const BcmTrunkTable* getTrunkTable() const override {
     return trunkTable_.get();
   }
+  const std::vector<std::shared_ptr<AclEntry>> getCoppAcls() const {
+    return coppAclEntries_;
+  }
 
   bool isPortUp(PortID port) const override;
 
@@ -286,6 +289,8 @@ class BcmSwitch : public BcmSwitchIf {
     return warmBootCache_.get();
   }
 
+  BcmRouteTable* writableRouteTable() const { return routeTable_.get(); }
+
   /**
    * Log the hardware state for the switch
    */
@@ -319,6 +324,9 @@ class BcmSwitch : public BcmSwitchIf {
   }
 
   opennsl_gport_t getCpuGPort() const;
+  CosQueueGports* getCpuCosQueueGports() {
+    return &cpuCosGports_;
+  }
 
  private:
   enum Flags : uint32_t {
@@ -496,16 +504,21 @@ class BcmSwitch : public BcmSwitchIf {
    * Copy IPv6 link local multicast packets to CPU
    */
   void copyIPv6LinkLocalMcastPackets();
+
   /*
    * (re) configure control plane policing based on new StateDelta
    */
   void reconfigureCoPP(const StateDelta& delta);
 
-
   /*
    * Create ACL group
    */
   void createAclGroup();
+
+  /*
+   * Forces a linkscan pass on the provided ports.
+   */
+  void forceLinkscanOn(opennsl_pbmp_t ports);
 
   /*
    * Configure rate limiting of packets sent to the CPU.
@@ -540,12 +553,13 @@ class BcmSwitch : public BcmSwitchIf {
    */
   void exportSdkVersion() const;
 
-  void initFieldProcessor(bool isWarmBoot) const;
+  void initFieldProcessor() const;
 
   /**
    * Setup COS manager
    */
   void setupCos();
+
   /*
    * Create buffer stats logger
    */
@@ -618,6 +632,7 @@ class BcmSwitch : public BcmSwitchIf {
     stats::MonotonicCounter counter;
   };
   std::vector<CpuPortCounter> cpuPortCounters_;
+  CosQueueGports cpuCosGports_;
 
   void updateCpuPortCounters();
   void setupCpuPortCounters();

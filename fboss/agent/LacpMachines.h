@@ -10,6 +10,7 @@
 #pragma once
 
 #include <folly/io/async/AsyncTimeout.h>
+#include <folly/Optional.h>
 
 #include <boost/container/flat_map.hpp>
 
@@ -77,6 +78,7 @@ class ReceiveMachine : private folly::AsyncTimeout {
   void recordDefault();
   void recordPDU(LACPDU& lacpdu);
   void updateSelected(LACPDU& lacpdu);
+  void updateDefaultSelected();
   bool updateNTT(LACPDU& lacpdu);
   std::chrono::seconds epochDuration();
   void updateState(ReceiveState nextState);
@@ -86,7 +88,7 @@ class ReceiveMachine : private folly::AsyncTimeout {
 
   ReceiveState state_{ReceiveState::INITIALIZED};
   ReceiveState prevState_{ReceiveState::INITIALIZED};
-  ParticipantInfo partnerInfo_{LacpState::NONE}; // operational
+  ParticipantInfo partnerInfo_; // operational
 
   LacpController& controller_;
 };
@@ -166,6 +168,7 @@ class MuxMachine : private folly::AsyncTimeout {
   void unselected();
   void matched();
   void notMatched();
+  void standby();
 
  private:
   enum class MuxState {
@@ -179,7 +182,7 @@ class MuxMachine : private folly::AsyncTimeout {
 
   // states
   void detached();
-  void waiting();
+  void waiting(bool shouldScheduleTimeout);
   void attached();
   void collectingDistributing();
 
@@ -204,22 +207,46 @@ std::ostream& operator<<(std::ostream& out, MuxMachine::MuxState s);
 
 class Selector {
  public:
-  explicit Selector(LacpController& controller);
+  enum class SelectionState {
+    SELECTED,
+    STANDBY
+  };
+  struct Selection {
+    Selection(LinkAggregationGroupID id, SelectionState s)
+        : lagID(id), state(s) {}
+    LinkAggregationGroupID lagID;
+    SelectionState state;
+    bool operator==(const struct Selection& rhs) {
+      return lagID == rhs.lagID && state == rhs.state;
+    }
+  };
+  using PortIDToSelection = boost::container::flat_map<PortID, Selection>;
+
+  Selector(LacpController& controller, uint8_t minLinkCount = 1);
 
   void start();
   void stop();
 
-  void select();
-  AggregatePortID selection();
+  void portDown();
 
-  using PortIDToLagID =
-      boost::container::flat_map<PortID, LinkAggregationGroupID>;
-  static PortIDToLagID& portToLag();
+  void select();
+
+  void selected();
+  void unselected();
+  void standby();
+
+  Selection getSelection();
+  folly::Optional<Selection> getSelectionIf();
+
+  static PortIDToSelection& portToSelection();
 
  private:
-  bool isAvailable(AggregatePortID);
+  bool isAvailable(AggregatePortID) const;
+  std::vector<PortID> getPortsWithSelection(Selection s) const;
 
   LacpController& controller_;
+  uint8_t minLinkCount_{0};
 };
+
 } // namespace fboss
 } // namespace facebook

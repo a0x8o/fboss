@@ -17,7 +17,8 @@
 
 #include "fboss/agent/hw/bcm/BcmPortGroup.h"
 #include "fboss/agent/platforms/wedge/WedgePlatform.h"
-#include "fboss/agent/QsfpClient.h"
+#include "fboss/qsfp_service/lib/QsfpClient.h"
+#include "fboss/qsfp_service/lib/QsfpCache.h"
 
 namespace facebook { namespace fboss {
 
@@ -25,9 +26,7 @@ WedgePort::WedgePort(
   PortID id,
   WedgePlatform* platform,
   folly::Optional<TransceiverID> frontPanelPort,
-  folly::Optional<ChannelID> channel,
-  const XPEs& egressXPEs) :
-    BcmPlatformPort(egressXPEs),
+  folly::Optional<ChannelID> channel) :
     id_(id),
     platform_(platform),
     frontPanelPort_(frontPanelPort),
@@ -59,34 +58,15 @@ bool WedgePort::isMediaPresent() {
   return false;
 }
 
-folly::Future<TransceiverInfo> WedgePort::getTransceiverInfo(
-    folly::EventBase* evb) const {
-  if (!evb) {
-    evb = platform_->getEventBase();
-  }
-  auto clientFuture = QsfpClient::createClient(evb);
-  folly::Optional<TransceiverID> transceiverId = getTransceiverID();
-  auto getTransceiverInfo =
-      [transceiverId](std::unique_ptr<QsfpServiceAsyncClient> client) {
-        // This will throw if there is no transceiver on this port
-        auto t = static_cast<int32_t>(transceiverId.value());
-        auto options = QsfpClient::getRpcOptions();
-        return client->future_getTransceiverInfo(options, {t});
-      };
-  auto fromMap =
-      [transceiverId](std::map<int, facebook::fboss::TransceiverInfo> infoMap) {
-        // This will throw if there is no transceiver on this port
-        auto t = static_cast<int32_t>(transceiverId.value());
-        return infoMap[t];
-      };
-  return clientFuture.then(evb, getTransceiverInfo).then(evb, fromMap);
+folly::Future<TransceiverInfo> WedgePort::getTransceiverInfo() const {
+  auto qsfpCache = platform_->getQsfpCache();
+  return qsfpCache->futureGet(getTransceiverID().value());
 }
 
 folly::Future<TransmitterTechnology> WedgePort::getTransmitterTech(
     folly::EventBase* evb) const {
-  if (!evb) {
-    evb = platform_->getEventBase();
-  }
+  DCHECK(evb);
+
   // If there's no transceiver this is a backplane port.
   // However, we know these are using copper, so pass that along
   if (!supportsTransceiver()) {
@@ -105,20 +85,18 @@ folly::Future<TransmitterTechnology> WedgePort::getTransmitterTech(
                << " Exception: " << folly::exceptionStr(e);
     return TransmitterTechnology::UNKNOWN;
   };
-  return getTransceiverInfo(evb).then(evb, getTech).onError(
+  return getTransceiverInfo().then(evb, getTech).onError(
       std::move(handleError));
 }
 
 // Get correct transmitter setting.
 folly::Future<folly::Optional<TxSettings>> WedgePort::getTxSettings(
     folly::EventBase* evb) const {
+  DCHECK(evb);
+
   auto txOverrides = getTxOverrides();
   if (txOverrides.empty()) {
     return folly::makeFuture<folly::Optional<TxSettings>>(folly::none);
-  }
-
-  if (!evb) {
-    evb = platform_->getEventBase();
   }
 
   auto getTx = [overrides = std::move(txOverrides)](TransceiverInfo info)
@@ -143,7 +121,7 @@ folly::Future<folly::Optional<TxSettings>> WedgePort::getTxSettings(
                << " Exception: " << folly::exceptionStr(e);
     return folly::Optional<TxSettings>();
   };
-  return getTransceiverInfo(evb).then(evb, getTx).onError(std::move(handleErr));
+  return getTransceiverInfo().then(evb, getTx).onError(std::move(handleErr));
 }
 
 void WedgePort::statusIndication(
@@ -157,11 +135,6 @@ void WedgePort::statusIndication(
 }
 
 void WedgePort::linkStatusChanged(bool up, bool adminUp) {
-  // If the link should be up but is not, let's make sure the qsfp
-  // settings are correct
-  if (!up && adminUp) {
-    customizeTransceiver();
-  }
 }
 
 void WedgePort::linkSpeedChanged(const cfg::PortSpeed& speed) {
@@ -213,63 +186,28 @@ std::vector<int32_t> WedgePort::getChannels() const {
     | folly::gen::as<std::vector>();
 }
 
-bool WedgePort::shouldCustomizeTransceiver() const {
-  auto trans = getTransceiverID();
-  if (!trans) {
-    // No qsfp atatched to customize
-    VLOG(4) << "Not customising qsfps of port " << id_
-            << " as it has no transceiver.";
-    return false;
-  } else if (!isControllingPort()) {
-    // We only want to customise on the first channel - this is the actual
-    // speed the transceiver should be configured for
-    // Other channels may be disabled with other speeds set
-    return false;
-  } else if (!isInSingleMode()) {
-    // If we are not in single mode (all 4 S gbps lanes treated as one
-    // 4xS port) then customizing risks restarting other non-broken lanes
-    return false;
-  } else if (speed_ == cfg::PortSpeed::DEFAULT) {
-    // This should be resolved in BcmPort before calling
-    LOG(ERROR) << "Unresolved speed: Unable to determine what qsfp settings "
-               << "are needed for transceiver"
-               << folly::to<std::string>(*trans);
-    return false;
+TransceiverIdxThrift WedgePort::getTransceiverMapping() const {
+  if (!supportsTransceiver()) {
+    return TransceiverIdxThrift();
   }
-
-  return true;
+  return TransceiverIdxThrift(
+    apache::thrift::FragileConstructor::FRAGILE,
+    static_cast<int32_t>(*getTransceiverID()),
+    0,  // TODO: deprecate
+    getChannels());
 }
 
-void WedgePort::customizeTransceiver() {
-  if (!shouldCustomizeTransceiver()) {
-    return;
-  }
-  // We've already checked whether there is a transceiver id in needsCustomize
-  auto transID = static_cast<int32_t>(*getTransceiverID());
-  auto evb = platform_->getEventBase();
-  if (!evb) {
-    LOG(ERROR) << "No valid eventbase to use with async customizeTransceivers"
-               << " call. Skipping call.";
-    return;
-  }
-  auto speedString = cfg::_PortSpeed_VALUES_TO_NAMES.find(speed_)->second;
-  auto& speed = speed_;
-  auto clientFuture = QsfpClient::createClient(evb);
-  auto doCustomize = [transID, speed, speedString](
-                         std::unique_ptr<QsfpServiceAsyncClient> client) {
-    LOG(INFO) << "Sending qsfp customize request for transceiver " << transID
-              << " to speed " << speedString;
-    auto options = QsfpClient::getRpcOptions();
-    return client->future_customizeTransceiver(options, transID, speed);
-  };
-  auto handleError = [transID, speedString](const std::exception& e) {
-    // This can happen for a variety of reasons ranging from
-    // thrift problems to invalid input sent to the server
-    // Let's just catch them all
-    LOG(ERROR) << "Unable to customize transceiver " << transID << " for speed "
-               << speedString << ". Exception: " << e.what();
-  };
-  clientFuture.then(evb, doCustomize).onError(std::move(handleError));
+PortStatus WedgePort::toThrift(const std::shared_ptr<Port>& port) {
+  // TODO: make it possible to generate a PortStatus struct solely
+  // from a Port SwitchState node. Currently you need platform to get
+  // transceiver mapping, which is not ideal.
+  return PortStatus(
+    apache::thrift::FragileConstructor::FRAGILE,
+    port->isEnabled(),
+    port->isUp(),
+    false,
+    getTransceiverMapping(),
+    static_cast<int64_t>(port->getSpeed()));
 }
 
 }} // facebook::fboss

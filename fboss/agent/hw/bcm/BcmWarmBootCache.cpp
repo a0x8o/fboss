@@ -52,6 +52,7 @@ using namespace facebook::fboss;
 namespace {
 auto constexpr kEcmpObjects = "ecmpObjects";
 auto constexpr kVlanForCPUEgressEntries = 0;
+auto constexpr kACLFieldGroupID = 128;
 
 struct AddrTables {
   AddrTables() : arpTable(make_shared<ArpTable>()),
@@ -200,6 +201,25 @@ BcmWarmBootCache::reconstructRouteTables() const {
   // route. Since we want to get all routes here (host
   // and LPM) we just get it from the dumped switch state.
   return dumpedSwSwitchState_->getRouteTables();
+}
+
+std::shared_ptr<AclMap>
+BcmWarmBootCache::reconstructAclMap() const {
+  return dumpedSwSwitchState_->getAcls();
+}
+
+void BcmWarmBootCache::programmed(Range2BcmHandlerItr itr) {
+  VLOG(1) << "Programmed AclRange, removing from warm boot cache."
+          << " flags=" << itr->first.getFlags()
+          << " min=" << itr->first.getMin()
+          << " max=" << itr->first.getMax()
+          << " handle= " << itr->second.first
+          << " current ref count=" << itr->second.second;
+  if (itr->second.second > 1) {
+    itr->second.second--;
+  } else {
+    aclRange2BcmAclRangeHandle_.erase(itr);
+  }
 }
 
 const BcmWarmBootCache::EgressIds&
@@ -409,6 +429,10 @@ void BcmWarmBootCache::populate() {
   // Traverse ecmp egress entries
   opennsl_l3_egress_ecmp_traverse(hw_->getUnit(), ecmpEgressTraversalCallback,
       this);
+
+  // populate acls and acl ranges
+  populateAcls(kACLFieldGroupID, this->aclRange2BcmAclRangeHandle_,
+    this->priority2BcmAclEntryHandle_);
 }
 
 bool BcmWarmBootCache::fillVlanPortInfo(Vlan* vlan) {
@@ -660,7 +684,7 @@ void BcmWarmBootCache::clear() {
 
   // Delete interfaces
   for (auto vlanMacAndIntf : vlanAndMac2Intf_) {
-    VLOG(1) <<"Deletingl3 interface for vlan: " << vlanMacAndIntf.first.first
+    VLOG(1) <<"Deleting l3 interface for vlan: " << vlanMacAndIntf.first.first
       <<" and mac : " << vlanMacAndIntf.first.second;
     auto rv = opennsl_l3_intf_delete(hw_->getUnit(), &vlanMacAndIntf.second);
     bcmLogFatal(rv, hw_, "failed to delete l3 interface for vlan: ",
@@ -693,6 +717,23 @@ void BcmWarmBootCache::clear() {
 
   egressIdsFromBcmHostInWarmBootFile_.clear();
   vrfIp2EgressFromBcmHostInWarmBootFile_.clear();
+
+  // Delete acls and acl ranges, since acl(field process) doesn't support
+  // opennsl, we call BcmAclTable to remove the unclaimed acls
+  VLOG(1) << "Unclaimed acl count=" << priority2BcmAclEntryHandle_.size();
+  for (auto aclItr: priority2BcmAclEntryHandle_) {
+    VLOG(1) << "Deleting unclaimed acl: prio=" << aclItr.first
+            << ", handle=" << aclItr.second;
+    removeBcmAcl(aclItr.second);
+  }
+  priority2BcmAclEntryHandle_.clear();
+  VLOG(1) << "Unclaimed acl range count=" << aclRange2BcmAclRangeHandle_.size();
+  for (auto aclRangeItr: aclRange2BcmAclRangeHandle_) {
+    VLOG(1) << "Deleting unclaimed acl range=" << aclRangeItr.first.str()
+            << ", handle=" << aclRangeItr.second.first;
+    removeBcmAclRange(aclRangeItr.second.first);
+  }
+  aclRange2BcmAclRangeHandle_.clear();
 }
 
 }}

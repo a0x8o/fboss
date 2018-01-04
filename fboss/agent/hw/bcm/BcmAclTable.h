@@ -28,15 +28,19 @@ class BcmAclTable {
   void processAddedAcl(const int groupId, const std::shared_ptr<AclEntry>& acl);
   void processRemovedAcl(const std::shared_ptr<AclEntry>& acl);
 
+  BcmAclEntry* getAclIf(int priority) const;
   // return nullptr if not found
   BcmAclRange*  getAclRangeIf(const AclRange& range) const;
   // return 0 if range does not exist
   uint32_t getAclRangeRefCount(const AclRange& range) const;
+  // if range doesn't exist, return folly::none
+  folly::Optional<uint32_t> getAclRangeRefCountIf(
+    BcmAclRangeHandle handle) const;
   uint32_t getAclRangeCount() const;
 
  private:
   BcmAclRange* incRefOrCreateBcmAclRange(const AclRange& range);
-  BcmAclRange*  derefBcmAclRange(const AclRange& range);
+  BcmAclRange* derefBcmAclRange(const AclRange& range);
 
   // map from acl range to bcm acl range and its reference count
   using BcmAclRangeMap = boost::container::flat_map<AclRange,

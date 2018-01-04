@@ -20,9 +20,11 @@ extern "C" {
 #include "common/stats/ExportedHistogramMapImpl.h"
 
 #include "fboss/agent/types.h"
+#include "fboss/agent/hw/bcm/BcmCosManager.h"
 #include "fboss/agent/hw/bcm/BcmPlatformPort.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/hw/bcm/gen-cpp2/hardware_stats_types.h"
+#include "fboss/agent/state/PortQueue.h"
 
 #include <mutex>
 
@@ -32,7 +34,6 @@ class BcmSwitch;
 class BcmPortGroup;
 class SwitchState;
 class Port;
-class PortQueue;
 
 /**
  * BcmPort is the class to abstract the physical port in BcmSwitch.
@@ -76,6 +77,9 @@ class BcmPort {
   }
   BcmPortGroup* getPortGroup() const {
     return portGroup_;
+  }
+  uint8_t getPipe() const {
+    return pipe_;
   }
 
   /*
@@ -144,6 +148,9 @@ class BcmPort {
 
   static opennsl_gport_t asGPort(opennsl_port_t port);
   static bool isValidLocalPort(opennsl_gport_t gport);
+  CosQueueGports* getCosQueueGports() {
+    return &cosQueueGports_;
+  }
 
  private:
   // no copy or assignment
@@ -178,14 +185,26 @@ class BcmPort {
   void setPause(const std::shared_ptr<Port>& swPort);
   void setTxSetting(const std::shared_ptr<Port>& swPort);
   bool isMmuLossy() const;
+  uint8_t determinePipe() const;
+  int getNumUnicastQueues() {
+    return cosQueueGports_.unicast.size();
+  }
 
-  static constexpr auto kOutCongestionDiscards = "out_congestion_discards";
+  static const std::string& getkOutCongestionDiscards() {
+    static const std::string out = "out_congestion_discards";
+    return out;
+  }
+  static const std::string& getkOutBytes() {
+    static const std::string out = "out_bytes";
+    return out;
+  }
 
   BcmSwitch* const hw_{nullptr};
   const opennsl_port_t port_;    // Broadcom physical port number
   // The gport_ is logically a const, but needs to be initialized as a parameter
   // to SDK call.
   opennsl_gport_t gport_;  // Broadcom global port number
+  uint8_t pipe_;
   BcmPlatformPort* const platformPort_{nullptr};
   int unit_{-1};
   std::string portName_{""};
@@ -195,6 +214,7 @@ class BcmPort {
   BcmPortGroup* portGroup_{nullptr};
 
   std::map<std::string, stats::MonotonicCounter> portCounters_;
+  CosQueueGports cosQueueGports_;
 
   stats::ExportedStatMapImpl::LockableStat outQueueLen_;
   stats::ExportedHistogramMapImpl::LockableHistogram inPktLengths_;

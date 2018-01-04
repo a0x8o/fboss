@@ -11,6 +11,7 @@
 
 #include <folly/IPAddressV4.h>
 #include <folly/IPAddressV6.h>
+#include "common/logging/logging.h"
 #include "common/stats/ServiceData.h"
 #include "fboss/agent/AddressUtil.h"
 #include "fboss/agent/ArpHandler.h"
@@ -290,17 +291,15 @@ void ThriftHandler::syncFib(
   }
 }
 
-void ThriftHandler::getAllInterfaces(
-    std::map<int32_t, InterfaceDetail>& interfaces) {
-  ensureConfigured();
-  for (const auto& intf : (*sw_->getState()->getInterfaces())) {
-    auto& interfaceDetail = interfaces[intf->getID()];
-
+static void populateInterfaceDetail(InterfaceDetail& interfaceDetail,
+                                    const std::shared_ptr<Interface> intf) {
     interfaceDetail.interfaceName = intf->getName();
     interfaceDetail.interfaceId = intf->getID();
     interfaceDetail.vlanId = intf->getVlanID();
     interfaceDetail.routerId = intf->getRouterID();
+    interfaceDetail.mtu = intf->getMtu();
     interfaceDetail.mac = intf->getMac().toString();
+    interfaceDetail.address.clear();
     interfaceDetail.address.reserve(intf->getAddresses().size());
     for (const auto& addrAndMask: intf->getAddresses()) {
       IpPrefix temp;
@@ -308,6 +307,14 @@ void ThriftHandler::getAllInterfaces(
       temp.prefixLength = addrAndMask.second;
       interfaceDetail.address.push_back(temp);
     }
+}
+
+void ThriftHandler::getAllInterfaces(
+    std::map<int32_t, InterfaceDetail>& interfaces) {
+  ensureConfigured();
+  for (const auto& intf : (*sw_->getState()->getInterfaces())) {
+    auto& interfaceDetail = interfaces[intf->getID()];
+    populateInterfaceDetail(interfaceDetail, intf);
   }
 }
 
@@ -327,20 +334,7 @@ void ThriftHandler::getInterfaceDetail(InterfaceDetail& interfaceDetail,
   if (!intf) {
     throw FbossError("no such interface ", interfaceId);
   }
-
-  interfaceDetail.interfaceName = intf->getName();
-  interfaceDetail.interfaceId = intf->getID();
-  interfaceDetail.vlanId = intf->getVlanID();
-  interfaceDetail.routerId = intf->getRouterID();
-  interfaceDetail.mac = intf->getMac().toString();
-  interfaceDetail.address.clear();
-  interfaceDetail.address.reserve(intf->getAddresses().size());
-  for (const auto& addrAndMask: intf->getAddresses()) {
-    IpPrefix temp;
-    temp.ip = toBinaryAddress(addrAndMask.first);
-    temp.prefixLength = int(addrAndMask.second);
-    interfaceDetail.address.push_back(temp);
-  }
+  populateInterfaceDetail(interfaceDetail, intf);
 }
 
 void ThriftHandler::getNdpTable(std::vector<NdpEntryThrift>& ndpTable) {
@@ -400,7 +394,7 @@ void ThriftHandler::getPortInfoHelper(
   portInfo.portId = port->getID();
   portInfo.name = port->getName();
   portInfo.description = port->getDescription();
-  portInfo.speedMbps = (int) port->getWorkingSpeed();
+  portInfo.speedMbps = static_cast<int>(port->getSpeed());
   for (auto entry : port->getVlans()) {
     portInfo.vlans.push_back(entry.first);
   }
@@ -879,20 +873,6 @@ void ThriftHandler::getVlanBinaryAddressesByName(BinaryAddresses& addrs,
   getVlanAddresses(getVlan(*vlan), addrs, toBinaryAddress);
 }
 
-void ThriftHandler::getSfpDomInfo(
-    map<int32_t, SfpDom>& /*domInfos*/,
-    unique_ptr<vector<int32_t>> /*ports*/) {
-  throw FbossError(folly::to<std::string>("This call is no longer supported, ",
-      "use getTransceiverInfo instead"));
-}
-
-void ThriftHandler::getTransceiverInfo(
-    map<int32_t, TransceiverInfo>& /*info*/,
-    unique_ptr<vector<int32_t>> /*ids*/) {
-  throw FbossError(folly::to<std::string>("This call is no longer supported, ",
-      "please call the QsfpService instead"));
-}
-
 template<typename ADDR_TYPE, typename ADDR_CONVERTER>
 void ThriftHandler::getVlanAddresses(const Vlan* vlan,
     std::vector<ADDR_TYPE>& addrs, ADDR_CONVERTER& converter) {
@@ -929,7 +909,7 @@ void ThriftHandler::ensureFibSynced(StringPiece function) {
   }
 
   if (!function.empty()) {
-    VLOG(1) << "failing thrift prior to FIB Sync: " << function;
+    VLOG_EVERY_MS(1, 1000) << "failing thrift prior to FIB Sync: " << function;
   }
   throw FbossError("switch is still initializing, FIB not synced yet");
 }

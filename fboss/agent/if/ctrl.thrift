@@ -91,6 +91,7 @@ struct InterfaceDetail {
   4: i32 routerId,
   5: string mac,
   6: list<IpPrefix> address,
+  7: i32 mtu,
 }
 
 struct ProductInfo {
@@ -191,10 +192,9 @@ struct TransceiverIdxThrift {
 struct PortStatus {
   1: bool enabled,
   2: bool up,
-  // Deprecated, this should be retrieved from the qsfp_service
-  3: optional bool present,
+  3: optional bool present,  # deprecated
   4: optional TransceiverIdxThrift transceiverIdx,
-  5: i64 speedMbps,
+  5: i64 speedMbps,  // TODO: i32 (someone is optimistic about port speeds)
 }
 
 enum CaptureDirection {
@@ -439,12 +439,6 @@ service FbossCtrl extends fb303.FacebookService {
   list<L2EntryThrift> getL2Table()
     throws (1: fboss.FbossBaseError error)
   list<AggregatePortEntryThrift> getAggregatePortTable()
-    throws (1: fboss.FbossBaseError error)
-
-  // Deprecated - use the qsfp_service instead
-  map<i32, optic.SfpDom> getSfpDomInfo(1: list<i32> port)
-    throws (1: fboss.FbossBaseError error)
-  map<i32, transceiver.TransceiverInfo> getTransceiverInfo(1: list<i32> idx)
     throws (1: fboss.FbossBaseError error)
 
   /*

@@ -9,6 +9,7 @@
  */
 #pragma once
 
+#include "fboss/agent/FbossError.h"
 #include "fboss/agent/types.h"
 
 namespace facebook { namespace fboss {
@@ -87,6 +88,8 @@ public:
     return max_ == min_;
   }
 
+  std::string str() const;
+
 private:
   uint32_t flags_;
   uint32_t min_;
@@ -123,6 +126,12 @@ public:
   BcmAclEntryHandle getHandle() const {
     return handle_;
   }
+  /**
+   * Check whether the acl details of handle in h/w matches the s/w acl and
+   * ranges
+   */
+  static bool isStateSame(BcmSwitch* hw, int gid, BcmAclEntryHandle handle,
+                          const std::shared_ptr<AclEntry>& acl);
 
 private:
   BcmSwitch* hw_;

@@ -22,6 +22,7 @@
 #include "fboss/agent/Utils.h"
 #include "fboss/agent/hw/BufferStatsLogger.h"
 #include "fboss/agent/hw/bcm/BcmAPI.h"
+#include "fboss/agent/hw/bcm/BcmControlPlane.h"
 #include "fboss/agent/hw/bcm/BcmSflowExporter.h"
 #include "fboss/agent/hw/bcm/BcmError.h"
 #include "fboss/agent/hw/bcm/BcmHostKey.h"
@@ -95,7 +96,6 @@ DEFINE_bool(flexports, false,
             "Load the agent with flexport support enabled");
 DEFINE_bool(enable_fine_grained_buffer_stats, false,
             "Enable fine grained buffer stats collection by default");
-
 enum : uint8_t {
   kRxCallbackPriority = 1,
 };
@@ -153,7 +153,8 @@ BcmSwitch::BcmSwitch(BcmPlatform *platform, HashMode hashMode)
       bcmTableStats_(new BcmTableStats(this, isAlpmEnabled())),
       bufferStatsLogger_(createBufferStatsLogger()),
       trunkTable_(new BcmTrunkTable(this)),
-      sFlowExporterTable_(new BcmSflowExporterTable()) {
+      sFlowExporterTable_(new BcmSflowExporterTable()),
+      controlPlane_(new BcmControlPlane(this)) {
   dumpConfigMap(BcmAPI::getHwConfig(), platform->getHwConfigDumpFile());
   exportSdkVersion();
 }
@@ -190,6 +191,7 @@ unique_ptr<BcmUnit> BcmSwitch::releaseUnit() {
   aclTable_.reset();
   bcmTableStats_.reset();
   trunkTable_.reset();
+  controlPlane_.reset();
 
   unit_ = -1;
   unitObject_->setCookie(nullptr);
@@ -390,6 +392,10 @@ std::shared_ptr<SwitchState> BcmSwitch::getColdBootSwitchState() const {
 
     auto swPort = make_shared<Port>(portID, name);
     swPort->setSpeed(bcmPort->getSpeed());
+    if (platform_->isCosSupported()) {
+      auto queues = bcmPort->getCurrentQueueSettings();
+      swPort->resetPortQueues(queues);
+    }
     bootState->addPort(swPort);
 
     memberPorts.insert(make_pair(portID, false));
@@ -528,12 +534,14 @@ HwInitResult BcmSwitch::init(Callback* callback) {
   ecmpHashSetup();
 
   // initialize field processor and field groups
-  if (!warmBoot) {
-    initFieldProcessor();
-    createAclGroup();
-    dropIPv6RAs();
-    copyIPv6LinkLocalMcastPackets();
-  }
+  // TODO - Stop initing FP on warm boots once
+  // T26329911 is solved. The problem seen there
+  // is that probing FP groups for comparison
+  // during warm boot messes up the COPP policy
+  // to direct traffic to CPU. Upshot of it being
+  // that most traffic gets routed to queue0
+  initFieldProcessor();
+  setupChangedOrMissingFPGroups();
 
   dropDhcpPackets();
   mmuState_ = queryMmuState();
@@ -565,7 +573,7 @@ HwInitResult BcmSwitch::init(Callback* callback) {
 
   setupCos();
   configureRxRateLimiting();
-  setupCpuPortCounters();
+  controlPlane_->setupQueueCounters();
   if (fineGrainedBufferStatsEnabled_) {
     startFineGrainedBufferStatLogging();
   }
@@ -800,16 +808,23 @@ void BcmSwitch::processChangedPorts(const StateDelta& delta) {
         bcmPort->program(newPort);
       }
 
-      auto queuesChanged = oldPort->getPortQueues() !=
-        newPort->getPortQueues();
-      VLOG_IF(1, queuesChanged) << "New cos queue settings on port " << id;
+      if (newPort->getPortQueues().size() != 0 &&
+          !platform_->isCosSupported()) {
+        throw FbossError("Changing settings for cos queues not supported on ",
+            "this platform");
+      }
 
-      if (queuesChanged) {
-        if (!platform_->isCosSupported()) {
-          throw FbossError("Changing settings for cos queues not supported on ",
-              "this platform");
+      // We expect the number of port queues to remain constant because this is
+      // defined by the hardware
+      for (const auto& newQueue : newPort->getPortQueues()) {
+        if (oldPort->getPortQueues().size() > 0 &&
+            *(oldPort->getPortQueues().at(newQueue->getID())) == *newQueue) {
+          continue;
         }
-        bcmPort->setupQueues(newPort->getPortQueues());
+
+        VLOG(1) << "New cos queue settings on port " << id << " queue "
+                << newQueue->getID();
+        bcmPort->setupQueue(newQueue);
       }
     });
 }
@@ -1424,7 +1439,7 @@ void BcmSwitch::updateStats(SwitchStats *switchStats) {
   // Update global statistics.
   updateGlobalStats();
   // Update cpu or host bound packet stats
-  updateCpuPortCounters();
+  controlPlane_->updateQueueCounters();
 }
 
 shared_ptr<BcmSwitchEventCallback> BcmSwitch::registerSwitchEventCallback(

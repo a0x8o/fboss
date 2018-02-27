@@ -77,7 +77,7 @@ void WedgePlatform::onHwInitialized(SwSwitch* sw) {
   // could populate with initial ports here, but should get taken care
   // of through state changes sent to the stateUpdated method.
   initLEDs();
-  qsfpCache_->init(sw->getBackgroundEVB());
+  qsfpCache_->init(sw->getQsfpCacheEvb());
   sw->registerStateObserver(this, "WedgePlatform");
 }
 
@@ -88,7 +88,9 @@ void WedgePlatform::stateUpdated(const StateDelta& delta) {
     auto newPort = entry.getNew();
     if (newPort) {
       auto platformPort = getPort(newPort->getID());
-      changedPorts[newPort->getID()] = platformPort->toThrift(newPort);
+      if (platformPort->supportsTransceiver()) {
+        changedPorts[newPort->getID()] = platformPort->toThrift(newPort);
+      }
     }
   }
   qsfpCache_->portsChanged(changedPorts);

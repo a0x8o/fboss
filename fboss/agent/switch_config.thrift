@@ -183,6 +183,9 @@ struct AclEntry {
   17: string name
 
   18: AclActionType actionType = PERMIT
+
+  19: optional string dstMac
+
 }
 
 /*
@@ -199,7 +202,6 @@ struct QueueMatchAction {
 
 struct MatchAction {
   1: optional QueueMatchAction sendToQueue
-  2: bool sendToCPU = false
 }
 
 struct MatchToAction {
@@ -222,18 +224,104 @@ enum MMUScalingFactor {
   FOUR = 10
 }
 
+// This determines how packets are scheduled on a per queue basis
+enum QueueScheduling {
+  // The round robin runs on all queues set to use WRR for a port
+  // Required to set a weight when using this
+  WEIGHTED_ROUND_ROBIN = 0
+  // All packets in this type of queue are dequeued before moving on
+  // to the next (lower priority) queue
+  // This means this can cause starvation on other queues if not
+  // configured properly
+  STRICT_PRIORITY = 1
+}
+
+// Detection based on average queue length in bytes with two thresholds.
+// If the queue length is below the minimum threshold, then never consider the
+// queue congested. If the queue length is above the maximum threshold, then
+// always consider the queue congested. If the queue length is in between the
+// two thresholds, then probabilistically consider the queue congested.
+// The probability grows linearly between the two thresholds. That is,
+// if we call the minimum threshold m and the maximum threshold M then the
+// formula for the probability at queue length m+k is:
+// P(m+k) = k/(M-m) for k between 0 and M-m
+struct LinearQueueCongestionDetection {
+  1: i16 minimumLength
+  2: i16 maximumLength
+}
+
+// Determines when we will consider a queue to be experiencing congestion
+// for the purposes of Active Queue Management
+union QueueCongestionDetection {
+  1: LinearQueueCongestionDetection linear;
+}
+
+// Two behaviors are supported for Active Queue Management:
+// drops and ECN marking. ECN marking is also conditional on the entity
+// entering the queue being an IP packet marked as ECN-enabled. Thus, the
+// two booleans can configure the following behavior during congestion:
+// earlyDrop false; ecn false: Tail drops for all packets
+// earlyDrop true; ecn false: Early drops for all packets
+// earlyDrop false; ecn true: Tail drops for ECN-disabled, ECN for ECN-enabled
+// earlyDrop true; ecn true: Early drops for ECN-disabled, ECN for ECN-enabled
+struct QueueCongestionBehavior {
+  // Drop packets before congested queues are totally full using an algorithm
+  // like WRED
+  1: bool earlyDrop
+  // Mark congestion enabled packets with Congestion Experienced
+  2: bool ecn
+}
+
+// Configuration for Active Queue Management of a PortQueue.
+// Follows the principles outlined in RFC 7567.
+struct ActiveQueueManagement {
+  // How we answer the question "Is the queue congested?"
+  1: QueueCongestionDetection detection
+  // How we handle packets on queues experiencing congestion
+  2: QueueCongestionBehavior behavior
+}
+
+// It is only necessary to define PortQueues for those that you want to
+// change settings on
+// It is only necessary to define PortQueues for those where you do not want to
+// use the default settings.
+// Any queues not described by config will use the system defaults of weighted
+// round robin with a default weight of 1
 struct PortQueue {
   1: required i16 id
   // We only use unicast in Fabric
   2: required StreamType streamType = StreamType.UNICAST
+  // This value is ignored if STRICT_PRIORITY is chosen
   3: optional i32 weight
   4: optional i32 reservedBytes
   5: optional MMUScalingFactor scalingFactor
+  6: required QueueScheduling scheduling
+  7: optional string name
+  8: optional i32 length
+  9: optional i32 packetsPerSec
+  10: optional i32 sharedBytes
+  11: optional ActiveQueueManagement aqm;
 }
 
 struct TrafficPolicyConfig {
   // Order of entries determines priority of acls when applied
   1: list<MatchToAction> matchToAction = []
+}
+
+struct CPUTrafficPolicyConfig {
+  1: optional TrafficPolicyConfig trafficPolicy
+  2: optional map<PacketRxReason, i16> rxReasonToCPUQueue
+}
+
+enum PacketRxReason {
+  UNMATCHED    = 0 // all packets for which there's not a explicit match rule
+  ARP          = 1
+  DHCP         = 2
+  BPDU         = 3
+  L3_SLOW_PATH = 4 // L3 slow path processed pkt
+  L3_DEST_MISS = 5 // L3 DIP miss
+  TTL_1        = 6 // L3UC or IPMC packet with TTL equal to 1
+  CPU_IS_NHOP  = 7 // The CPU port is the next-hop in the routing table
 }
 
 /**
@@ -524,7 +612,7 @@ struct Interface {
   * this flag is set to true if we need to
   * disable auto-state feature for SVI
   */
-  10: optional bool isStateSyncDisabled = 0
+  10: bool isStateSyncDisabled = 0
 }
 
 struct StaticRouteWithNextHops {
@@ -576,18 +664,18 @@ struct SwitchConfig {
   // The MAC address to use for the switch CPU.
   11: optional string cpuMAC
   // Static routes with next hops
-  12: optional list<StaticRouteWithNextHops> staticRoutesWithNhops = [];
+  12: list<StaticRouteWithNextHops> staticRoutesWithNhops = [];
   // Prefixes for which to drop traffic
-  13: optional list<StaticRouteNoNextHops> staticRoutesToNull = [];
+  13: list<StaticRouteNoNextHops> staticRoutesToNull = [];
   // Prefixes for which to send traffic to CPU
-  14: optional list<StaticRouteNoNextHops> staticRoutesToCPU = [];
+  14: list<StaticRouteNoNextHops> staticRoutesToCPU = [];
   // List of all ACLs that are available for use by various agent components
   // ACLs declared here can be referenced in other places in order to tie
   // actions to them, e.g. as part of a MatchToAction
   // Only DROP acls are applied directly, all others require being referenced
   // elsewhere in order to be meaningful
   // Ordering of DROP acls define their priority
-  15: optional list<AclEntry> acls = []
+  15: list<AclEntry> acls = []
   // Set max number of probes to a sufficiently high value
   // to allow for the cases where
   // a) We are probing and the agent on other end is restarting.
@@ -628,4 +716,6 @@ struct SwitchConfig {
   25: optional string config_version
   26: list<SflowCollector> sFlowCollectors = []
   27: optional Lacp lacp
+  28: optional list<PortQueue> cpuQueues
+  29: optional CPUTrafficPolicyConfig cpuTrafficPolicy
 }

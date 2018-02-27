@@ -8,7 +8,6 @@
  *
  */
 #include "fboss/agent/state/AclEntry.h"
-#include "fboss/agent/state/MatchAction.h"
 #include "fboss/agent/state/NodeBase-defs.h"
 #include "fboss/agent/state/StateUtils.h"
 #include <folly/Conv.h>
@@ -40,6 +39,7 @@ constexpr auto kIcmpCode = "icmpCode";
 constexpr auto kIcmpType = "icmpType";
 constexpr auto kDscp = "dscp";
 constexpr auto kPortName = "portName";
+constexpr auto kDstMac = "dstMac";
 constexpr auto kAclAction = "aclAction";
 }
 
@@ -116,6 +116,9 @@ folly::dynamic AclEntryFields::toFollyDynamic() const {
   if (dstIp.first) {
     aclEntry[kDstIp] = IPAddress::networkToString(dstIp);
   }
+  if (dstMac) {
+    aclEntry[kDstMac] = dstMac->toString();
+  }
   if (proto) {
     aclEntry[kProto] = static_cast<uint8_t>(proto.value());
   }
@@ -154,7 +157,9 @@ folly::dynamic AclEntryFields::toFollyDynamic() const {
   auto itr_action = cfg::_AclActionType_VALUES_TO_NAMES.find(actionType);
   CHECK(itr_action != cfg::_AclActionType_VALUES_TO_NAMES.end());
   aclEntry[kActionType] = itr_action->second;
-  aclEntry[kAclAction] = MatchAction::toFollyDynamic(aclAction);
+  if (aclAction) {
+    aclEntry[kAclAction] = aclAction.value().toFollyDynamic();
+  }
   aclEntry[kPriority] = priority;
   aclEntry[kName] = name;
   return aclEntry;
@@ -180,6 +185,9 @@ AclEntryFields AclEntryFields::fromFollyDynamic(
       " vs ",
       aclEntryJson[kDstIp].asString()
     );
+  }
+  if (aclEntryJson.find(kDstMac) != aclEntryJson.items().end()) {
+    aclEntry.dstMac = MacAddress(aclEntryJson[kDstMac].asString());
   }
   if (aclEntryJson.find(kProto) != aclEntryJson.items().end()) {
     aclEntry.proto = aclEntryJson[kProto].asInt();

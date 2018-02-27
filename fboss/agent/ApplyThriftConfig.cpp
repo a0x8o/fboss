@@ -20,6 +20,7 @@
 #include "fboss/agent/state/AggregatePort.h"
 #include "fboss/agent/state/AggregatePortMap.h"
 #include "fboss/agent/state/ArpResponseTable.h"
+#include "fboss/agent/state/ControlPlane.h"
 #include "fboss/agent/state/SflowCollector.h"
 #include "fboss/agent/state/SflowCollectorMap.h"
 #include "fboss/agent/state/Interface.h"
@@ -69,8 +70,8 @@ const int kAclStartPriority = 100000;
 
 namespace facebook { namespace fboss {
 
-typedef boost::container::flat_map<int, std::shared_ptr<PortQueue> >
-  QueueConfig;
+using QueueConfig = PortFields::QueueConfig;
+
 /*
  * A class for implementing applyThriftConfig().
  *
@@ -163,7 +164,7 @@ class ThriftConfigApplier {
       const cfg::Port* cfg);
   std::shared_ptr<PortQueue> updatePortQueue(
       const std::shared_ptr<PortQueue>& orig,
-      const cfg::PortQueue& cfg);
+      const cfg::PortQueue* cfg);
   std::shared_ptr<PortQueue> createPortQueue(const cfg::PortQueue& cfg);
   std::shared_ptr<AggregatePortMap> updateAggregatePorts();
   std::shared_ptr<AggregatePort> updateAggPort(
@@ -181,12 +182,12 @@ class ThriftConfigApplier {
   std::shared_ptr<AclMap> updateAcls();
   std::shared_ptr<AclEntry> createAcl(const cfg::AclEntry* config,
       int priority,
-      const cfg::MatchAction* action = nullptr);
+      const MatchAction* action = nullptr);
   std::shared_ptr<AclEntry> updateAcl(const cfg::AclEntry& acl,
     int priority,
     int* numExistingProcessed,
     bool* changed,
-    const cfg::MatchAction* action = nullptr);
+    const MatchAction* action = nullptr);
   // check the acl provided by config is valid
   void checkAcl(const cfg::AclEntry* config) const;
   bool updateNeighborResponseTables(Vlan* vlan, const cfg::Vlan* config);
@@ -209,6 +210,7 @@ class ThriftConfigApplier {
   shared_ptr<SflowCollector> updateSflowCollector(
       const shared_ptr<SflowCollector>& orig,
       const cfg::SflowCollector* config);
+  shared_ptr<ControlPlane> updateControlPlane();
 
   std::shared_ptr<SwitchState> orig_;
   const cfg::SwitchConfig* cfg_{nullptr};
@@ -239,6 +241,14 @@ class ThriftConfigApplier {
 shared_ptr<SwitchState> ThriftConfigApplier::run() {
   auto newState = orig_->clone();
   bool changed = false;
+
+  {
+    auto newControlPlane = updateControlPlane();
+    if (newControlPlane) {
+      newState->resetControlPlane(std::move(newControlPlane));
+      changed = true;
+    }
+  }
 
   processVlanPorts();
 
@@ -513,28 +523,40 @@ shared_ptr<PortMap> ThriftConfigApplier::updatePorts() {
 
   return origPorts->clone(newPorts);
 }
+
 std::shared_ptr<PortQueue> ThriftConfigApplier::updatePortQueue(
     const std::shared_ptr<PortQueue>& orig,
-    const cfg::PortQueue& cfg) {
-  CHECK_EQ(orig->getID(), cfg.id);
+    const cfg::PortQueue* cfg) {
+  CHECK_EQ(orig->getID(), cfg->id);
 
-  if (orig->getStreamType() == cfg.streamType &&
-      orig->getWeight() == cfg.weight &&
-      orig->getReservedBytes() == cfg.reservedBytes &&
-      orig->getScalingFactor() == cfg.scalingFactor) {
-    return nullptr;
+  if (orig->getStreamType() == cfg->streamType &&
+      orig->getScheduling() == cfg->scheduling &&
+      orig->getWeight() == cfg->weight &&
+      orig->getReservedBytes() == cfg->reservedBytes &&
+      orig->getScalingFactor() == cfg->scalingFactor &&
+      orig->getAqm() == cfg->aqm) {
+    return orig;
   }
 
   auto newQueue = orig->clone();
-  newQueue->setStreamType(cfg.streamType);
-  if (cfg.__isset.weight) {
-    newQueue->setWeight(cfg.weight);
+  newQueue->setStreamType(cfg->streamType);
+  newQueue->setScheduling(cfg->scheduling);
+  if (cfg->__isset.weight) {
+    newQueue->setWeight(cfg->weight);
   }
-  if (cfg.__isset.reservedBytes) {
-    newQueue->setReservedBytes(cfg.reservedBytes);
+  if (cfg->__isset.reservedBytes) {
+    newQueue->setReservedBytes(cfg->reservedBytes);
   }
-  if (cfg.__isset.scalingFactor) {
-    newQueue->setScalingFactor(cfg.scalingFactor);
+  if (cfg->__isset.scalingFactor) {
+    newQueue->setScalingFactor(cfg->scalingFactor);
+  }
+  if (cfg->__isset.aqm) {
+    if (cfg->aqm.detection.getType() ==
+        cfg::QueueCongestionDetection::Type::__EMPTY__) {
+      throw FbossError(
+          "Active Queue Management must specify a congestion detection method");
+    }
+    newQueue->setAqm(cfg->aqm);
   }
   return newQueue;
 }
@@ -543,6 +565,7 @@ std::shared_ptr<PortQueue> ThriftConfigApplier::createPortQueue(
     const cfg::PortQueue& cfg) {
   auto queue = std::make_shared<PortQueue>(cfg.id);
   queue->setStreamType(cfg.streamType);
+  queue->setScheduling(cfg.scheduling);
   if (cfg.__isset.weight) {
     queue->setWeight(cfg.weight);
   }
@@ -552,7 +575,14 @@ std::shared_ptr<PortQueue> ThriftConfigApplier::createPortQueue(
   if (cfg.__isset.scalingFactor) {
     queue->setScalingFactor(cfg.scalingFactor);
   }
-
+  if (cfg.__isset.aqm) {
+    if (cfg.aqm.detection.getType() ==
+        cfg::QueueCongestionDetection::Type::__EMPTY__) {
+      throw FbossError(
+          "Active Queue Management must specify a congestion detection method");
+    }
+    queue->setAqm(cfg.aqm);
+  }
   return queue;
 }
 
@@ -561,18 +591,30 @@ QueueConfig ThriftConfigApplier::updatePortQueues(
     const cfg::Port* cfg) {
   auto origPortQueues = orig->getPortQueues();
   QueueConfig newPortQueues;
-  // Process all supplied queues
+
+  flat_map<int, const cfg::PortQueue*> newQueues;
   for (const auto& queue : cfg->queues) {
-    auto origQueueIter = origPortQueues.find(queue.id);
-    std::shared_ptr<PortQueue> newQueue;
-    std::shared_ptr<PortQueue> origQueue;
-    if (origQueueIter != origPortQueues.end()) {
-      newQueue = updatePortQueue(origQueueIter->second, queue);
-      origQueue = origQueueIter->second;
-    } else {
-      newQueue = createPortQueue(queue);
+    newQueues.emplace(std::make_pair(queue.id, &queue));
+  }
+
+  // Process all supplied queues
+  // We retrieve the current port queue values from hardware
+  // if there is a config present for any of these queues, we update the
+  // PortQueue according to this
+  // Otherwise we reset it to the default values for this queue type
+  for (int i = 0; i < origPortQueues.size(); i++) {
+    auto newQueueIter = newQueues.find(i);
+    auto newQueue = std::make_shared<PortQueue>(i);
+    if (newQueueIter != newQueues.end()) {
+      newQueue = updatePortQueue(origPortQueues.at(i), newQueueIter->second);
+      newQueues.erase(newQueueIter);
     }
-    updateMap(&newPortQueues, origQueue, newQueue);
+    newPortQueues.push_back(newQueue);
+  }
+
+  if (newQueues.size() > 0) {
+    throw FbossError("Port queue config listed for invalid queues. Maximum",
+        " number of queues on this platform is ", origPortQueues.size());
   }
   return newPortQueues;
 }
@@ -584,6 +626,12 @@ shared_ptr<Port> ThriftConfigApplier::updatePort(const shared_ptr<Port>& orig,
   auto vlans = portVlans_[orig->getID()];
 
   auto portQueues = updatePortQueues(orig, portConf);
+  bool queuesUnchanged = portQueues.size() == orig->getPortQueues().size();
+  for (int i=0; i<portQueues.size() && queuesUnchanged; i++) {
+    if (*(portQueues.at(i)) != *(orig->getPortQueues().at(i))) {
+      queuesUnchanged = false;
+    }
+  }
 
   if (portConf->state == orig->getAdminState() &&
       VlanID(portConf->ingressVlan) == orig->getIngressVlan() &&
@@ -595,7 +643,7 @@ shared_ptr<Port> ThriftConfigApplier::updatePort(const shared_ptr<Port>& orig,
       portConf->description == orig->getDescription() &&
       vlans == orig->getVlans() &&
       portConf->fec == orig->getFEC() &&
-      portQueues == orig->getPortQueues()) {
+      queuesUnchanged) {
     return nullptr;
   }
 
@@ -939,8 +987,12 @@ std::shared_ptr<AclMap> ThriftConfigApplier::updateAcls() {
         aclCfg.dstPort = dstPortID;
         aclCfg.__isset.dstPort = true;
       }
+
+      // Here is sending to regular port queue action
+      MatchAction matchAction = MatchAction();
+      matchAction.setSendToQueue(std::make_pair(mta.action.sendToQueue, false));
       auto acl = updateAcl(aclCfg, priority++, &numExistingProcessed,
-        &changed, &(mta.action));
+        &changed, &matchAction);
       entries.push_back(std::make_pair(acl->getID(), acl));
     }
     return entries;
@@ -981,7 +1033,7 @@ std::shared_ptr<AclEntry> ThriftConfigApplier::updateAcl(
     int priority,
     int* numExistingProcessed,
     bool* changed,
-    const cfg::MatchAction* action) {
+    const MatchAction* action) {
   auto origAcl = orig_->getAcls()->getEntryIf(acl.name);
   auto newAcl = createAcl(&acl, priority, action);
   if (origAcl) {
@@ -1053,7 +1105,7 @@ void ThriftConfigApplier::checkAcl(const cfg::AclEntry *config) const {
 
 shared_ptr<AclEntry> ThriftConfigApplier::createAcl(
     const cfg::AclEntry* config, int priority,
-    const cfg::MatchAction* action) {
+    const MatchAction* action) {
   checkAcl(config);
   auto newAcl = make_shared<AclEntry>(priority, config->name);
   newAcl->setActionType(config->actionType);
@@ -1101,6 +1153,9 @@ shared_ptr<AclEntry> ThriftConfigApplier::createAcl(
   }
   if (config->__isset.dscp) {
     newAcl->setDscp(config->dscp);
+  }
+  if (config->__isset.dstMac) {
+    newAcl->setDstMac(MacAddress(config->dstMac));
   }
   return newAcl;
 }
@@ -1390,6 +1445,11 @@ shared_ptr<Interface> ThriftConfigApplier::updateInterface(
   newIntf->setIsVirtual(config->isVirtual);
   newIntf->setIsStateSyncDisabled(config->isStateSyncDisabled);
   return newIntf;
+}
+
+shared_ptr<ControlPlane> ThriftConfigApplier::updateControlPlane() {
+  // TODO(joseph5wu) Add processing cpu queue setting and reason mapping logics
+  return nullptr;
 }
 
 std::string

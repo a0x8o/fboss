@@ -56,6 +56,7 @@
 #include <folly/String.h>
 #include <folly/Logging.h>
 #include <folly/SocketAddress.h>
+#include <folly/system/ThreadName.h>
 #include <folly/Demangle.h>
 #include <chrono>
 #include <exception>
@@ -86,7 +87,7 @@ using namespace apache::thrift::async;
 
 
 DEFINE_string(config, "", "The path to the local JSON configuration file");
-DEFINE_int32(thread_heartbeat_ms, 5000, "Thread hearbeat interval (ms)");
+DEFINE_int32(thread_heartbeat_ms, 1000, "Thread heartbeat interval (ms)");
 DEFINE_int32(
     distribution_timeout_ms,
     1000,
@@ -182,7 +183,8 @@ void SwSwitch::destroyPushClient(){
 void SwSwitch::constructPushClient(uint16_t port) {
   auto creation = [&, port]() {
     SocketAddress addr("::1", port);
-    auto socket = TAsyncSocket::newSocket(&pcapDistributionEvb_, addr, 2000);
+    auto socket =
+        TAsyncSocket::newSocket(&pcapDistributionEventBase_, addr, 2000);
     auto chan = HeaderClientChannel::newChannel(socket);
     chan->setTimeout(FLAGS_distribution_timeout_ms);
     chan->setCloseCallback(closer_.get());
@@ -190,7 +192,7 @@ void SwSwitch::constructPushClient(uint16_t port) {
         std::make_unique<PcapPushSubscriberAsyncClient>(std::move(chan));
     distributionServiceReady_.store(true);
   };
-  pcapDistributionEvb_.runInEventBaseThread(creation);
+  pcapDistributionEventBase_.runInEventBaseThread(creation);
 }
 
 void SwSwitch::killDistributionProcess(){
@@ -253,6 +255,8 @@ void SwSwitch::stop() {
 
   bgThreadHeartbeat_.reset();
   updThreadHeartbeat_.reset();
+  packetTxThreadHeartbeat_.reset();
+  lacpThreadHeartbeat_.reset();
 
   // stops the background and update threads.
   stopThreads();
@@ -335,6 +339,15 @@ void SwSwitch::gracefulExit() {
 
 void SwSwitch::getProductInfo(ProductInfo& productInfo) const {
   platform_->getProductInfo(productInfo);
+}
+void SwSwitch::updateStats(){
+  try {
+    getHw()->updateStats(stats());
+  } catch (const std::exception& ex) {
+    stats()->updateStatsException();
+    LOG(ERROR) << "Error running updateStats: "
+      << folly::exceptionStr(ex);
+  }
 }
 
 void SwSwitch::registerNeighborListener(
@@ -493,7 +506,7 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
     if (tunMgr) {
       tunMgr_ = std::move(tunMgr);
     } else {
-      tunMgr_ = std::make_unique<TunManager>(this, &fbossPktTxEventBase_);
+      tunMgr_ = std::make_unique<TunManager>(this, &packetTxEventBase_);
     }
   }
 
@@ -543,15 +556,26 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
     &updateEventBase_, "fbossUpdateThread", FLAGS_thread_heartbeat_ms,
     updHeartbeatStatsFunc);
 
-  auto fbossPktTxHeartbeatStatsFunc = [this](int delay, int backLog) {
-    stats()->fbossPktTxHeartbeatDelay(delay);
-    stats()->fbossPktTxEventBacklog(backLog);
+  auto packetTxHeartbeatStatsFunc = [this](int delay, int backLog) {
+    stats()->packetTxHeartbeatDelay(delay);
+    stats()->packetTxEventBacklog(backLog);
   };
-  fbossPktTxThreadHeartbeat_ = std::make_unique<ThreadHeartbeat>(
-      &fbossPktTxEventBase_,
+  packetTxThreadHeartbeat_ = std::make_unique<ThreadHeartbeat>(
+      &packetTxEventBase_,
       "fbossPktTxThread",
       FLAGS_thread_heartbeat_ms,
-      fbossPktTxHeartbeatStatsFunc);
+      packetTxHeartbeatStatsFunc);
+
+  auto updateLacpThreadHeartbeatStats = [this](int delay, int backLog) {
+        stats()->lacpHeartbeatDelay(delay);
+        stats()->lacpEventBacklog(backLog);
+  };
+  lacpThreadHeartbeat_ = std::make_unique<ThreadHeartbeat>(
+      &lacpEventBase_,
+      *folly::getThreadName(lacpThread_->get_id()),
+      FLAGS_thread_heartbeat_ms,
+      updateLacpThreadHeartbeatStats);
+
   portRemediator_->init();
 
   setSwitchRunState(SwitchRunState::INITIALIZED);
@@ -1162,11 +1186,16 @@ void SwSwitch::startThreads() {
       [=] { this->threadLoop("fbossBgThread", &backgroundEventBase_); }));
   updateThread_.reset(new std::thread(
       [=] { this->threadLoop("fbossUpdateThread", &updateEventBase_); }));
-  fbossPktTxThread_.reset(new std::thread(
-      [=] { this->threadLoop("fbossPktTxThread", &fbossPktTxEventBase_); }));
+  packetTxThread_.reset(new std::thread(
+      [=] { this->threadLoop("fbossPktTxThread", &packetTxEventBase_); }));
   pcapDistributionThread_.reset(new std::thread([=] {
-    this->threadLoop("pcapDistributionThread", &pcapDistributionEvb_);
+    this->threadLoop(
+        "fbossPcapDistributionThread", &pcapDistributionEventBase_);
   }));
+  qsfpCacheThread_.reset(new std::thread(
+      [=] { this->threadLoop("fbossQsfpCacheThread", &qsfpCacheEventBase_); }));
+  lacpThread_.reset(new std::thread(
+      [=] { this->threadLoop("fbossLacpThread", &lacpEventBase_); }));
 }
 
 void SwSwitch::stopThreads() {
@@ -1184,13 +1213,21 @@ void SwSwitch::stopThreads() {
     updateEventBase_.runInEventBaseThread(
         [this] { updateEventBase_.terminateLoopSoon(); });
   }
-  if (fbossPktTxThread_) {
-    fbossPktTxEventBase_.runInEventBaseThread(
-        [this] { fbossPktTxEventBase_.terminateLoopSoon(); });
+  if (packetTxThread_) {
+    packetTxEventBase_.runInEventBaseThread(
+        [this] { packetTxEventBase_.terminateLoopSoon(); });
   }
   if (pcapDistributionThread_) {
-    pcapDistributionEvb_.runInEventBaseThread(
-        [this] { pcapDistributionEvb_.terminateLoopSoon(); });
+    pcapDistributionEventBase_.runInEventBaseThread(
+        [this] { pcapDistributionEventBase_.terminateLoopSoon(); });
+  }
+  if (qsfpCacheThread_) {
+    qsfpCacheEventBase_.runInEventBaseThread(
+        [this] { qsfpCacheEventBase_.terminateLoopSoon(); });
+  }
+  if (lacpThread_) {
+    lacpEventBase_.runInEventBaseThread(
+        [this] { lacpEventBase_.terminateLoopSoon(); });
   }
   if (backgroundThread_) {
     backgroundThread_->join();
@@ -1198,11 +1235,17 @@ void SwSwitch::stopThreads() {
   if (updateThread_) {
     updateThread_->join();
   }
-  if (fbossPktTxThread_) {
-    fbossPktTxThread_->join();
+  if (packetTxThread_) {
+    packetTxThread_->join();
   }
   if (pcapDistributionThread_) {
     pcapDistributionThread_->join();
+  }
+  if (qsfpCacheThread_) {
+    qsfpCacheThread_->join();
+  }
+  if (lacpThread_) {
+    lacpThread_->join();
   }
 }
 

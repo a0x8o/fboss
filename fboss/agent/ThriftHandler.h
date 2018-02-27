@@ -23,7 +23,7 @@
 
 #include <folly/Synchronized.h>
 #include <folly/String.h>
-#include <thrift/lib/cpp/server/TServer.h>
+#include <thrift/lib/cpp/server/TServerEventHandler.h>
 #include <thrift/lib/cpp2/async/DuplexChannel.h>
 
 namespace facebook { namespace fboss {
@@ -209,6 +209,20 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
    */
   void reloadConfig() override;
 
+  /**
+   * Serialize live running switch state at the path pointer by JSON Pointer
+   */
+  void getCurrentStateJSON(std::string& ret, std::unique_ptr<std::string>)
+      override;
+
+  /**
+   * Patch live running switch state at path pointed by jsonPointer using the
+   * JSON merge patch supplied in jsonPatch
+   */
+  void patchCurrentStateJSON(
+      std::unique_ptr<std::string> jsonPointer,
+      std::unique_ptr<std::string> jsonPatch) override;
+
  protected:
   void ensureConfigured(folly::StringPiece function);
   void ensureConfigured() {
@@ -247,10 +261,14 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
                                 std::vector<std::string> added,
                                 std::vector<std::string> deleted);
 
+  void updateUnicastRoutesImpl(
+    int16_t client, const std::unique_ptr<std::vector<UnicastRoute>>& routes,
+    const std::string& updType, bool sync);
+
   void getPortInfoHelper(
       PortInfoThrift& portInfo,
       const std::shared_ptr<Port> port);
-  void fillPortStats(PortInfoThrift& portInfo);
+  void fillPortStats(PortInfoThrift& portInfo, int numPortQs = 0);
 
   Vlan* getVlan(int32_t vlanId);
   Vlan* getVlan(const std::string& vlanName);

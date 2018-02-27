@@ -5,12 +5,13 @@ from __future__ import unicode_literals
 
 import unittest
 from fboss.system_tests.system_tests import FbossBaseSystemTest, test_tags
+from fboss.system_tests.testutils.cli_thrift_helper import get_interfaces_mtu
 
 JUMBO_FRAME_SIZE = 9000
 PACKET_HEADER = 62
 
 
-@test_tags("jumbo_frame")
+@test_tags("jumbo_frame", "run-on-diff")
 class JumboFrameTest(FbossBaseSystemTest):
     def _is_topology_jumbo_frame_enabled(self):
         '''
@@ -19,12 +20,10 @@ class JumboFrameTest(FbossBaseSystemTest):
         self._jumbo_frame_hosts = []
 
         # check if switch has jumbo frame MTU set
-        with self.test_topology.switch_thrift() as sw_client:
-            # (ToDo-prathyushapeddi): Have better way to obtain interface
-            # MTU's. T22299283 will make it little better.
-            resp = sw_client.getRunningConfig()
-            if '\"mtu\": 9000' not in resp:
-                return False
+        interfaces_mtu = get_interfaces_mtu(self.test_topology.switch_thrift)
+        if any(map(lambda mtu: mtu != JUMBO_FRAME_SIZE, interfaces_mtu.values())):
+            return False
+
 
         # check if servers have jumbo MTU set,
         for host in self.test_topology.hosts():

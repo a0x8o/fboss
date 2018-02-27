@@ -36,9 +36,10 @@ bool BcmSwitch::isAlpmEnabled() {
 
 void BcmSwitch::dropDhcpPackets() {}
 
-void BcmSwitch::dropIPv6RAs() {}
-
 void BcmSwitch::setupCos() {}
+
+void BcmSwitch::setupChangedOrMissingFPGroups() {
+}
 
 void BcmSwitch::copyIPv6LinkLocalMcastPackets() {
   // OpenNSL doesn't yet provide functions for adding field-processor rules
@@ -48,6 +49,10 @@ void BcmSwitch::copyIPv6LinkLocalMcastPackets() {
 void BcmSwitch::configureRxRateLimiting() {
   // OpenNSL doesn't yet provide functions for configuring rate-limiting,
   // so rate limiting settings must be baked into the binary driver.
+}
+
+void BcmSwitch::createSlowProtocolsGroup() {
+  // OpenNSL doesn't yet provide functions for adding field-processor rules
 }
 
 bool BcmSwitch::isRxThreadRunning() {
@@ -110,11 +115,6 @@ void BcmSwitch::processRemovedAcl(const std::shared_ptr<AclEntry>& /*acl*/) {}
 BcmSwitch::MmuState BcmSwitch::queryMmuState() const {
   return MmuState::UNKNOWN;
 }
-
-// Update cpu or host bound port statistics
-void BcmSwitch::updateCpuPortCounters() {}
-// API not available in opennsl to support this
-void BcmSwitch::setupCpuPortCounters() {}
 
 opennsl_gport_t BcmSwitch::getCpuGPort() const {
   // API not available in opennsl

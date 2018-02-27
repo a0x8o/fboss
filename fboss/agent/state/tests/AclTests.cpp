@@ -17,12 +17,15 @@
 #include "fboss/agent/state/SwitchState.h"
 
 #include <folly/IPAddress.h>
+#include <folly/MacAddress.h>
 #include <gtest/gtest.h>
 
 using namespace facebook::fboss;
 using std::make_pair;
 using std::make_shared;
 using std::shared_ptr;
+using folly::MacAddress;
+
 namespace {
 // We offset the start point in ApplyThriftConfig
 constexpr auto kAclStartPriority = 100000;
@@ -70,6 +73,7 @@ TEST(Acl, applyConfig) {
   EXPECT_EQ(cfg::AclActionType::DENY, aclV1->getActionType());
   EXPECT_EQ(5, aclV1->getSrcPort());
   EXPECT_EQ(8, aclV1->getDstPort());
+
   EXPECT_FALSE(aclV1->isPublished());
 
   config.acls[0].dstIp = "invalid address";
@@ -191,6 +195,27 @@ TEST(Acl, applyConfig) {
   auto aclV5 = stateV5->getAcl("system:acl3");
   EXPECT_NE(nullptr, aclV5);
   EXPECT_EQ(aclV5->getIpFrag().value(), cfg::IpFragMatch::MATCH_NOT_FRAGMENTED);
+
+  // set dst Mac
+  auto dstMacStr = "01:01:01:01:01:01";
+  configV2.acls[0].__isset.dstMac = true;
+  configV2.acls[0].dstMac = dstMacStr;
+
+  auto stateV6 = publishAndApplyConfig(stateV5, &configV2, platform.get());
+  EXPECT_NE(nullptr, stateV6);
+  auto aclV6 = stateV6->getAcl("system:acl3");
+  EXPECT_NE(nullptr, aclV6);
+
+  EXPECT_EQ(MacAddress(dstMacStr), aclV6->getDstMac());
+  // Remove src, dst Mac
+  configV2.acls[0].__isset.dstMac = false;
+
+  auto stateV7 = publishAndApplyConfig(stateV6, &configV2, platform.get());
+  EXPECT_NE(nullptr, stateV7);
+  auto aclV7 = stateV7->getAcl("system:acl3");
+  EXPECT_NE(nullptr, aclV7);
+
+  EXPECT_FALSE(aclV7->getDstMac());
 }
 
 TEST(Acl, stateDelta) {
@@ -402,4 +427,38 @@ TEST(Acl, AclGeneration) {
   config.acls[1].dstPort = 5;
   EXPECT_THROW(publishAndApplyConfig(stateV1, &config, platform.get()),
       FbossError);
+}
+
+TEST(Acl, SerializeAclEntry) {
+  auto entry = std::make_unique<AclEntry>(0, "dscp1");
+  entry->setDscp(1);
+  MatchAction action = MatchAction();
+  cfg::QueueMatchAction queueAction = cfg::QueueMatchAction();
+  queueAction.queueId = 3;
+  action.setSendToQueue(make_pair(queueAction, false));
+  entry->setAclAction(action);
+
+  auto serialized = entry->toFollyDynamic();
+  auto entryBack = AclEntry::fromFollyDynamic(serialized);
+
+  EXPECT_TRUE(*entry == *entryBack);
+  EXPECT_TRUE(entryBack->getAclAction());
+  auto aclAction = entryBack->getAclAction().value();
+  EXPECT_TRUE(aclAction.getSendToQueue());
+  EXPECT_EQ(aclAction.getSendToQueue().value().second, false);
+  EXPECT_EQ(aclAction.getSendToQueue().value().first.queueId, 3);
+
+  // change to sendToCPU = true
+  action.setSendToQueue(make_pair(queueAction, true));
+  EXPECT_EQ(action.getSendToQueue().value().second, true);
+  entry->setAclAction(action);
+  serialized = entry->toFollyDynamic();
+  entryBack = AclEntry::fromFollyDynamic(serialized);
+
+  EXPECT_TRUE(*entry == *entryBack);
+  EXPECT_TRUE(entryBack->getAclAction());
+  aclAction = entryBack->getAclAction().value();
+  EXPECT_TRUE(aclAction.getSendToQueue());
+  EXPECT_EQ(aclAction.getSendToQueue().value().second, true);
+  EXPECT_EQ(aclAction.getSendToQueue().value().first.queueId, 3);
 }

@@ -26,7 +26,7 @@ void WedgeManager::initTransceiverMap() {
   for (int idx = 0; idx < getNumQsfpModules(); idx++) {
     auto qsfpImpl = std::make_unique<WedgeQsfp>(idx, wedgeI2CBusLock_.get());
     auto qsfp = std::make_unique<QsfpModule>(std::move(qsfpImpl));
-    qsfp->detectTransceiver();
+    qsfp->refresh();
     transceivers_.push_back(move(qsfp));
     LOG(INFO) << "making QSFP for " << idx;
   }
@@ -77,6 +77,9 @@ void WedgeManager::syncPorts(
     std::unique_ptr<std::map<int32_t, PortStatus>> ports) {
 
   auto groups = folly::gen::from(*ports)
+    | folly::gen::filter([](const std::pair<int32_t, PortStatus>& item) {
+        return item.second.__isset.transceiverIdx;
+      })
     | folly::gen::groupBy([](const std::pair<int32_t, PortStatus>& item) {
         return item.second.transceiverIdx.transceiverId;
       })
@@ -87,17 +90,14 @@ void WedgeManager::syncPorts(
     LOG(INFO) << "Syncing ports of transceiver " << transceiverIdx;
 
     auto transceiver = transceivers_.at(transceiverIdx).get();
-    for (auto& it : group.values()) {
-      transceiver->portChanged(it.first, std::move(it.second));
-    }
-    transceiver->customizeTransceiverIfDown();
+    transceiver->transceiverPortsChanged(group.values());
     info[transceiverIdx] = transceiver->getTransceiverInfo();
   }
 }
 
-void WedgeManager::customizeDownTransceivers() {
+void WedgeManager::refreshTransceivers() {
   for (const auto& transceiver : transceivers_) {
-    transceiver->customizeTransceiverIfDown();
+    transceiver->refresh();
   }
 }
 

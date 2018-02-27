@@ -29,10 +29,16 @@ struct PortQueueFields {
   folly::dynamic toFollyDynamic() const;
   static PortQueueFields fromFollyDynamic(const folly::dynamic& json);
   uint8_t id{0};
+  cfg::QueueScheduling scheduling{cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN};
   cfg::StreamType streamType{cfg::StreamType::UNICAST};
-  folly::Optional<int> weight{folly::none};
+  int weight{1};
   folly::Optional<int> reservedBytes{folly::none};
   folly::Optional<cfg::MMUScalingFactor> scalingFactor{folly::none};
+  folly::Optional<cfg::ActiveQueueManagement> aqm{folly::none};
+ private:
+  folly::dynamic aqmToFollyDynamic() const;
+  static cfg::ActiveQueueManagement aqmFromFollyDynamic(
+      const folly::dynamic& json);
 };
 
 /*
@@ -57,16 +63,29 @@ class PortQueue :
     return getFields()->toFollyDynamic();
   }
 
-  bool operator==(const PortQueue& queue) {
+  bool operator==(const PortQueue& queue) const {
     return getFields()->id == queue.getID() &&
            getFields()->streamType == queue.getStreamType() &&
            getFields()->weight == queue.getWeight() &&
            getFields()->reservedBytes == queue.getReservedBytes() &&
-           getFields()->scalingFactor == queue.getScalingFactor();
+           getFields()->scalingFactor == queue.getScalingFactor() &&
+           getFields()->scheduling == queue.getScheduling() &&
+           getFields()->aqm == queue.getAqm();
+  }
+  bool operator!=(const PortQueue& queue) {
+    return !(*this == queue);
   }
 
   uint8_t getID() const {
     return getFields()->id;
+  }
+
+  void setScheduling(cfg::QueueScheduling scheduling) {
+    writableFields()->scheduling = scheduling;
+  }
+
+  cfg::QueueScheduling getScheduling() const {
+    return getFields()->scheduling;
   }
 
   void setStreamType(cfg::StreamType type) {
@@ -77,7 +96,7 @@ class PortQueue :
     return getFields()->streamType;
   }
 
-  folly::Optional<int> getWeight() const {
+  int getWeight() const {
     return getFields()->weight;
   }
 
@@ -99,6 +118,14 @@ class PortQueue :
 
   void setScalingFactor(cfg::MMUScalingFactor scalingFactor) {
     writableFields()->scalingFactor = scalingFactor;
+  }
+
+  folly::Optional<cfg::ActiveQueueManagement> getAqm() const {
+    return getFields()->aqm;
+  }
+
+  void setAqm(const cfg::ActiveQueueManagement& aqm) {
+    writableFields()->aqm = aqm;
   }
 
  private:

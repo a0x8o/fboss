@@ -13,11 +13,13 @@
 #include "fboss/agent/FbossError.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/state/NodeBase.h"
+#include "fboss/agent/state/MatchAction.h"
 
 #include <string>
 #include <utility>
 #include <folly/IPAddress.h>
 #include <folly/Optional.h>
+#include <folly/MacAddress.h>
 
 namespace facebook { namespace fboss {
 
@@ -159,9 +161,10 @@ struct AclEntryFields {
   folly::Optional<uint8_t> icmpType{folly::none};
   folly::Optional<uint8_t> icmpCode{folly::none};
   folly::Optional<uint8_t> dscp{folly::none};
+  folly::Optional<folly::MacAddress> dstMac{folly::none};
 
   cfg::AclActionType actionType{cfg::AclActionType::PERMIT};
-  cfg::MatchAction aclAction;
+  folly::Optional<MatchAction> aclAction{folly::none};
 };
 
 /*
@@ -204,7 +207,8 @@ class AclEntry :
            getFields()->ipFrag == acl.getIpFrag() &&
            getFields()->icmpType == acl.getIcmpType() &&
            getFields()->icmpCode == acl.getIcmpCode() &&
-           getFields()->dscp == acl.getDscp();
+           getFields()->dscp == acl.getDscp() &&
+           getFields()->dstMac == acl.getDstMac();
   }
 
   int getPriority() const {
@@ -215,11 +219,11 @@ class AclEntry :
     return getFields()->name;
   }
 
-  const cfg::MatchAction& getAclAction() const {
+  const folly::Optional<MatchAction> getAclAction() const {
     return getFields()->aclAction;
   }
 
-  void setAclAction(const cfg::MatchAction& action) {
+  void setAclAction(const MatchAction& action) {
     writableFields()->aclAction = action;
   }
 
@@ -333,6 +337,14 @@ class AclEntry :
 
   void setDscp(uint8_t dscp) {
     writableFields()->dscp = dscp;
+  }
+
+  folly::Optional<folly::MacAddress> getDstMac() const {
+    return getFields()->dstMac;
+  }
+
+  void setDstMac(const folly::MacAddress& dstMac) {
+    writableFields()->dstMac = dstMac;
   }
 
  private:

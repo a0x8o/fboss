@@ -34,6 +34,7 @@
 #include "fboss/agent/state/NdpTable.h"
 #include "fboss/agent/state/NdpEntry.h"
 #include "fboss/agent/state/Port.h"
+#include "fboss/agent/state/PortQueue.h"
 #include "fboss/agent/state/Route.h"
 #include "fboss/agent/state/RouteTable.h"
 #include "fboss/agent/state/RouteTableRib.h"
@@ -44,6 +45,7 @@
 #include "fboss/agent/state/VlanMap.h"
 #include "fboss/agent/if/gen-cpp2/NeighborListenerClient.h"
 
+#include <folly/json_pointer.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/MoveWrapper.h>
@@ -74,6 +76,11 @@ using apache::thrift::server::TConnectionContext;
 using facebook::network::toBinaryAddress;
 using facebook::network::toAddress;
 using facebook::network::toIPAddress;
+
+DEFINE_bool(
+    enable_running_config_mutations,
+    false,
+    "Allow external mutations of running config");
 
 namespace facebook { namespace fboss {
 
@@ -176,40 +183,7 @@ void ThriftHandler::addUnicastRoutes(
     int16_t client, std::unique_ptr<std::vector<UnicastRoute>> routes) {
   ensureConfigured("addUnicastRoutes");
   ensureFibSynced("addUnicastRoutes");
-  RouteUpdateStats stats(sw_, "Add", routes->size());
-  auto updateFn = [&](const shared_ptr<SwitchState>& state) {
-    RouteUpdater updater(state->getRouteTables());
-    RouterID routerId = RouterID(0); // TODO, default vrf for now
-    auto clientIdToAdmin = sw_->clientIdToAdminDistance(client);
-    for (const auto& route : *routes) {
-      auto network = toIPAddress(route.dest.ip);
-      auto mask = static_cast<uint8_t>(route.dest.prefixLength);
-      auto adminDistance = route.__isset.adminDistance ? route.adminDistance :
-        clientIdToAdmin;
-      RouteNextHops nexthops = util::toRouteNextHops(route.nextHopAddrs);
-      if (nexthops.size()) {
-        updater.addRoute(routerId, network, mask, ClientID(client),
-                         RouteNextHopEntry(std::move(nexthops), adminDistance));
-      } else {
-        updater.addRoute(routerId, network, mask, ClientID(client),
-                         RouteNextHopEntry(RouteForwardAction::DROP,
-                           adminDistance));
-      }
-      if (network.isV4()) {
-        sw_->stats()->addRouteV4();
-      } else {
-        sw_->stats()->addRouteV6();
-      }
-    }
-    auto newRt = updater.updateDone();
-    if (!newRt) {
-      return shared_ptr<SwitchState>();
-    }
-    auto newState = state->clone();
-    newState->resetRouteTables(std::move(newRt));
-    return newState;
-  };
-  sw_->updateStateBlocking("add unicast route", updateFn);
+  updateUnicastRoutesImpl(client, routes, "addUnicastRoutes", false);
 }
 
 void ThriftHandler::getProductInfo(ProductInfo& productInfo) {
@@ -249,7 +223,16 @@ void ThriftHandler::deleteUnicastRoutes(
 void ThriftHandler::syncFib(
     int16_t client, std::unique_ptr<std::vector<UnicastRoute>> routes) {
   ensureConfigured("syncFib");
-  RouteUpdateStats stats(sw_, "Sync", routes->size());
+  updateUnicastRoutesImpl(client, routes, "syncFib", true);
+  if (!sw_->isFibSynced()) {
+    sw_->fibSynced();
+  }
+}
+
+void ThriftHandler::updateUnicastRoutesImpl(
+  int16_t client, const std::unique_ptr<std::vector<UnicastRoute>>& routes,
+  const std::string& updType, bool sync) {
+  RouteUpdateStats stats(sw_, updType, routes->size());
 
   // Note that we capture routes by reference here, since it is a unique_ptr.
   // This is safe since we use updateStateBlocking(), so routes will still
@@ -260,16 +243,25 @@ void ThriftHandler::syncFib(
     RouteUpdater updater(state->getRouteTables());
     RouterID routerId = RouterID(0); // TODO, default vrf for now
     auto clientIdToAdmin = sw_->clientIdToAdminDistance(client);
-    updater.removeAllRoutesForClient(routerId, ClientID(client));
+    if (sync) {
+      updater.removeAllRoutesForClient(routerId, ClientID(client));
+    }
     for (const auto& route : *routes) {
       folly::IPAddress network = toIPAddress(route.dest.ip);
       uint8_t mask = static_cast<uint8_t>(route.dest.prefixLength);
       auto adminDistance = route.__isset.adminDistance ? route.adminDistance :
         clientIdToAdmin;
       RouteNextHops nexthops = util::toRouteNextHops(route.nextHopAddrs);
-      updater.addRoute(routerId, network, mask, ClientID(client),
-                       RouteNextHopEntry(std::move(nexthops),
-                         adminDistance));
+      if (nexthops.size()) {
+        updater.addRoute(routerId, network, mask, ClientID(client),
+                         RouteNextHopEntry(std::move(nexthops), adminDistance));
+      } else {
+        VLOG(3) << "Blackhole route:" << network << "/"
+                <<  static_cast<int>(mask);
+        updater.addRoute(routerId, network, mask, ClientID(client),
+                         RouteNextHopEntry(RouteForwardAction::DROP,
+                           adminDistance));
+      }
       if (network.isV4()) {
         sw_->stats()->addRouteV4();
       } else {
@@ -284,11 +276,7 @@ void ThriftHandler::syncFib(
     newState->resetRouteTables(std::move(newRt));
     return newState;
   };
-  sw_->updateStateBlocking("sync fib", updateFn);
-
-  if (!sw_->isFibSynced()) {
-    sw_->fibSynced();
-  }
+  sw_->updateStateBlocking(updType, updateFn);
 }
 
 static void populateInterfaceDetail(InterfaceDetail& interfaceDetail,
@@ -360,7 +348,7 @@ void ThriftHandler::getAggregatePortTable(
   VLOG(6) << "Aggregate Port Table size:" << aggregatePortTable.size();
 }
 
-void ThriftHandler::fillPortStats(PortInfoThrift& portInfo) {
+void ThriftHandler::fillPortStats(PortInfoThrift& portInfo, int numPortQs) {
   auto portId = portInfo.portId;
   auto statMap = fbData->getStatMap();
 
@@ -386,6 +374,13 @@ void ThriftHandler::fillPortStats(PortInfoThrift& portInfo) {
 
   fillPortCounters(portInfo.output, "out_");
   fillPortCounters(portInfo.input, "in_");
+  for (int i=0; i<numPortQs; i++) {
+    auto queue = folly::to<std::string>("queue", i, ".");
+    QueueStats stats;
+    stats.congestionDiscards = getSumStat(queue, "out_congestion_discards");
+    stats.outBytes = getSumStat(queue, "out_bytes");
+    portInfo.output.unicast.push_back(stats);
+  }
 }
 
 void ThriftHandler::getPortInfoHelper(
@@ -399,6 +394,46 @@ void ThriftHandler::getPortInfoHelper(
     portInfo.vlans.push_back(entry.first);
   }
 
+  for (const auto& queue : port->getPortQueues()) {
+    PortQueueThrift pq;
+    pq.id = queue->getID();
+    pq.mode = cfg::_QueueScheduling_VALUES_TO_NAMES.find(
+        queue->getScheduling())->second;
+    if (queue->getScheduling() == cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN) {
+      pq.weight = queue->getWeight();
+      pq.__isset.weight = true;
+    }
+    if (queue->getReservedBytes()) {
+      pq.reservedBytes = queue->getReservedBytes().value();
+      pq.__isset.reservedBytes = true;
+    }
+    if (queue->getScalingFactor()) {
+      pq.scalingFactor = cfg::_MMUScalingFactor_VALUES_TO_NAMES.find(
+          queue->getScalingFactor().value())->second;
+      pq.__isset.scalingFactor = true;
+    }
+    if (queue->getAqm()) {
+      auto aqm = queue->getAqm().value();
+
+      pq.aqm.behavior.earlyDrop = aqm.behavior.earlyDrop;
+      pq.aqm.behavior.ecn = aqm.behavior.ecn;
+      pq.__isset.aqm = true;
+      switch (aqm.detection.getType()) {
+        case cfg::QueueCongestionDetection::Type::linear:
+          pq.aqm.detection.linear.minimumLength =
+              aqm.detection.get_linear().minimumLength;
+          pq.aqm.detection.linear.maximumLength =
+              aqm.detection.get_linear().maximumLength;
+          pq.aqm.detection.__isset.linear = true;
+          break;
+        case cfg::QueueCongestionDetection::Type::__EMPTY__:
+          LOG(WARNING) << "Invalid queue congestion detection config";
+          break;
+      }
+    }
+    portInfo.portQueues.push_back(pq);
+  }
+
   portInfo.adminState =
       PortAdminState(port->getAdminState() == cfg::PortState::ENABLED);
   portInfo.operState =
@@ -409,7 +444,7 @@ void ThriftHandler::getPortInfoHelper(
   portInfo.txPause = pause.tx;
   portInfo.rxPause = pause.rx;
 
-  fillPortStats(portInfo);
+  fillPortStats(portInfo, portInfo.portQueues.size());
 }
 
 void ThriftHandler::getPortInfo(PortInfoThrift &portInfo, int32_t portId) {
@@ -448,6 +483,47 @@ void ThriftHandler::getAllPortStats(map<int32_t, PortInfoThrift>& portInfoMap) {
 void ThriftHandler::getRunningConfig(std::string& configStr) {
   ensureConfigured();
   configStr = sw_->getConfigStr();
+}
+
+void ThriftHandler::getCurrentStateJSON(
+    std::string& ret,
+    std::unique_ptr<std::string> jsonPointerStr) {
+  if (!jsonPointerStr) {
+    return;
+  }
+  ensureConfigured();
+  auto const jsonPtr = folly::json_pointer::try_parse(*jsonPointerStr);
+  if (!jsonPtr) {
+    throw FbossError("Malformed JSON Pointer");
+  }
+  auto swState = sw_->getState()->toFollyDynamic();
+  auto dyn = swState.get_ptr(jsonPtr.value());
+  ret = folly::json::serialize(*dyn, folly::json::serialization_opts{});
+}
+
+void ThriftHandler::patchCurrentStateJSON(
+    std::unique_ptr<std::string> jsonPointerStr,
+    std::unique_ptr<std::string> jsonPatchStr) {
+  if (!FLAGS_enable_running_config_mutations) {
+    throw FbossError( "Running config mutations are not allowed");
+  }
+  ensureConfigured();
+  auto const jsonPtr = folly::json_pointer::try_parse(*jsonPointerStr);
+  if (!jsonPtr) {
+    throw FbossError("Malformed JSON Pointer");
+  }
+  // OK to capture by reference because the update call below is blocking
+  auto updateFn = [&](const shared_ptr<SwitchState>& oldState) {
+    auto fullDynamic = oldState->toFollyDynamic();
+    auto* partialDynamic = fullDynamic.get_ptr(jsonPtr.value());
+    if (!partialDynamic) {
+      throw FbossError("JSON Pointer does not address proper object");
+    }
+    // mutates in place, i.e. modifies fullDynamic too
+    partialDynamic->merge_patch(folly::parseJson(*jsonPatchStr));
+    return SwitchState::fromFollyDynamic(fullDynamic);
+  };
+  sw_->updateStateBlocking("JSON patch", std::move(updateFn));
 }
 
 void ThriftHandler::getPortStatus(map<int32_t, PortStatus>& statusMap,

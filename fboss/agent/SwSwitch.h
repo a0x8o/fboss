@@ -168,6 +168,9 @@ class SwSwitch : public HwSwitch::Callback {
 
   bool isExiting() const;
 
+  void updateStats();
+
+
   /*
    * Get a pointer to the current switch state.
    *
@@ -394,22 +397,29 @@ class SwSwitch : public HwSwitch::Callback {
   /*
    * Get the EventBase for the background thread
    */
-  folly::EventBase* getBackgroundEVB() {
+  folly::EventBase* getBackgroundEvb() {
     return &backgroundEventBase_;
-  }
-
-  /*
-   * Get the EventBase for the update thread
-   */
-  folly::EventBase* getUpdateEVB() {
-    return &updateEventBase_;
   }
 
   /*
    * Get the EventBase over which LacpController and LacpMachines should execute
    */
   folly::EventBase* getLacpEvb() {
-    return getBackgroundEVB();
+    return &lacpEventBase_;
+  }
+
+  /*
+   * Get the EventBase over which QsfpCache should execute
+   */
+  folly::EventBase* getQsfpCacheEvb() {
+    return &qsfpCacheEventBase_;
+  }
+
+  /*
+   * Get the EventBase for the update thread
+   */
+  folly::EventBase* getUpdateEvb() {
+    return &updateEventBase_;
   }
 
   /**
@@ -760,26 +770,42 @@ class SwSwitch : public HwSwitch::Callback {
    */
   std::unique_ptr<std::thread> backgroundThread_;
   folly::EventBase backgroundEventBase_;
-
-  /*
-   * A thread for processing SwitchState updates.
-   */
-  std::unique_ptr<std::thread> updateThread_;
-  folly::EventBase updateEventBase_;
+  std::unique_ptr<ThreadHeartbeat> bgThreadHeartbeat_;
 
   /*
    * A thread for processing packets received from
    * host (linux) that may need to be sent out of
    * ASIC front panel ports
    */
-  std::unique_ptr<std::thread> fbossPktTxThread_;
-  folly::EventBase fbossPktTxEventBase_;
+  std::unique_ptr<std::thread> packetTxThread_;
+  folly::EventBase packetTxEventBase_;
+  std::unique_ptr<ThreadHeartbeat> packetTxThreadHeartbeat_;
 
   /*
    * A thread for sending packets to the distribution process
    */
   std::unique_ptr<std::thread> pcapDistributionThread_;
-  folly::EventBase pcapDistributionEvb_;
+  folly::EventBase pcapDistributionEventBase_;
+
+  /*
+   * A thread for communicating with qsfp_service via QsfpCache
+   */
+  std::unique_ptr<std::thread> qsfpCacheThread_;
+  folly::EventBase qsfpCacheEventBase_;
+
+  /*
+   * A thread for processing SwitchState updates.
+   */
+  std::unique_ptr<std::thread> updateThread_;
+  folly::EventBase updateEventBase_;
+  std::unique_ptr<ThreadHeartbeat> updThreadHeartbeat_;
+
+  /*
+   * A thread dedicated to LACP processing.
+   */
+  std::unique_ptr<std::thread> lacpThread_;
+  folly::EventBase lacpEventBase_;
+  std::unique_ptr<ThreadHeartbeat> lacpThreadHeartbeat_;
 
   /*
    * A callback for listening to neighbors coming and going.
@@ -814,9 +840,6 @@ class SwSwitch : public HwSwitch::Callback {
 
   BootType bootType_{BootType::UNINITIALIZED};
   std::unique_ptr<LldpManager> lldpManager_;
-  std::unique_ptr<ThreadHeartbeat> bgThreadHeartbeat_;
-  std::unique_ptr<ThreadHeartbeat> updThreadHeartbeat_;
-  std::unique_ptr<ThreadHeartbeat> fbossPktTxThreadHeartbeat_;
   std::unique_ptr<PortUpdateHandler> portUpdateHandler_;
   SwitchFlags flags_{SwitchFlags::DEFAULT};
 };

@@ -21,29 +21,28 @@ from thrift.transport.TTransport import TTransportException
 
 
 class PortDetailsCmd(cmds.FbossCmd):
-    def run(self, ports):
+    def run(self, ports, show_down=True):
         try:
             self._client = self._create_agent_client()
-            # No ports specified, get all ports
-            if not ports:
-                resp = self._client.getAllPortInfo()
+            resp = self._client.getAllPortInfo()
 
         except FbossBaseError as e:
-            raise SystemExit('Fboss Error: ' + e)
-
+            raise SystemExit('Fboss Error: ' + str(e))
         except Exception as e:
-            raise Exception('Error: ' + e)
+            raise Exception('Error: ' + str(e))
 
-        if ports:
-            for port in ports:
-                self._print_port_details(port)
-        elif resp:
-            all_ports = sorted(resp.values(), key=utils.port_sort_fn)
-            all_ports = [port for port in all_ports if port.operState == 1]
-            for port in all_ports:
-                self._print_port_details(port.portId, port)
-        else:
-            print("No Ports Found")
+        def use_port(port):
+            return (show_down or port.operState == 1) and \
+                   (not ports or port.portId in ports or port.name in ports)
+
+        port_details = {k: v for k, v in resp.items() if use_port(v)}
+
+        if not port_details:
+            print("No ports found")
+
+        for port in sorted(port_details.values(), key=utils.port_sort_fn):
+            self._print_port_details(port)
+            self._print_port_counters(port)
 
     def _convert_bps(self, bps):
         ''' convert bps to human readable form
@@ -69,15 +68,11 @@ class PortDetailsCmd(cmds.FbossCmd):
 
         return bps_per_unit, suffix
 
-    def _print_port_details(self, port_id, port_info=None):
+    def _print_port_details(self, port_info):
         ''' Print out port details
 
-            :var port_id int: port identifier
             :var port_info PortInfoThrift: port information
         '''
-
-        if not port_info:
-            port_info = self._client.getPortInfo(port_id)
 
         admin_status = "ENABLED" if port_info.adminState else "DISABLED"
         oper_status = "UP" if port_info.operState else "DOWN"
@@ -99,7 +94,6 @@ class PortDetailsCmd(cmds.FbossCmd):
             pause = pause + 'RX'
         if pause == '':
             pause = 'None'
-
         fmt = '{:.<50}{}'
         lines = [
             ('Name', port_info.name.strip()),
@@ -114,7 +108,46 @@ class PortDetailsCmd(cmds.FbossCmd):
 
         print()
         print('\n'.join(fmt.format(*l) for l in lines))
-        print('Description'.ljust(20, '.') + (port_info.description or ""))
+
+        if hasattr(port_info, 'portQueues'):
+            print(fmt.format("Unicast queues", len(port_info.portQueues)))
+            for queue in port_info.portQueues:
+                name = "({})".format(+queue.name) if queue.name != "" else ""
+                attrs = [queue.mode]
+                for val in ("weight", "reservedBytes", "scalingFactor"):
+                    if hasattr(queue, val) and getattr(queue, val):
+                        attrs.append("{}={}".format(val, getattr(queue, val)))
+                print("    Queue {}{:30}{}".format(queue.id, name, ",".join(attrs)))
+                if hasattr(queue, "aqm") and getattr(queue, "aqm"):
+                    aqm = getattr(queue, "aqm")
+                    attrs1 = []
+                    attrs1.append("{}={}".format("aqm", "enabled"))
+                    if hasattr(aqm.detection, "linear") and getattr(
+                            aqm.detection, "linear"):
+                        attrs1.append("{}={}".format("detection", "linear"))
+                        linear = getattr(aqm.detection, "linear")
+                        attrs1.append("{}={}".format(
+                            "minThresh",
+                            linear.minimumLength))
+                        attrs1.append("{}={}".format(
+                            "maxThresh",
+                            linear.maximumLength))
+                    if aqm.behavior.earlyDrop:
+                        earlyDrop = "ENABLED"
+                    else:
+                        earlyDrop = "DISABLED"
+                    attrs1.append("{}={}".format("earlyDrop", earlyDrop))
+                    if aqm.behavior.ecn:
+                        ecn = "ENABLED"
+                    else:
+                        ecn = "DISABLED"
+                    attrs1.append("{}={}".format("ecn", ecn))
+                    print('{:<5}{}'.format('', ",".join(attrs1)))
+
+        print(fmt.format('Description', port_info.description or ""))
+
+    def _print_port_counters(self, port_info):
+        pass
 
 
 class PortFlapCmd(cmds.FbossCmd):

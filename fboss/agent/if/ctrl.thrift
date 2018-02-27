@@ -129,6 +129,11 @@ struct PortErrors {
   2: i64 discards,
 }
 
+struct QueueStats {
+  1: i64 congestionDiscards,
+  2: i64 outBytes,
+}
+
 /*
  * Values in these counters are cumulative since the last time the agent
  * started.
@@ -139,6 +144,7 @@ struct PortCounters {
   3: i64 multicastPkts,
   4: i64 broadcastPkts,
   5: PortErrors errors,
+  6: list<QueueStats> unicast = [];
 }
 
 enum PortAdminState {
@@ -149,6 +155,35 @@ enum PortAdminState {
 enum PortOperState {
   DOWN = 0,
   UP = 1,
+}
+
+struct LinearQueueCongestionDetection {
+  1: i16 minimumLength
+  2: i16 maximumLength
+}
+
+struct QueueCongestionDetection {
+  1: optional LinearQueueCongestionDetection linear
+}
+
+struct QueueCongestionBehavior {
+  1: bool earlyDrop
+  2: bool ecn
+}
+
+struct ActiveQueueManagement {
+  1: QueueCongestionDetection detection
+  2: QueueCongestionBehavior behavior
+}
+
+struct PortQueueThrift {
+  1: i32 id,
+  2: string name = "",
+  3: string mode,
+  4: optional i32 weight,
+  5: optional i32 reservedBytes,
+  6: optional string scalingFactor,
+  7: optional ActiveQueueManagement aqm,
 }
 
 struct PortInfoThrift {
@@ -165,6 +200,7 @@ struct PortInfoThrift {
   14: bool fecEnabled, // Forward Error Correction port setting
   15: bool txPause = false,
   16: bool rxPause = false,
+  17: list<PortQueueThrift> portQueues = [],
 }
 
 struct NdpEntryThrift {
@@ -493,6 +529,17 @@ service FbossCtrl extends fb303.FacebookService {
    * has changed since the agent started.
    */
   void reloadConfig()
+
+  /*
+   * Serialize switch state at path pointed by JSON pointer
+   */
+  string getCurrentStateJSON(1: string jsonPointer)
+
+  /*
+   * Apply patch at given path within the state tree. jsonPatch must  be
+   * a valid JSON object string
+   */
+  void patchCurrentStateJSON(1: string jsonPointer, 2: string jsonPatch)
 }
 
 service NeighborListenerClient extends fb303.FacebookService {

@@ -17,6 +17,7 @@
 #include "fboss/agent/ArpHandler.h"
 #include "fboss/agent/HighresCounterSubscriptionHandler.h"
 #include "fboss/agent/IPv6Handler.h"
+#include "fboss/agent/LinkAggregationManager.h"
 #include "fboss/agent/LldpManager.h"
 #include "fboss/agent/SwitchStats.h"
 #include "fboss/agent/SwSwitch.h"
@@ -27,6 +28,8 @@
 #include "fboss/agent/capture/PktCapture.h"
 #include "fboss/agent/capture/PktCaptureManager.h"
 #include "fboss/agent/hw/mock/MockRxPacket.h"
+#include "fboss/agent/state/AggregatePort.h"
+#include "fboss/agent/state/AggregatePortMap.h"
 #include "fboss/agent/state/ArpEntry.h"
 #include "fboss/agent/state/ArpTable.h"
 #include "fboss/agent/state/Interface.h"
@@ -51,6 +54,8 @@
 #include <folly/MoveWrapper.h>
 #include <folly/Range.h>
 #include <thrift/lib/cpp2/async/DuplexChannel.h>
+
+#include <limits>
 
 using apache::thrift::ClientReceiveState;
 using facebook::fb303::cpp2::fb_status;
@@ -341,11 +346,105 @@ void ThriftHandler::getL2Table(std::vector<L2EntryThrift>& l2Table) {
   VLOG(6) << "L2 Table size:" << l2Table.size();
 }
 
-void ThriftHandler::getAggregatePortTable(
-    std::vector<AggregatePortEntryThrift>& aggregatePortTable) {
+LacpPortRateThrift ThriftHandler::fromLacpPortRate(cfg::LacpPortRate rate) {
+  LacpPortRateThrift thriftRate;
+
+  switch (rate) {
+    case cfg::LacpPortRate::SLOW:
+      thriftRate = LacpPortRateThrift::SLOW;
+      break;
+    case cfg::LacpPortRate::FAST:
+      thriftRate = LacpPortRateThrift::FAST;
+      break;
+  }
+
+  return thriftRate;
+}
+
+LacpPortActivityThrift ThriftHandler::fromLacpPortActivity(
+    cfg::LacpPortActivity activity) {
+  LacpPortActivityThrift thriftActivity;
+
+  switch (activity) {
+    case cfg::LacpPortActivity::ACTIVE:
+      thriftActivity = LacpPortActivityThrift::ACTIVE;
+      break;
+    case cfg::LacpPortActivity::PASSIVE:
+      thriftActivity = LacpPortActivityThrift::PASSIVE;
+      break;
+  }
+
+  return thriftActivity;
+}
+
+void ThriftHandler::populateAggregatePortThrift(
+    const std::shared_ptr<AggregatePort>& aggregatePort,
+    AggregatePortThrift& aggregatePortThrift) {
+  aggregatePortThrift.key = static_cast<uint32_t>(aggregatePort->getID());
+  aggregatePortThrift.name = aggregatePort->getName();
+  aggregatePortThrift.description = aggregatePort->getDescription();
+  aggregatePortThrift.systemPriority = aggregatePort->getSystemPriority();
+  aggregatePortThrift.systemID = aggregatePort->getSystemID().toString();
+  aggregatePortThrift.minimumLinkCount = aggregatePort->getMinimumLinkCount();
+
+  // Since aggregatePortThrift.memberPorts is being push_back'ed to, but is an
+  // out parameter, make sure it's clear() first
+  aggregatePortThrift.memberPorts.clear();
+
+  aggregatePortThrift.memberPorts.reserve(aggregatePort->subportsCount());
+
+  for (const auto& subport : aggregatePort->sortedSubports()) {
+    bool isEnabled = aggregatePort->getForwardingState(subport.portID) ==
+        AggregatePort::Forwarding::ENABLED;
+
+    aggregatePortThrift.memberPorts.push_back(
+        {apache::thrift::FragileConstructor::FRAGILE,
+         static_cast<int32_t>(subport.portID),
+         isEnabled,
+         static_cast<int32_t>(subport.priority),
+         fromLacpPortRate(subport.rate),
+         fromLacpPortActivity(subport.activity)});
+  }
+}
+
+void ThriftHandler::getAggregatePort(
+    AggregatePortThrift& aggregatePortThrift,
+    int32_t aggregatePortIDThrift) {
   ensureConfigured();
-  sw_->fetchAggregatePortTable(aggregatePortTable);
-  VLOG(6) << "Aggregate Port Table size:" << aggregatePortTable.size();
+
+  if (aggregatePortIDThrift < 0 ||
+      aggregatePortIDThrift > std::numeric_limits<uint16_t>::max()) {
+    throw FbossError(
+        "AggregatePort ID ", aggregatePortIDThrift, " is out of range");
+  }
+  auto aggregatePortID = static_cast<AggregatePortID>(aggregatePortIDThrift);
+
+  auto aggregatePort =
+      sw_->getState()->getAggregatePorts()->getAggregatePortIf(aggregatePortID);
+
+  if (!aggregatePort) {
+    throw FbossError(
+        "AggregatePort with ID ", aggregatePortIDThrift, " not found");
+  }
+
+  populateAggregatePortThrift(aggregatePort, aggregatePortThrift);
+}
+
+void ThriftHandler::getAggregatePortTable(
+    std::vector<AggregatePortThrift>& aggregatePortsThrift) {
+  ensureConfigured();
+
+  // Since aggregatePortsThrift is being push_back'ed to, but is an out
+  // parameter, make sure it's clear() first
+  aggregatePortsThrift.clear();
+
+  aggregatePortsThrift.reserve(sw_->getState()->getAggregatePorts()->size());
+
+  for (const auto& aggregatePort : *(sw_->getState()->getAggregatePorts())) {
+    aggregatePortsThrift.emplace_back();
+
+    populateAggregatePortThrift(aggregatePort, aggregatePortsThrift.back());
+  }
 }
 
 void ThriftHandler::fillPortStats(PortInfoThrift& portInfo, int numPortQs) {
@@ -1064,6 +1163,31 @@ int32_t ThriftHandler::getIdleTimeout() {
 
 void ThriftHandler::reloadConfig() {
   return sw_->applyConfig("reload config initiated by thrift call");
+}
+
+void ThriftHandler::getLacpPartnerPair(
+    LacpPartnerPair& lacpPartnerPair,
+    int32_t portID) {
+  ensureConfigured();
+
+  auto lagManager = sw_->getLagManager();
+  if (!lagManager) {
+    throw FbossError("LACP not enabled");
+  }
+
+  lagManager->populatePartnerPair(static_cast<PortID>(portID), lacpPartnerPair);
+}
+
+void ThriftHandler::getAllLacpPartnerPairs(
+    std::vector<LacpPartnerPair>& lacpPartnerPairs) {
+  ensureConfigured();
+
+  auto lagManager = sw_->getLagManager();
+  if (!lagManager) {
+    throw FbossError("LACP not enabled");
+  }
+
+  lagManager->populatePartnerPairs(lacpPartnerPairs);
 }
 
 }} // facebook::fboss

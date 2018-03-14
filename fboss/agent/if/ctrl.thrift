@@ -74,14 +74,57 @@ struct L2EntryThrift {
   3: i32 vlanID,
 }
 
-struct SubportThrift {
-  1: required i32 id,
-  2: required bool isForwardingEnabled,
+enum LacpPortRateThrift {
+  SLOW = 0,
+  FAST = 1,
 }
 
-struct AggregatePortEntryThrift {
-  1: required i32 aggregatePortId,
-  2: required list<SubportThrift> subports,
+enum LacpPortActivityThrift {
+  PASSIVE = 0,
+  ACTIVE = 1,
+}
+
+struct AggregatePortMemberThrift {
+  1: i32 memberPortID
+  2: bool isForwarding
+  3: i32 priority
+  4: LacpPortRateThrift rate
+  5: LacpPortActivityThrift activity
+}
+
+struct AggregatePortThrift {
+  1: i32 key
+  2: list<AggregatePortMemberThrift> memberPorts
+  3: string name
+  4: string description
+  5: i32 systemPriority
+  6: string systemID
+  7: byte minimumLinkCount
+}
+
+struct LacpStateThrift {
+  1: bool active      ,
+  2: bool shortTimeout,
+  3: bool aggregatable,
+  4: bool inSync      ,
+  5: bool collecting  ,
+  6: bool distributing,
+  7: bool defaulted   ,
+  8: bool expired     ,
+}
+
+struct LacpEndpoint {
+  1: i32 systemPriority,
+  2: string systemID,
+  3: i32 key,
+  4: i32 portPriority,
+  5: i32 port,
+  6: LacpStateThrift state,
+}
+
+struct LacpPartnerPair {
+  1: LacpEndpoint localEndpoint,
+  2: LacpEndpoint remoteEndpoint,
 }
 
 struct InterfaceDetail {
@@ -474,7 +517,15 @@ service FbossCtrl extends fb303.FacebookService {
     throws (1: fboss.FbossBaseError error)
   list<L2EntryThrift> getL2Table()
     throws (1: fboss.FbossBaseError error)
-  list<AggregatePortEntryThrift> getAggregatePortTable()
+
+  AggregatePortThrift getAggregatePort(1: i32 aggregatePortID)
+    throws (1: fboss.FbossBaseError error)
+  list<AggregatePortThrift> getAggregatePortTable()
+    throws (1: fboss.FbossBaseError error)
+
+  LacpPartnerPair getLacpPartnerPair(1: i32 portID)
+    throws (1: fboss.FbossBaseError error)
+  list<LacpPartnerPair> getAllLacpPartnerPairs()
     throws (1: fboss.FbossBaseError error)
 
   /*

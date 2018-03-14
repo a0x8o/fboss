@@ -552,6 +552,10 @@ class SwSwitch : public HwSwitch::Callback {
     return routeUpdateLogger_.get();
   }
 
+  LinkAggregationManager* getLagManager() {
+    return lagManager_.get();
+  }
+
   /*
    * Gets the flags the SwSwitch was initialized with.
    */
@@ -637,9 +641,6 @@ class SwSwitch : public HwSwitch::Callback {
 
   void publishRxPacket(RxPacket* packet, uint16_t ethertype);
   void publishTxPacket(TxPacket* packet, uint16_t ethertype);
-
-  void fetchAggregatePortTable(
-      std::vector<AggregatePortEntryThrift> &aggregatePortTable);
 
  private:
   void queueStateUpdateForGettingHwInSync(

@@ -7,16 +7,10 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
-
-#include "fboss/agent/hw/bcm/BcmAclEntry.h"
+#include "fboss/agent/platforms/wedge/MinipackPlatform.h"
 
 namespace facebook { namespace fboss {
-
-BcmAclEntry::BcmAclEntry(
-    BcmSwitch* /*hw*/,
-    int /*gid*/,
-    const std::shared_ptr<AclEntry>& /*acl*/,
-    const BcmAclRanges& /*ranges*/) {}
-BcmAclEntry::~BcmAclEntry() {}
-
+std::unique_ptr<WedgePortMapping> MinipackPlatform::createPortMapping() {
+  return std::unique_ptr<WedgePortMapping>{};
+}
 }} // facebook::fboss

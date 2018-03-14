@@ -18,6 +18,8 @@
 
 #include <folly/io/async/EventBase.h>
 
+#include <algorithm>
+#include <iterator>
 #include <tuple>
 #include <utility>
 
@@ -67,6 +69,10 @@ void LinkAggregationManager::stateUpdated(const StateDelta& delta) {
               port->getID(), sw_->getLacpEvb(), this, sw_)));
       CHECK(inserted);
     }
+
+    for (const auto& portAndController : portToController_) {
+      portAndController.second->startMachines();
+    }
     initialized_ = true;
   }
 
@@ -91,6 +97,7 @@ void LinkAggregationManager::aggregatePortAdded(
   for (const auto& subport : aggPort->sortedSubports()) {
     it = portToController_.find(subport.portID);
     CHECK_NE(it, portToController_.end());
+    it->second->stopMachines();
     it->second.reset(new LacpController(
         subport.portID,
         sw_->getLacpEvb(),
@@ -103,6 +110,7 @@ void LinkAggregationManager::aggregatePortAdded(
         aggPort->getMinimumLinkCount(),
         this,
         sw_));
+    it->second->startMachines();
   }
 }
 
@@ -112,8 +120,10 @@ void LinkAggregationManager::aggregatePortRemoved(
   for (const auto& subport : aggPort->sortedSubports()) {
     it = portToController_.find(subport.portID);
     CHECK_NE(it, portToController_.end());
+    it->second->stopMachines();
     it->second.reset(
         new LacpController(subport.portID, sw_->getLacpEvb(), this, sw_));
+    it->second->startMachines();
   }
 }
 
@@ -159,6 +169,48 @@ void LinkAggregationManager::portChanged(
       return;
     }
     it->second->portDown();
+  }
+}
+
+void LinkAggregationManager::populatePartnerPair(
+    PortID portID,
+    LacpPartnerPair& partnerPair) {
+  // TODO(samank): CHECK in Thrift worker thread
+
+  std::shared_ptr<LacpController> controller;
+  {
+    folly::SharedMutexWritePriority::ReadHolder g(&controllersLock_);
+
+    auto it = portToController_.find(portID);
+    if (it == portToController_.end()) {
+      throw LACPError("No LACP controller found for port ", portID);
+    }
+
+    controller = it->second;
+  }
+
+  controller->actorInfo().populate(partnerPair.localEndpoint);
+  controller->partnerInfo().populate(partnerPair.remoteEndpoint);
+}
+
+void LinkAggregationManager::populatePartnerPairs(
+    std::vector<LacpPartnerPair>& partnerPairs) {
+  // TODO(samank): CHECK in Thrift worker thread
+
+  partnerPairs.clear();
+
+  folly::SharedMutexWritePriority::ReadHolder g(&controllersLock_);
+
+  partnerPairs.reserve(
+      std::distance(portToController_.begin(), portToController_.end()));
+
+  for (const auto& portAndController : portToController_) {
+    auto controller = portAndController.second;
+
+    partnerPairs.emplace_back();
+
+    controller->actorInfo().populate(partnerPairs.back().localEndpoint);
+    controller->partnerInfo().populate(partnerPairs.back().remoteEndpoint);
   }
 }
 

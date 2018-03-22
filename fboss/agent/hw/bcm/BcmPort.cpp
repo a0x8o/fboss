@@ -9,6 +9,7 @@
  */
 #include "fboss/agent/hw/bcm/BcmPort.h"
 
+#include <chrono>
 #include <map>
 
 #include "common/stats/MonotonicCounter.h"
@@ -21,9 +22,11 @@
 #include "fboss/agent/state/Port.h"
 #include "fboss/agent/hw/bcm/BcmError.h"
 #include "fboss/agent/hw/bcm/BcmPlatformPort.h"
+#include "fboss/agent/hw/bcm/BcmStatsConstants.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmPortGroup.h"
 #include "fboss/agent/hw/bcm/gen-cpp2/hardware_stats_constants.h"
+
 
 extern "C" {
 #include <opennsl/link.h>
@@ -38,27 +41,6 @@ using std::string;
 using std::shared_ptr;
 
 using facebook::stats::MonotonicCounter;
-
-namespace {
-
-const string kInBytes = "in_bytes";
-const string kInUnicastPkts = "in_unicast_pkts";
-const string kInMulticastPkts = "in_multicast_pkts";
-const string kInBroadcastPkts = "in_broadcast_pkts";
-const string kInDiscards = "in_discards";
-const string kInErrors = "in_errors";
-const string kInPause = "in_pause_frames";
-const string kInIpv4HdrErrors = "in_ipv4_header_errors";
-const string kInIpv6HdrErrors = "in_ipv6_header_errors";
-const string kInNonPauseDiscards = "in_non_pause_discards";
-const string kOutUnicastPkts = "out_unicast_pkts";
-const string kOutMulticastPkts = "out_multicast_pkts";
-const string kOutBroadcastPkts = "out_broadcast_pkts";
-const string kOutDiscards = "out_discards";
-const string kOutErrors = "out_errors";
-const string kOutPause = "out_pause_frames";
-
-}
 
 namespace facebook { namespace fboss {
 
@@ -144,16 +126,17 @@ void BcmPort::updateName(const std::string& newName) {
   reinitPortStats();
 }
 
-MonotonicCounter* BcmPort::getPortCounterIf(const string& statKey) {
-  auto pcitr = portCounters_.find(statKey);
+MonotonicCounter* BcmPort::getPortCounterIf(folly::StringPiece statKey) {
+  auto pcitr = portCounters_.find(statKey.str());
   return pcitr != portCounters_.end() ? &pcitr->second : nullptr;
 }
 
-void BcmPort::reinitPortStat(const string& statKey) {
+void BcmPort::reinitPortStat(folly::StringPiece statKey) {
   auto stat = getPortCounterIf(statKey);
+
   if (!stat) {
     portCounters_.emplace(
-        statKey,
+        statKey.str(),
         MonotonicCounter({statName(statKey), stats::SUM, stats::RATE}));
   } else {
     MonotonicCounter newStat{statName(statKey), stats::SUM, stats::RATE};
@@ -166,29 +149,29 @@ void BcmPort::reinitPortStats() {
     return;
   }
 
-  reinitPortStat(kInBytes);
-  reinitPortStat(kInUnicastPkts);
-  reinitPortStat(kInMulticastPkts);
-  reinitPortStat(kInBroadcastPkts);
-  reinitPortStat(kInDiscards);
-  reinitPortStat(kInErrors);
-  reinitPortStat(kInPause);
-  reinitPortStat(kInIpv4HdrErrors);
-  reinitPortStat(kInIpv6HdrErrors);
-  reinitPortStat(kInNonPauseDiscards);
+  reinitPortStat(kInBytes());
+  reinitPortStat(kInUnicastPkts());
+  reinitPortStat(kInMulticastPkts());
+  reinitPortStat(kInBroadcastPkts());
+  reinitPortStat(kInDiscards());
+  reinitPortStat(kInErrors());
+  reinitPortStat(kInPause());
+  reinitPortStat(kInIpv4HdrErrors());
+  reinitPortStat(kInIpv6HdrErrors());
+  reinitPortStat(kInNonPauseDiscards());
 
-  reinitPortStat(getkOutBytes());
-  reinitPortStat(kOutUnicastPkts);
-  reinitPortStat(kOutMulticastPkts);
-  reinitPortStat(kOutBroadcastPkts);
-  reinitPortStat(kOutDiscards);
-  reinitPortStat(kOutErrors);
-  reinitPortStat(kOutPause);
-  reinitPortStat(getkOutCongestionDiscards());
+  reinitPortStat(kOutBytes());
+  reinitPortStat(kOutUnicastPkts());
+  reinitPortStat(kOutMulticastPkts());
+  reinitPortStat(kOutBroadcastPkts());
+  reinitPortStat(kOutDiscards());
+  reinitPortStat(kOutErrors());
+  reinitPortStat(kOutPause());
+  reinitPortStat(kOutCongestionDiscards());
   for (int i = 0; i < getNumUnicastQueues(); i++) {
     auto name = folly::to<std::string>("queue", i, ".");
-    reinitPortStat(folly::to<std::string>(name, getkOutCongestionDiscards()));
-    reinitPortStat(folly::to<std::string>(name, getkOutBytes()));
+    reinitPortStat(folly::to<std::string>(name, kOutCongestionDiscards()));
+    reinitPortStat(folly::to<std::string>(name, kOutBytes()));
   }
   // (re) init out queue length
   auto statMap = fbData->getStatMap();
@@ -203,12 +186,10 @@ void BcmPort::reinitPortStats() {
   outPktLengths_ = histMap->getOrCreateLockableHistogram(
       statName("out_pkt_lengths"), &pktLenHist);
 
-  // (re) init last set of statistics
-  portStats_ = HwPortStats();
-  portStats_.set_queueOutDiscardBytes_(
-      std::vector<int64_t>(getNumUnicastQueues(), 0));
-  portStats_.set_queueOutBytes_(
-      std::vector<int64_t>(getNumUnicastQueues(), 0));
+  {
+    auto lockedPortStatsPtr = lastPortStats_.wlock();
+    *lockedPortStatsPtr = BcmPortStats(getNumUnicastQueues());
+  }
 }
 
 BcmPort::BcmPort(BcmSwitch* hw, opennsl_port_t port,
@@ -571,81 +552,86 @@ void BcmPort::updateStats() {
   auto now = duration_cast<seconds>(system_clock::now().time_since_epoch());
   HwPortStats curPortStats;
   updateStat(
-      now, kInBytes, opennsl_spl_snmpIfHCInOctets, &curPortStats.inBytes_);
+      now, kInBytes(), opennsl_spl_snmpIfHCInOctets, &curPortStats.inBytes_);
   updateStat(
       now,
-      kInUnicastPkts,
+      kInUnicastPkts(),
       opennsl_spl_snmpIfHCInUcastPkts,
       &curPortStats.inUnicastPkts_);
   updateStat(
       now,
-      kInMulticastPkts,
+      kInMulticastPkts(),
       opennsl_spl_snmpIfHCInMulticastPkts,
       &curPortStats.inMulticastPkts_);
   updateStat(
       now,
-      kInBroadcastPkts,
+      kInBroadcastPkts(),
       opennsl_spl_snmpIfHCInBroadcastPkts,
       &curPortStats.inBroadcastPkts_);
   updateStat(
       now,
-      kInDiscards,
+      kInDiscards(),
       opennsl_spl_snmpIfInDiscards,
       &curPortStats.inDiscards_);
   updateStat(
-      now, kInErrors, opennsl_spl_snmpIfInErrors, &curPortStats.inErrors_);
+      now, kInErrors(), opennsl_spl_snmpIfInErrors, &curPortStats.inErrors_);
   updateStat(
       now,
-      kInIpv4HdrErrors,
+      kInIpv4HdrErrors(),
       opennsl_spl_snmpIpInHdrErrors,
       &curPortStats.inIpv4HdrErrors_);
   updateStat(
       now,
-      kInIpv6HdrErrors,
+      kInIpv6HdrErrors(),
       opennsl_spl_snmpIpv6IfStatsInHdrErrors,
       &curPortStats.inIpv6HdrErrors_);
   updateStat(
       now,
-      kInPause,
+      kInPause(),
       opennsl_spl_snmpDot3InPauseFrames,
       &curPortStats.inPause_);
   // Egress Stats
   updateStat(
-      now, getkOutBytes(), opennsl_spl_snmpIfHCOutOctets,
+      now,
+      kOutBytes(),
+      opennsl_spl_snmpIfHCOutOctets,
       &curPortStats.outBytes_);
   updateStat(
       now,
-      kOutUnicastPkts,
+      kOutUnicastPkts(),
       opennsl_spl_snmpIfHCOutUcastPkts,
       &curPortStats.outUnicastPkts_);
   updateStat(
       now,
-      kOutMulticastPkts,
+      kOutMulticastPkts(),
       opennsl_spl_snmpIfHCOutMulticastPkts,
       &curPortStats.outMulticastPkts_);
   updateStat(
       now,
-      kOutBroadcastPkts,
+      kOutBroadcastPkts(),
       opennsl_spl_snmpIfHCOutBroadcastPckts,
       &curPortStats.outBroadcastPkts_);
   updateStat(
       now,
-      kOutDiscards,
+      kOutDiscards(),
       opennsl_spl_snmpIfOutDiscards,
       &curPortStats.outDiscards_);
   updateStat(
-      now, kOutErrors, opennsl_spl_snmpIfOutErrors, &curPortStats.outErrors_);
+      now, kOutErrors(), opennsl_spl_snmpIfOutErrors, &curPortStats.outErrors_);
   updateStat(
       now,
-      kOutPause,
+      kOutPause(),
       opennsl_spl_snmpDot3OutPauseFrames,
       &curPortStats.outPause_);
 
   setAdditionalStats(now, &curPortStats);
+
+  auto lastPortStats = lastPortStats_.rlock()->portStats();
+
   // Compute non pause discards
   const auto kUninit = hardware_stats_constants::STAT_UNINITIALIZED();
-  if (isMmuLossy() && portStats_.inDiscards_ != kUninit &&
-      portStats_.inPause_ != kUninit) {
+  if (isMmuLossy() && lastPortStats.inDiscards_ != kUninit &&
+      lastPortStats.inPause_ != kUninit) {
     // If MMU setup as lossy, all incoming pause frames will be
     // discarded and will count towards in discards. This makes in discards
     // counter somewhat useless. So instead calculate "in_non_pause_discards",
@@ -653,25 +639,29 @@ void BcmPort::updateStats() {
     // std::max(..) is used, since stats from  h/w are synced non atomically,
     // So depending on what get synced later # of pause maybe be slightly
     // higher than # of discards.
-    auto inPauseSincePrev = curPortStats.inPause_ - portStats_.inPause_;
+    auto inPauseSincePrev = curPortStats.inPause_ - lastPortStats.inPause_;
     auto inDiscardsSincePrev =
-        curPortStats.inDiscards_ - portStats_.inDiscards_;
-    if (inPauseSincePrev >= 0 && inDiscardsSincePrev >=0) {
+        curPortStats.inDiscards_ - lastPortStats.inDiscards_;
+    if (inPauseSincePrev >= 0 && inDiscardsSincePrev >= 0) {
       // Account for counter rollover.
       auto inNonPauseDiscardsSincePrev =
           std::max(0L, (inDiscardsSincePrev - inPauseSincePrev));
       // Init current port stats from prev value or 0
       curPortStats.inNonPauseDiscards_ =
-          (portStats_.inNonPauseDiscards_ == kUninit
+          (lastPortStats.inNonPauseDiscards_ == kUninit
                ? 0
-               : portStats_.inNonPauseDiscards_);
+               : lastPortStats.inNonPauseDiscards_);
       // Counters are cumalative
       curPortStats.inNonPauseDiscards_ += inNonPauseDiscardsSincePrev;
-      auto inNonPauseDiscards = getPortCounterIf(kInNonPauseDiscards);
+      auto inNonPauseDiscards = getPortCounterIf(kInNonPauseDiscards());
       inNonPauseDiscards->updateValue(now, curPortStats.inNonPauseDiscards_);
     }
   }
-  portStats_ = curPortStats;
+
+  {
+    auto lockedLastPortStatsPtr = lastPortStats_.wlock();
+    *lockedLastPortStatsPtr = BcmPortStats(curPortStats, now);
+  }
 
   // Update the queue length stat
   uint32_t qlength;
@@ -694,7 +684,7 @@ void BcmPort::updateStats() {
 
 void BcmPort::updateStat(
     std::chrono::seconds now,
-    const string& statKey,
+    folly::StringPiece statKey,
     opennsl_stat_val_t type,
     int64_t* statVal) {
   auto stat = getPortCounterIf(statKey);
@@ -739,6 +729,35 @@ void BcmPort::updatePktLenHist(
   for (int idx = 0; idx < stats.size(); ++idx) {
     hist->addValueLocked(guard, now.count(), idx, counters[idx]);
   }
+}
+
+BcmPort::BcmPortStats::BcmPortStats(int numUnicastQueues) {
+  HwPortStats portStats;
+  portStats_.set_queueOutDiscardBytes_(
+      std::vector<int64_t>(numUnicastQueues, 0));
+  portStats_.set_queueOutBytes_(std::vector<int64_t>(numUnicastQueues, 0));
+  portStats_ = portStats;
+}
+
+BcmPort::BcmPortStats::BcmPortStats(
+    HwPortStats portStats,
+    std::chrono::seconds timeRetrieved)
+    : portStats_(portStats), timeRetrieved_(timeRetrieved) {}
+
+HwPortStats BcmPort::BcmPortStats::portStats() const {
+  return portStats_;
+}
+
+std::chrono::seconds BcmPort::BcmPortStats::timeRetrieved() const {
+  return timeRetrieved_;
+}
+
+HwPortStats BcmPort::getPortStats() const {
+  return lastPortStats_.rlock()->portStats();
+}
+
+std::chrono::seconds BcmPort::getTimeRetrieved() const {
+  return lastPortStats_.rlock()->timeRetrieved();
 }
 
 /**

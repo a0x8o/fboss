@@ -27,7 +27,10 @@ extern "C" {
 #include "fboss/agent/state/Port.h"
 #include "fboss/agent/state/PortQueue.h"
 
+#include <folly/Range.h>
+#include <folly/Synchronized.h>
 #include <mutex>
+#include <utility>
 
 namespace facebook { namespace fboss {
 
@@ -126,6 +129,8 @@ class BcmPort {
    * Update this port's statistics.
    */
   void updateStats();
+  HwPortStats getPortStats() const;
+  std::chrono::seconds getTimeRetrieved() const;
 
   /**
    * Take actions on this port (especially if it is up), so that it will not
@@ -154,16 +159,29 @@ class BcmPort {
   }
 
  private:
+  class BcmPortStats {
+   public:
+    BcmPortStats() {}
+    explicit BcmPortStats(int numUnicastQueues);
+    BcmPortStats(HwPortStats portStats, std::chrono::seconds seconds);
+    HwPortStats portStats() const;
+    std::chrono::seconds timeRetrieved() const;
+
+   private:
+    HwPortStats portStats_;
+    std::chrono::seconds timeRetrieved_;
+  };
+
   // no copy or assignment
   BcmPort(BcmPort const &) = delete;
   BcmPort& operator=(BcmPort const &) = delete;
 
-  stats::MonotonicCounter* getPortCounterIf(const std::string& statName);
+  stats::MonotonicCounter* getPortCounterIf(folly::StringPiece statName);
   bool shouldReportStats() const;
   void reinitPortStats();
-  void reinitPortStat(const std::string& newName);
+  void reinitPortStat(folly::StringPiece newName);
   void updateStat(std::chrono::seconds now,
-                  const std::string& statName,
+                  folly::StringPiece statName,
                   opennsl_stat_val_t type,
                   int64_t* portStatVal);
   void updatePktLenHist(std::chrono::seconds now,
@@ -191,15 +209,6 @@ class BcmPort {
     return cosQueueGports_.unicast.size();
   }
 
-  static const std::string& getkOutCongestionDiscards() {
-    static const std::string out = "out_congestion_discards";
-    return out;
-  }
-  static const std::string& getkOutBytes() {
-    static const std::string out = "out_bytes";
-    return out;
-  }
-
   BcmSwitch* const hw_{nullptr};
   const opennsl_port_t port_;    // Broadcom physical port number
   // The gport_ is logically a const, but needs to be initialized as a parameter
@@ -220,7 +229,8 @@ class BcmPort {
   stats::ExportedStatMapImpl::LockableStat outQueueLen_;
   stats::ExportedHistogramMapImpl::LockableHistogram inPktLengths_;
   stats::ExportedHistogramMapImpl::LockableHistogram outPktLengths_;
-  HwPortStats portStats_;
+
+  folly::Synchronized<BcmPortStats> lastPortStats_;
 };
 
 }} // namespace facebook::fboss

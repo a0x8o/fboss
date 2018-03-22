@@ -9,7 +9,6 @@ from fboss.system_tests.testutils.test_client import TestClient
 from neteng.fboss.ttypes import FbossBaseError
 from fboss.system_tests.facebook.utils.agent_config import (
     FbossAgentConfig)
-
 from thrift.transport.TTransport import TTransportException
 
 import logging
@@ -108,6 +107,9 @@ class FBOSSTestTopology(object):
         else:
             raise FbossTestException("host not in test topology: %s" % host)
 
+    def number_of_hosts(self):
+        return len(self.test_hosts)
+
     def min_hosts_or_skip(self, n_hosts):
         if len(self.test_hosts) < n_hosts:
             raise unittest.SkipTest("Test needs %d hosts, topology has %d",
@@ -118,25 +120,26 @@ class FBOSSTestTopology(object):
         try:
             with FbossAgentClient(self.switch.name, self.port) as client:
                 client.keepalive()  # will throw FbossBaseError on failure
-        except FbossBaseError:
+        except (FbossBaseError, TTransportException):
             return False
         return True
 
-    def verify_hosts(self, fail_on_error=False):
+    def verify_hosts(self, fail_on_error=False, min_hosts=0):
         """ Verify each host is thrift reachable
                 if fail_on_error is false, just remove unreachable
                 hosts from our setup with a warning.
+            zero min_hosts implies switche
         """
         bad_hosts = []
         for host in self.test_hosts.values():
             try:
                 with TestClient(host.name, host.port) as client:
                     if not client.status():
-                        bad_hosts.append(host)
+                        bad_hosts.append(host.name)
                     else:
                         self.log.debug("Verified host %s" % host.name)
             except (FbossBaseError, TTransportException):
-                bad_hosts.append(host)
+                bad_hosts.append(host.name)
         if bad_hosts:
             if fail_on_error:
                 raise FbossBaseError("fail_on_error set and hosts down: %s" %
@@ -144,9 +147,9 @@ class FBOSSTestTopology(object):
             else:
                 for host in bad_hosts:
                     self.log.warning("Removing unreachable host: %s " %
-                                        host.name)
+                                        host)
                     self.remove_host(host)
-                if len(self.test_hosts) == 0:
+                if len(self.test_hosts) == min_hosts:
                     return False    # all hosts were bad
         return True
 

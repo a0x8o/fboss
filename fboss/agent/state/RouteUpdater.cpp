@@ -10,16 +10,21 @@
 // Copyright 2004-present Facebook.  All rights reserved.
 #include "RouteUpdater.h"
 
+#include <numeric>
+
+#include <boost/math/common_factor.hpp>
+#include <folly/logging/xlog.h>
+
+#include "fboss/agent/FbossError.h"
+#include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/InterfaceMap.h"
-#include "fboss/agent/state/NodeBase.h"
 #include "fboss/agent/state/NodeBase-defs.h"
+#include "fboss/agent/state/NodeBase.h"
 #include "fboss/agent/state/Route.h"
 #include "fboss/agent/state/RouteTable.h"
 #include "fboss/agent/state/RouteTableMap.h"
 #include "fboss/agent/state/RouteTableRib.h"
-#include "fboss/agent/FbossError.h"
-#include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 
 using folly::IPAddress;
 using folly::IPAddressV4;
@@ -117,11 +122,11 @@ void RouteUpdater::addRouteImpl(const PrefixT& prefix, RibT *ribCloned,
       newRoute = old;
     }
     newRoute->update(clientId, std::move(entry));
-    VLOG(3) << "Updated route " << newRoute->str();
+    XLOG(DBG3) << "Updated route " << newRoute->str();
   } else {
     auto newRoute = make_shared<RouteT>(prefix, clientId, std::move(entry));
     rib->addRoute(newRoute);
-    VLOG(3) << "Added route " << newRoute->str();
+    XLOG(DBG3) << "Added route " << newRoute->str();
   }
 }
 
@@ -134,7 +139,7 @@ void RouteUpdater::addRoute(
   } else {
     PrefixV6 prefix{network.asV6().mask(mask), mask};
     if (prefix.network.isLinkLocal()) {
-      VLOG(2) << "Ignoring v6 link-local interface route: " << prefix.str();
+      XLOG(DBG2) << "Ignoring v6 link-local interface route: " << prefix.str();
       return;
     }
     addRouteImpl(prefix, getRibV6(id), clientId, std::move(entry));
@@ -166,13 +171,13 @@ template<typename PrefixT, typename RibT>
 void RouteUpdater::delRouteImpl(
     const PrefixT& prefix, RibT *ribCloned, ClientID clientId) {
   if (!ribCloned) {
-    VLOG(3) << "Failed to delete non-existing route " << prefix.str();
+    XLOG(DBG3) << "Failed to delete non-existing route " << prefix.str();
     return;
   }
   auto rib = ribCloned->rib.get();
   auto old = rib->exactMatch(prefix);
   if (!old) {
-    VLOG(3) << "Failed to delete non-existing route " << prefix.str();
+    XLOG(DBG3) << "Failed to delete non-existing route " << prefix.str();
     return;
   }
   rib = makeClone(ribCloned);
@@ -188,11 +193,11 @@ void RouteUpdater::delRouteImpl(
   }
   old->delEntryForClient(clientId);
   // TODO Do I need to publish the change??
-  VLOG(3) << "Deleted nexthops for client " << clientId <<
-             " from route " << prefix.str();
+  XLOG(DBG3) << "Deleted nexthops for client " << clientId << " from route "
+             << prefix.str();
   if (old->hasNoEntry()) {
     rib->removeRoute(old);
-    VLOG(3) << "...and then deleted route " << prefix.str();
+    XLOG(DBG3) << "...and then deleted route " << prefix.str();
   }
 }
 
@@ -241,13 +246,205 @@ void RouteUpdater::removeAllRoutesForClient(RouterID rid, ClientID clientId) {
   removeAllRoutesForClientImpl<IPAddressV6>(getRibV6(rid), clientId);
 }
 
-template<typename RtRibT, typename AddrT>
+// Some helper functions for recursive weight resolution
+// These aren't really usefully reusable, but structuring them
+// this way helps with clarifying their meaning.
+namespace {
+using NextHopForwardInfos =
+    boost::container::flat_map<NextHop, RouteNextHopSet>;
+using NextHopCombinedWeights =
+    boost::container::flat_map<NextHopKey, NextHopWeight>;
+
+NextHopWeight totalWeightsLcm(const NextHopForwardInfos& nhToFwds) {
+  auto lcmAccumFn =
+      [](NextHopWeight l,
+         std::pair<NextHop, RouteNextHopSet> nhToFwd) -> NextHopWeight {
+    auto t = totalWeight(nhToFwd.second);
+    return boost::math::lcm(l, t);
+  };
+  return std::accumulate(nhToFwds.begin(), nhToFwds.end(), 1, lcmAccumFn);
+}
+
+bool hasEcmpNextHop(const NextHopForwardInfos& nhToFwds) {
+  for (const auto& nhToFwd : nhToFwds) {
+    if (nhToFwd.first.weight() == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/*
+ * In the case that any next hop has weight 0, go through the next hop set
+ * of each resolved next hop and bring its next hop set in with weight 0.
+ */
+RouteNextHopSet mergeForwardInfosEcmp(
+    const NextHopForwardInfos& nhToFwds,
+    const std::string& routeStr) {
+  RouteNextHopSet fwd;
+  for (const auto& nhToFwd : nhToFwds) {
+    const NextHop& nh = nhToFwd.first;
+    const RouteNextHopSet& fw = nhToFwd.second;
+    if (nh.weight()) {
+      XLOG(WARNING) << "While resolving " << routeStr
+                    << " defaulting resolution of weighted next hop " << nh
+                    << " to ECMP because another next hop has weight 0";
+    }
+    for (const auto& fnh : fw) {
+      if (fnh.weight()) {
+        XLOG(DBG4)
+            << "While resolving " << routeStr
+            << " defaulting weighted recursively resolved next hop " << fnh
+            << " to ECMP because the next hop being resolved has weight 0: "
+            << nh;
+      }
+      fwd.emplace(ResolvedNextHop(fnh.addr(), fnh.intf(), ECMP_WEIGHT));
+    }
+  }
+  return fwd;
+}
+
+/*
+ * for each recursively resolved next hop set, combine the next hops into
+ * a map from (IP,InterfaceID)->weight, normalizing weights to the scale of
+ * the LCM of the total weights of each resolved next hop set. The odd map
+ * representation is needed to combine weights for different instances of
+ * the same next hop coming from different recursively resolved next hop sets.
+ */
+NextHopCombinedWeights combineWeights(
+    const NextHopForwardInfos& nhToFwds,
+    const std::string& routeStr) {
+  NextHopCombinedWeights cws;
+  NextHopWeight l = totalWeightsLcm(nhToFwds);
+  for (const auto& nhToFwd : nhToFwds) {
+    const NextHop& unh = nhToFwd.first;
+    const RouteNextHopSet& fw = nhToFwd.second;
+    if (fw.empty()) {
+      continue;
+    }
+    NextHopWeight normalization;
+    NextHopWeight t = totalWeight(fw);
+    // If total weight of any resolved next hop set is 0, the LCM will
+    // also be 0. This represents the case where one of the recursively
+    // resolved routes has ECMP next hops. In this case, we want the
+    // ECMP behavior to "propagate up" to this route, so lcm and thus
+    // the normalizationg factor being 0 is desirable.
+    // We need to check t for 0 for precisely the ecmp
+    // recursively resolved next hop sets to not do 0/0.
+    normalization = t ? l / t : 0;
+    bool loggedEcmpDefault = false;
+    for (const auto& fnh : fw) {
+      NextHopWeight w = fnh.weight() * normalization * unh.weight();
+      // We only want to log this once per recursively resolved next hop
+      // to prevent a large ecmp group from spamming pointless logs
+      if (!loggedEcmpDefault && !w && unh.weight()) {
+        XLOG(WARNING) << "While resolving " << routeStr
+                      << " defaulting resolution of weighted next hop " << unh
+                      << " to ECMP because another next hop in the resolution"
+                      << " tree uses ECMP.";
+        loggedEcmpDefault = true;
+      }
+      cws[nextHopKey(fnh)] += w;
+    }
+  }
+  return cws;
+}
+
+/*
+ * Given a map from (IP,InterfaceID)->weight, take the gcd of the weights
+ * and return a next hop set with IP, intf, weight/GCD to minimize the weights
+ */
+RouteNextHopSet optimizeWeights(const NextHopCombinedWeights& cws) {
+  RouteNextHopSet fwd;
+  auto gcdAccumFn = [](NextHopWeight g,
+                       const std::pair<NextHopKey, NextHopWeight>& cw) {
+    NextHopWeight w = cw.second;
+    return (g ? boost::math::gcd(g, w) : w);
+  };
+  auto fwdWeightGcd = std::accumulate(cws.begin(), cws.end(), 0, gcdAccumFn);
+  for (const auto& cw : cws) {
+    const folly::IPAddress& addr = cw.first.first;
+    const InterfaceID& intf = cw.first.second;
+    NextHopWeight w = fwdWeightGcd ? cw.second / fwdWeightGcd : 0;
+    fwd.emplace(ResolvedNextHop(addr, intf, w));
+  }
+  return fwd;
+}
+
+/*
+ * Take the resolved forwarding info (NextHopSet containing ResolvedNextHops)
+ * from each recursively resolved next hop and merge them together.
+ *
+ * There are two cases:
+ * 1) Any of the weights of the current routes next hops are 0.
+ *    This represents a mix of ECMP and UCMP next hops. In this case,
+ *    we default to just ECMP-ing everything from all the next hops.
+ * 2) This route's next hops all have weight. In this case, we run through
+ *    algorithm to normalize all the weights for the next hops resolved for
+ *    each next hop (combineWeights) then minimize the weights
+ *    (optimizeWeights). Both of these algorithms will preserve the critical
+ *    ratio w_i/w_j for any two weights w_i, w_j of next hops i, j in both
+ *    the current route's weights and in the recursively resolved route's
+ *    weights.
+ *
+ * NOTE: case 1) will propagate recursively, so in effect, any ECMP next hop
+ *       anywhere in the resolution tree for a route will result in the entire
+ *       tree ultimately being treated as an ECMP route.
+ *
+ * An example to illustrate the requirement:
+ * We will represent the recursive route resolution tree for three routes
+ * R1, R2, and R3. Numbers on the edges represent weights for next hops,
+ * and I1, I2, I3, and I4 are connected interfaces.
+ *
+ *             R1
+ *          3/    2\
+ *         R2       R3
+ *       5/  4\   3/  2\
+ *      I1    I2 I3    I4
+ *
+ * In resolving R1, resolveOne and getFwdInfoFromNhop will mutually recursively
+ * get to a point where we have resolved R2 and R3 to having next hops I1 with
+ * weight 5, I2 with weight 4, and I3 with weight 3 and I4 with weight 2
+ * respectively: {R2x3:{I1x5, I2x4}, R3x2:{I3x2, I4x2}}
+ * We need to preserve the following ratios in the final result:
+ * I1/I2=5/4; I3/I4=3/2; (I1+I2)/(I3+I4)=3/2
+ * To do this, we normalize the weights by finding the LCM of the total
+ * weights of the recursively resolved next hop sets:
+ * LCM(9, 5) = 45, then bring in each next hop into the final next hop
+ * set with its weight multiplied by LCM/TotalWeight(its next hop)
+ * and by the weight of its top level next hop:
+ * I1: 5*(45/9)*3=75, I2: 4*(45/9)*3=60, I3: 3*(45/5)*2=54, I4: 2*(45/5)*2=36
+ * I1/I2=75/60=5/4, I3/I4=54/36=3/2, (I1+I2)/(I3+I4)=135/90=3/2
+ * as required. Finally, we can find the gcds of top level weights to minimize
+ * these weights:
+ * GCD(75, 60, 54, 36) = 3 so we reach a final next hop set of:
+ * {I1x25, I2x20, I3x18, I4x12}
+ */
+RouteNextHopSet mergeForwardInfos(
+    const NextHopForwardInfos& nhToFwds,
+    const std::string& routeStr) {
+  RouteNextHopSet fwd;
+  if (hasEcmpNextHop(nhToFwds)) {
+    fwd = mergeForwardInfosEcmp(nhToFwds, routeStr);
+  } else {
+    NextHopCombinedWeights cws = combineWeights(nhToFwds, routeStr);
+    fwd = optimizeWeights(cws);
+  }
+  return fwd;
+}
+} // anonymous namespace
+
+template <typename RtRibT, typename AddrT>
 void RouteUpdater::getFwdInfoFromNhop(
-    RtRibT* nRib, ClonedRib* ribCloned, const AddrT& nh,
-    bool *hasToCpu, bool *hasDrop, RouteNextHopSet* fwd) {
+    RtRibT* nRib,
+    ClonedRib* ribCloned,
+    const AddrT& nh,
+    bool* hasToCpu,
+    bool* hasDrop,
+    RouteNextHopSet& fwd) {
   auto route = nRib->longestMatch(nh);
   if (route == nullptr) {
-    VLOG(3) << " Could not find route for nhop :  " << nh;
+    XLOG(DBG3) << " Could not find route for nhop :  " << nh;
     // Un resolvable next hop
     return;
   }
@@ -265,9 +462,12 @@ void RouteUpdater::getFwdInfoFromNhop(
       // if the route used to resolve the nexthop is directly connected
       if (route->isConnected()) {
         const auto& rtNh = *nhops.begin();
-        fwd->emplace(RouteNextHop::createForward(nh, rtNh.intf()));
+        // NOTE: we need to use a UCMP compatible weight so that this can
+        // be a leaf in the recursive resolution defined in the comment
+        // describing mergeForwardInfos above.
+        fwd.emplace(ResolvedNextHop(nh, rtNh.intf(), UCMP_DEFAULT_WEIGHT));
       } else {
-        fwd->insert(nhops.begin(), nhops.end());
+        fwd.insert(nhops.begin(), nhops.end());
       }
     }
   }
@@ -281,9 +481,9 @@ void RouteUpdater::resolveOne(RouteT* route, ClonedRib* ribCloned) {
   // in setUnresolvable() or setResolved()
   route->setProcessing();
 
-  RouteNextHopSet fwd;
   bool hasToCpu{false};
   bool hasDrop{false};
+  RouteNextHopSet fwd;
 
   auto bestPair = route->getBestEntry();
   const auto clientId = bestPair.first;
@@ -294,6 +494,7 @@ void RouteUpdater::resolveOne(RouteT* route, ClonedRib* ribCloned) {
   } else if (action == RouteForwardAction::TO_CPU) {
     hasToCpu = true;
   } else {
+    NextHopForwardInfos nhToFwds;
     // loop through all nexthops to find out the forward info
     for (const auto& nh : bestEntry->getNextHopSet()) {
       const auto& addr = nh.addr();
@@ -306,7 +507,7 @@ void RouteUpdater::resolveOne(RouteT* route, ClonedRib* ribCloned) {
         // It is either an interface route or v6 link-local
         CHECK(clientId == kInterfaceRouteClientId
               or (addr.isV6() and addr.isLinkLocal()));
-        fwd.emplace(RouteNextHop::createForward(addr, nh.intfID().value()));
+        nhToFwds[nh].emplace(nh);
         continue;
       }
 
@@ -314,18 +515,19 @@ void RouteUpdater::resolveOne(RouteT* route, ClonedRib* ribCloned) {
       if (addr.isV4()) {
         auto nRib = ribCloned->v4.rib.get();
         getFwdInfoFromNhop(nRib, ribCloned, nh.addr().asV4(), &hasToCpu,
-                           &hasDrop, &fwd);
+                           &hasDrop, nhToFwds[nh]);
       } else {
         auto nRib = ribCloned->v6.rib.get();
         getFwdInfoFromNhop(nRib, ribCloned, nh.addr().asV6(), &hasToCpu,
-                           &hasDrop, &fwd);
+                           &hasDrop, nhToFwds[nh]);
       }
     }
+    fwd = mergeForwardInfos(nhToFwds, route->str());
   }
 
   if (!fwd.empty()) {
-    route->setResolved(
-        RouteNextHopEntry(std::move(fwd), AdminDistance::MAX_ADMIN_DISTANCE));
+    route->setResolved(RouteNextHopEntry(
+        std::move(fwd), AdminDistance::MAX_ADMIN_DISTANCE));
     if (clientId == kInterfaceRouteClientId) {
       route->setConnected();
     }
@@ -339,8 +541,8 @@ void RouteUpdater::resolveOne(RouteT* route, ClonedRib* ribCloned) {
     route->setUnresolvable();
   }
 
-  VLOG(3) << (route->isResolved() ? "Resolved" : "Cannot resolve")
-          << " route " << route->str();
+  XLOG(DBG3) << (route->isResolved() ? "Resolved" : "Cannot resolve")
+             << " route " << route->str();
 }
 
 void RouteUpdater::resolve() {
@@ -436,8 +638,11 @@ void RouteUpdater::addInterfaceAndLinkLocalRoutes(
     auto routerId = intf->getRouterID();
     routers.insert(routerId);
     for (auto const& addr : intf->getAddresses()) {
-      auto nhop = RouteNextHop::createInterfaceNextHop(
-          addr.first, intf->getID());
+      // NOTE: we need to use a UCMP compatible weight so that this can
+      // be a leaf in the recursive resolution defined in the comment
+      // describing mergeForwardInfos above.
+      auto nhop =
+          ResolvedNextHop(addr.first, intf->getID(), UCMP_DEFAULT_WEIGHT);
       addRoute(routerId, addr.first, addr.second,
                kInterfaceRouteClientId,
                RouteNextHopEntry(std::move(nhop),
@@ -446,88 +651,6 @@ void RouteUpdater::addInterfaceAndLinkLocalRoutes(
   }
   for (auto id : routers) {
     addLinkLocalRoutes(id);
-  }
-}
-
-template<typename StaticRouteType>
-void RouteUpdater::staticRouteDelHelper(
-    const std::vector<StaticRouteType>& oldRoutes,
-    const flat_map<RouterID, flat_set<CIDRNetwork>>& newRoutes) {
-  for (const auto& oldRoute : oldRoutes) {
-    RouterID rid(oldRoute.routerID);
-    auto network = IPAddress::createNetwork(oldRoute.prefix);
-    auto itr = newRoutes.find(rid);
-    if (itr == newRoutes.end() || itr->second.find(network) ==
-        itr->second.end()) {
-      delRoute(rid, network.first, network.second,
-               StdClientIds2ClientID(StdClientIds::STATIC_ROUTE));
-      VLOG(1) << "Unconfigured static route : " << network.first
-        << "/" << (int)network.second;
-    }
-  }
-}
-
-void RouteUpdater::updateStaticRoutes(const cfg::SwitchConfig& curCfg,
-    const cfg::SwitchConfig& prevCfg) {
-  flat_map<RouterID, flat_set<CIDRNetwork>> newCfgVrf2StaticPfxs;
-  auto processStaticRoutesNoNhops = [&](
-      const std::vector<cfg::StaticRouteNoNextHops>& routes,
-      RouteForwardAction action) {
-    for (const auto& route : routes) {
-      RouterID rid(route.routerID) ;
-      auto network = IPAddress::createNetwork(route.prefix);
-      if (newCfgVrf2StaticPfxs[rid].find(network)
-          != newCfgVrf2StaticPfxs[rid].end()) {
-        throw FbossError("Prefix : ",  network.first, "/",
-            (int)network.second, " in multiple static routes");
-      }
-      addRoute(rid, network.first, network.second,
-               StdClientIds2ClientID(StdClientIds::STATIC_ROUTE),
-               RouteNextHopEntry(action, AdminDistance::STATIC_ROUTE));
-      // Note down prefix for comparing with old static routes
-      newCfgVrf2StaticPfxs[rid].emplace(network);
-    }
-  };
-
-
-  if (curCfg.__isset.staticRoutesToNull) {
-    processStaticRoutesNoNhops(curCfg.staticRoutesToNull, DROP);
-  }
-  if (curCfg.__isset.staticRoutesToCPU) {
-    processStaticRoutesNoNhops(curCfg.staticRoutesToCPU, TO_CPU);
-  }
-
-  if (curCfg.__isset.staticRoutesWithNhops) {
-    for (const auto& route : curCfg.staticRoutesWithNhops) {
-      RouterID rid(route.routerID) ;
-      auto network = IPAddress::createNetwork(route.prefix);
-      RouteNextHops nhops;
-      for (auto& nhopStr : route.nexthops) {
-        nhops.emplace(
-            RouteNextHop::createNextHop(folly::IPAddress(nhopStr)));
-      }
-      addRoute(rid, network.first, network.second,
-               StdClientIds2ClientID(StdClientIds::STATIC_ROUTE),
-               RouteNextHopEntry(
-                   std::move(nhops), AdminDistance::STATIC_ROUTE));
-      // Note down prefix for comparing with old static routes
-      newCfgVrf2StaticPfxs[rid].emplace(network);
-    }
-  }
-  // Now blow away any static routes that are not in the config
-  // Ideally after this we should replay the routes from lower
-  // precedence route announcers (e.g. BGP) for deleted prefixes.
-  // The static route may have overridden a existing protocol
-  // route and in that case rather than blowing away the route we
-  // should just replace it - t8910011
-  if (prevCfg.__isset.staticRoutesWithNhops) {
-    staticRouteDelHelper(prevCfg.staticRoutesWithNhops, newCfgVrf2StaticPfxs);
-  }
-  if (prevCfg.__isset.staticRoutesToCPU) {
-    staticRouteDelHelper(prevCfg.staticRoutesToCPU, newCfgVrf2StaticPfxs);
-  }
-  if (prevCfg.__isset.staticRoutesToNull) {
-    staticRouteDelHelper(prevCfg.staticRoutesToNull, newCfgVrf2StaticPfxs);
   }
 }
 

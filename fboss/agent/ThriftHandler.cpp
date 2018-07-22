@@ -48,11 +48,12 @@
 #include "fboss/agent/state/VlanMap.h"
 #include "fboss/agent/if/gen-cpp2/NeighborListenerClient.h"
 
-#include <folly/json_pointer.h>
-#include <folly/io/Cursor.h>
-#include <folly/io/IOBuf.h>
 #include <folly/MoveWrapper.h>
 #include <folly/Range.h>
+#include <folly/io/Cursor.h>
+#include <folly/io/IOBuf.h>
+#include <folly/json_pointer.h>
+#include <folly/logging/xlog.h>
 #include <thrift/lib/cpp2/async/DuplexChannel.h>
 
 #include <limits>
@@ -107,6 +108,15 @@ fromFwdNextHops(RouteNextHopSet const& nexthops) {
   return nhs;
 }
 
+std::vector<NextHopThrift> thriftNextHopsFromAddresses(
+    const std::vector<network::thrift::BinaryAddress>& addrs) {
+  std::vector<NextHopThrift> nhs;
+  nhs.reserve(addrs.size());
+  for (const auto& addr : addrs) {
+    nhs.emplace_back(apache::thrift::FRAGILE, addr, 0);
+  }
+  return nhs;
+}
 }
 
 class RouteUpdateStats {
@@ -122,8 +132,8 @@ class RouteUpdateStats {
     auto duration =
       std::chrono::duration_cast<std::chrono::microseconds>(end - start_);
     sw_->stats()->routeUpdate(duration, routes_);
-    VLOG(0) << func_ << " " << routes_ << " routes took "
-            << duration.count() << "us";
+    XLOG(DBG0) << func_ << " " << routes_ << " routes took " << duration.count()
+               << "us";
   }
  private:
   SwSwitch* sw_;
@@ -137,12 +147,12 @@ ThriftHandler::ThriftHandler(SwSwitch* sw) : FacebookBase2("FBOSS"), sw_(sw) {
     [=](const std::vector<std::string>& added,
         const std::vector<std::string>& deleted) {
       for (auto& listener : listeners_.accessAllThreads()) {
-        LOG(INFO) << "Sending notification to bgpD";
+        XLOG(INFO) << "Sending notification to bgpD";
         auto listenerPtr = &listener;
-        listener.eventBase->runInEventBaseThread(
-            [=] {
-              LOG(INFO) << "firing off notification";
-              invokeNeighborListeners(listenerPtr, added, deleted); });
+        listener.eventBase->runInEventBaseThread([=] {
+          XLOG(INFO) << "firing off notification";
+          invokeNeighborListeners(listenerPtr, added, deleted);
+        });
       }
   });
 }
@@ -256,13 +266,19 @@ void ThriftHandler::updateUnicastRoutesImpl(
       uint8_t mask = static_cast<uint8_t>(route.dest.prefixLength);
       auto adminDistance = route.__isset.adminDistance ? route.adminDistance :
         clientIdToAdmin;
-      RouteNextHops nexthops = util::toRouteNextHops(route.nextHopAddrs);
+      std::vector<NextHopThrift> nhts;
+      if (route.nextHops.empty() && !route.nextHopAddrs.empty()) {
+        nhts = util::thriftNextHopsFromAddresses(route.nextHopAddrs);
+      } else {
+        nhts = route.nextHops;
+      }
+      RouteNextHopSet nexthops = util::toRouteNextHopSet(nhts);
       if (nexthops.size()) {
         updater.addRoute(routerId, network, mask, ClientID(client),
                          RouteNextHopEntry(std::move(nexthops), adminDistance));
       } else {
-        VLOG(3) << "Blackhole route:" << network << "/"
-                <<  static_cast<int>(mask);
+        XLOG(DBG3) << "Blackhole route:" << network << "/"
+                   << static_cast<int>(mask);
         updater.addRoute(routerId, network, mask, ClientID(client),
                          RouteNextHopEntry(RouteForwardAction::DROP,
                            adminDistance));
@@ -343,38 +359,28 @@ void ThriftHandler::getArpTable(std::vector<ArpEntryThrift>& arpTable) {
 void ThriftHandler::getL2Table(std::vector<L2EntryThrift>& l2Table) {
   ensureConfigured();
   sw_->getHw()->fetchL2Table(&l2Table);
-  VLOG(6) << "L2 Table size:" << l2Table.size();
+  XLOG(DBG6) << "L2 Table size:" << l2Table.size();
 }
 
 LacpPortRateThrift ThriftHandler::fromLacpPortRate(cfg::LacpPortRate rate) {
-  LacpPortRateThrift thriftRate;
-
   switch (rate) {
     case cfg::LacpPortRate::SLOW:
-      thriftRate = LacpPortRateThrift::SLOW;
-      break;
+      return LacpPortRateThrift::SLOW;
     case cfg::LacpPortRate::FAST:
-      thriftRate = LacpPortRateThrift::FAST;
-      break;
+      return LacpPortRateThrift::FAST;
   }
-
-  return thriftRate;
+  throw FbossError("Unknown LACP port rate: ", rate);
 }
 
 LacpPortActivityThrift ThriftHandler::fromLacpPortActivity(
     cfg::LacpPortActivity activity) {
-  LacpPortActivityThrift thriftActivity;
-
   switch (activity) {
     case cfg::LacpPortActivity::ACTIVE:
-      thriftActivity = LacpPortActivityThrift::ACTIVE;
-      break;
+      return LacpPortActivityThrift::ACTIVE;
     case cfg::LacpPortActivity::PASSIVE:
-      thriftActivity = LacpPortActivityThrift::PASSIVE;
-      break;
+      return LacpPortActivityThrift::PASSIVE;
   }
-
-  return thriftActivity;
+  throw FbossError("Unknown LACP port activity: ", activity);
 }
 
 void ThriftHandler::populateAggregatePortThrift(
@@ -452,9 +458,8 @@ void ThriftHandler::fillPortStats(PortInfoThrift& portInfo, int numPortQs) {
   auto statMap = fbData->getStatMap();
 
   auto getSumStat = [&] (StringPiece prefix, StringPiece name) {
-    // Currently, the internal name of the port is "port<n>", even though
-    // `the external name is "eth<a>/<b>/<c>"
-    auto portName = folly::to<std::string>("port", portId);
+    auto portName =  portInfo.name.empty() ?
+      folly::to<std::string>("port", portId) : portInfo.name;
     auto statName = folly::to<std::string>(portName, ".", prefix, name);
     auto statPtr = statMap->getLockedStatPtr(statName);
     auto numLevels = statPtr->numLevels();
@@ -511,24 +516,27 @@ void ThriftHandler::getPortInfoHelper(
           queue->getScalingFactor().value())->second;
       pq.__isset.scalingFactor = true;
     }
-    if (queue->getAqm()) {
-      auto aqm = queue->getAqm().value();
-
-      pq.aqm.behavior.earlyDrop = aqm.behavior.earlyDrop;
-      pq.aqm.behavior.ecn = aqm.behavior.ecn;
-      pq.__isset.aqm = true;
-      switch (aqm.detection.getType()) {
-        case cfg::QueueCongestionDetection::Type::linear:
-          pq.aqm.detection.linear.minimumLength =
-              aqm.detection.get_linear().minimumLength;
-          pq.aqm.detection.linear.maximumLength =
-              aqm.detection.get_linear().maximumLength;
-          pq.aqm.detection.__isset.linear = true;
-          break;
-        case cfg::QueueCongestionDetection::Type::__EMPTY__:
-          LOG(WARNING) << "Invalid queue congestion detection config";
-          break;
+    if (!queue->getAqms().empty()) {
+      std::vector<ActiveQueueManagement> aqms;
+      for (const auto& aqm: queue->getAqms()) {
+        ActiveQueueManagement aqmThrift;
+        switch (aqm.second.detection.getType()) {
+          case cfg::QueueCongestionDetection::Type::linear:
+            aqmThrift.detection.linear.minimumLength =
+                aqm.second.detection.get_linear().minimumLength;
+            aqmThrift.detection.linear.maximumLength =
+                aqm.second.detection.get_linear().maximumLength;
+            aqmThrift.detection.__isset.linear = true;
+            break;
+          case cfg::QueueCongestionDetection::Type::__EMPTY__:
+            XLOG(WARNING) << "Invalid queue congestion detection config";
+            break;
+        }
+        aqmThrift.behavior = QueueCongestionBehavior(aqm.first);
+        aqms.push_back(aqmThrift);
       }
+      pq.aqms.swap(aqms);
+      pq.__isset.aqms = true;
     }
     portInfo.portQueues.push_back(pq);
   }
@@ -649,8 +657,8 @@ void ThriftHandler::setPortState(int32_t portNum, bool enable) {
       enable ? cfg::PortState::ENABLED : cfg::PortState::DISABLED;
 
   if (port->getAdminState() == newPortState) {
-    VLOG(2) << "setPortState: port already in state "
-            << (enable ? "ENABLED" : "DISABLED");
+    XLOG(DBG2) << "setPortState: port already in state "
+               << (enable ? "ENABLED" : "DISABLED");
     return;
   }
 
@@ -669,7 +677,7 @@ void ThriftHandler::getRouteTable(std::vector<UnicastRoute>& routes) {
     for (const auto& ipv4 : *(routeTable->getRibV4()->routes())) {
       UnicastRoute tempRoute;
       if (!ipv4->isResolved()) {
-        LOG(INFO) << "Skipping unresolved route: " << ipv4->toFollyDynamic();
+        XLOG(INFO) << "Skipping unresolved route: " << ipv4->toFollyDynamic();
         continue;
       }
       auto fwdInfo = ipv4->getForwardInfo();
@@ -681,7 +689,7 @@ void ThriftHandler::getRouteTable(std::vector<UnicastRoute>& routes) {
     for (const auto& ipv6 : *(routeTable->getRibV6()->routes())) {
       UnicastRoute tempRoute;
       if (!ipv6->isResolved()) {
-        LOG(INFO) << "Skipping unresolved route: " << ipv6->toFollyDynamic();
+        XLOG(INFO) << "Skipping unresolved route: " << ipv6->toFollyDynamic();
         continue;
       }
       auto fwdInfo = ipv6->getForwardInfo();
@@ -706,8 +714,10 @@ void ThriftHandler::getRouteTableByClient(
       UnicastRoute tempRoute;
       tempRoute.dest.ip = toBinaryAddress(ipv4->prefix().network);
       tempRoute.dest.prefixLength = ipv4->prefix().mask;
-      tempRoute.nextHopAddrs = util::fromRouteNextHops(
-          entry->getNextHopSet());
+      tempRoute.nextHops = util::fromRouteNextHopSet(entry->getNextHopSet());
+      for (const auto& nh : tempRoute.nextHops) {
+        tempRoute.nextHopAddrs.emplace_back(nh.address);
+      }
       routes.emplace_back(std::move(tempRoute));
     }
 
@@ -720,8 +730,10 @@ void ThriftHandler::getRouteTableByClient(
       UnicastRoute tempRoute;
       tempRoute.dest.ip = toBinaryAddress(ipv6->prefix().network);
       tempRoute.dest.prefixLength = ipv6->prefix().mask;
-      tempRoute.nextHopAddrs = util::fromRouteNextHops(
-          entry->getNextHopSet());
+      tempRoute.nextHops = util::fromRouteNextHopSet(entry->getNextHopSet());
+      for (const auto& nh : tempRoute.nextHops) {
+        tempRoute.nextHopAddrs.emplace_back(nh.address);
+      }
       routes.emplace_back(std::move(tempRoute));
     }
   }
@@ -865,7 +877,7 @@ void ThriftHandler::invokeNeighborListeners(ThreadLocalListener* listener,
       try {
         NeighborListenerClientAsyncClient::recv_neighborsChanged(state);
       } catch (const std::exception& ex) {
-        LOG(ERROR) << "Exception in neighbor listener: " << ex.what();
+        XLOG(ERR) << "Exception in neighbor listener: " << ex.what();
         brokenClients_.push_back(client.first);
       }
     };
@@ -895,7 +907,7 @@ void ThriftHandler::startPktCapture(unique_ptr<CaptureInfo> info) {
   ensureConfigured();
   auto* mgr = sw_->getCaptureMgr();
   auto capture = make_unique<PktCapture>(
-      info->name, info->maxPackets, info->direction);
+       info->name, info->maxPackets, info->direction, info->filter);
   mgr->startCapture(std::move(capture));
 }
 
@@ -1072,7 +1084,7 @@ void ThriftHandler::ensureConfigured(StringPiece function) {
   }
 
   if (!function.empty()) {
-    VLOG(1) << "failing thrift prior to switch configuration: " << function;
+    XLOG(DBG1) << "failing thrift prior to switch configuration: " << function;
   }
   throw FbossError("switch is still initializing or is exiting and is not "
                    "fully configured yet");
@@ -1100,7 +1112,7 @@ void ThriftHandler::connectionDestroyed(TConnectionContext* ctx) {
 
   // If there is an ongoing high-resolution counter subscription, kill it. Don't
   // grab a write lock if there are no active calls
-  if (!highresKillSwitches_.asConst()->empty()) {
+  if (!as_const(highresKillSwitches_)->empty()) {
     SYNCHRONIZED(highresKillSwitches_) {
       auto killSwitchIter = highresKillSwitches_.find(ctx);
 
@@ -1149,7 +1161,7 @@ void ThriftHandler::async_tm_subscribeToCounters(
 
     callback->result(true);
   } else {
-    LOG(ERROR) << "None of the requested counters were valid.";
+    XLOG(ERR) << "None of the requested counters were valid.";
     callback->result(false);
   }
 }

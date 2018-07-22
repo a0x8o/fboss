@@ -49,7 +49,9 @@ void getQsfpFieldAddress(SffField field, int &dataAddress,
  */
 class QsfpModule : public Transceiver {
  public:
-  explicit QsfpModule(std::unique_ptr<TransceiverImpl> qsfpImpl);
+  explicit QsfpModule(
+      std::unique_ptr<TransceiverImpl> qsfpImpl,
+      unsigned int portsPerTransceiver);
 
   /*
    * Determines if the QSFP is present or not.
@@ -217,7 +219,7 @@ class QsfpModule : public Transceiver {
   /*
    * returns the freeside transceiver technology type
    */
-  TransmitterTechnology getQsfpTransmitterTechnology();
+  virtual TransmitterTechnology getQsfpTransmitterTechnology() const;
   /*
    * Parse out flag values from bitfields
    */
@@ -324,7 +326,13 @@ class QsfpModule : public Transceiver {
    * we need customization (needsCustomization_) and also makes sure
    * we haven't customized too recently via the cooldown param.
    */
-  bool shouldCustomize(time_t cooldown) const;
+  bool customizationWanted(time_t cooldown) const;
+
+  /*
+   * Returns whether customization is supported at all. Basically
+   * checks if something is plugged in and checks if copper.
+   */
+  bool customizationSupported() const;
 
   /*
    * Whether enough time has passed that we should refresh our data.
@@ -339,6 +347,7 @@ class QsfpModule : public Transceiver {
   cfg::PortSpeed getPortSpeed() const;
 
   std::map<uint32_t, PortStatus> ports_;
+  unsigned int portsPerTransceiver_{0};
 };
 
 }} //namespace facebook::fboss

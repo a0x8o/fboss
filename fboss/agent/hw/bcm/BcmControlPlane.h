@@ -9,20 +9,13 @@
  */
 #pragma once
 
-#include "common/stats/MonotonicCounter.h"
-
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
-#include "fboss/agent/hw/bcm/BcmCosManager.h"
+#include "fboss/agent/hw/bcm/BcmCosQueueManager.h"
 #include "fboss/agent/state/ControlPlane.h"
-
-#include <boost/container/flat_map.hpp>
-#include <vector>
 
 extern "C" {
 #include <opennsl/types.h>
 }
-
-using facebook::stats::MonotonicCounter;
 
 namespace facebook { namespace fboss {
 
@@ -41,8 +34,8 @@ public:
   opennsl_gport_t getCPUGPort() const {
     return gport_;
   }
-  CosQueueGports* getCosQueueGports() {
-    return &cosQueueGports_;
+  BcmCosQueueManager* getQueueManager() const {
+    return queueManager_.get();
   }
 
   /**
@@ -55,13 +48,11 @@ public:
    */
   void setupRxReasonToQueue(const ControlPlane::RxReasonToQueue& reasonToQueue);
 
-  /**
-   * TODO(joseph5wu) Temporarily keep this functions cause we haven't supported
-   * applying ControlPlane queue settings from config
-   */
-  void setupQueueCounters();
-
   void updateQueueCounters();
+
+  QueueConfig getMulticastQueueSettings() {
+    return queueManager_->getCurrentQueueSettings().multicast;
+  }
 
 private:
   // no copy or assignment
@@ -71,14 +62,6 @@ private:
   BcmSwitch* hw_{nullptr};
   // Broadcom global port number
   const opennsl_gport_t gport_;
-  CosQueueGports cosQueueGports_;
-
-  struct QueueCounter {
-    bool isDropCounter;
-    MonotonicCounter counter;
-  };
-  // key=queue id
-  boost::container::flat_map<opennsl_cos_queue_t,
-                             std::vector<QueueCounter>> queueCounters_;
+  std::unique_ptr<BcmCosQueueManager> queueManager_;
 };
 }} // facebook::fboss

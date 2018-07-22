@@ -10,6 +10,7 @@
 #pragma once
 
 #include <functional>
+#include <ostream>
 #include <memory>
 
 #include "fboss/agent/state/AclMap.h"
@@ -17,6 +18,7 @@
 #include "fboss/agent/state/SflowCollectorMap.h"
 #include "fboss/agent/state/DeltaFunctions.h"
 #include "fboss/agent/state/InterfaceMap.h"
+#include "fboss/agent/state/LoadBalancerMap.h"
 #include "fboss/agent/state/NodeMapDelta.h"
 #include "fboss/agent/state/PortMap.h"
 #include "fboss/agent/state/RouteDelta.h"
@@ -25,6 +27,7 @@
 namespace facebook { namespace fboss {
 
 class SwitchState;
+class ControlPlane;
 
 /*
  * StateDelta contains code for examining the differences between two
@@ -53,6 +56,8 @@ class StateDelta {
   AclMapDelta getAclsDelta() const;
   NodeMapDelta<AggregatePortMap> getAggregatePortsDelta() const;
   NodeMapDelta<SflowCollectorMap> getSflowCollectorsDelta() const;
+  NodeMapDelta<LoadBalancerMap> getLoadBalancersDelta() const;
+  DeltaValue<ControlPlane> getControlPlaneDelta() const;
 
  private:
   // Forbidden copy constructor and assignment operator
@@ -62,5 +67,7 @@ class StateDelta {
   std::shared_ptr<SwitchState> old_;
   std::shared_ptr<SwitchState> new_;
 };
+
+std::ostream& operator<<(std::ostream& out, const StateDelta& stateDelta);
 
 }} // facebook::fboss

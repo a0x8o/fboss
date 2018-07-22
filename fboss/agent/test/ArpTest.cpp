@@ -7,18 +7,18 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
-#include "common/stats/ServiceData.h"
 #include <folly/Memory.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
+#include "common/stats/ServiceData.h"
 #include "fboss/agent/AddressUtil.h"
-#include "fboss/agent/FbossError.h"
-#include "fboss/agent/SwSwitch.h"
-#include "fboss/agent/TxPacket.h"
 #include "fboss/agent/ArpHandler.h"
+#include "fboss/agent/FbossError.h"
 #include "fboss/agent/NeighborUpdater.h"
+#include "fboss/agent/SwSwitch.h"
 #include "fboss/agent/SwitchStats.h"
 #include "fboss/agent/ThriftHandler.h"
+#include "fboss/agent/TxPacket.h"
 #include "fboss/agent/hw/mock/MockHwSwitch.h"
 #include "fboss/agent/hw/mock/MockPlatform.h"
 #include "fboss/agent/hw/mock/MockRxPacket.h"
@@ -26,17 +26,21 @@
 #include "fboss/agent/state/ArpEntry.h"
 #include "fboss/agent/state/ArpResponseTable.h"
 #include "fboss/agent/state/ArpTable.h"
+#include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/PortDescriptor.h"
 #include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/state/Vlan.h"
 #include "fboss/agent/state/VlanMap.h"
-#include "fboss/agent/state/Interface.h"
 #include "fboss/agent/test/CounterCache.h"
-#include "fboss/agent/test/TestUtils.h"
 #include "fboss/agent/test/HwTestHandle.h"
+#include "fboss/agent/test/NeighborEntryTest.h"
+#include "fboss/agent/test/TestUtils.h"
 
+#include <boost/range/combine.hpp>
 #include <gtest/gtest.h>
+#include <array>
 #include <future>
+#include <string>
 
 using namespace facebook::fboss;
 using facebook::network::toBinaryAddress;
@@ -56,7 +60,10 @@ using ::testing::_;
 
 namespace {
 
-unique_ptr<HwTestHandle> setupTestHandle(std::chrono::seconds arpTimeout) {
+unique_ptr<HwTestHandle> setupTestHandle(
+    std::chrono::seconds arpTimeout = std::chrono::seconds(0),
+    uint32_t maxProbes = 1,
+    std::chrono::seconds staleTimeout = std::chrono::seconds(1)) {
   // Setup a default state object
   auto state = testStateA();
   const auto& intfs = state->getInterfaces();
@@ -81,17 +88,13 @@ unique_ptr<HwTestHandle> setupTestHandle(std::chrono::seconds arpTimeout) {
     state->setArpTimeout(arpTimeout);
   }
 
-  state->setMaxNeighborProbes(1);
-  state->setStaleEntryInterval(std::chrono::seconds(1));
+  state->setMaxNeighborProbes(maxProbes);
+  state->setStaleEntryInterval(staleTimeout);
 
   auto handle = createTestHandle(state);
   handle->getSw()->initialConfigApplied(std::chrono::steady_clock::now());
   waitForStateUpdates(handle->getSw());
   return handle;
-}
-
-unique_ptr<HwTestHandle> setupTestHandle() {
-  return setupTestHandle(std::chrono::seconds(0));
 }
 
 TxMatchFn checkArpPkt(bool isRequest,
@@ -196,6 +199,16 @@ TxMatchFn checkArpRequest(IPAddressV4 senderIP, MacAddress senderMAC,
                      targetIP, MacAddress::BROADCAST, vlan);
 }
 
+const std::shared_ptr<ArpEntry>
+getArpEntry(SwSwitch* sw, IPAddressV4 ip, VlanID vlanID = VlanID(1)) {
+  return sw->getState()
+      ->getVlans()
+      ->getVlanIf(vlanID)
+      ->getArpTable()
+      ->getEntryIf(ip);
+  return nullptr;
+}
+
 /* This helper sends an arp request for targetIP and verifies it was correctly
    sent out. */
 void testSendArpRequest(SwSwitch* sw, VlanID vlanID,
@@ -206,8 +219,56 @@ void testSendArpRequest(SwSwitch* sw, VlanID vlanID,
   auto intf = state->getInterfaces()->getInterfaceIf(RouterID(0), senderIP);
   EXPECT_NE(intf, nullptr);
 
+  // Cache the current stats
+  CounterCache counters(sw);
+
+  // Expect ARP entry to be created
+  WaitForArpEntryCreation arpCreate(sw, targetIP);
+  if (state->getMaxNeighborProbes() > 1) {
+    EXPECT_MANY_PKTS(sw, "ARP request",
+               checkArpRequest(senderIP, intf->getMac(), targetIP, vlanID));
+  }
+  else {
+    EXPECT_PKT(sw, "ARP request",
+               checkArpRequest(senderIP, intf->getMac(), targetIP, vlanID));
+  }
+  ArpHandler::sendArpRequest(sw, vlan->getID(), intf->getMac(),
+                             senderIP, targetIP);
+
+  // Notify the updater that we sent an arp request
+  sw->getNeighborUpdater()->sentArpRequest(vlanID, targetIP);
+
+  waitForStateUpdates(sw);
+  EXPECT_TRUE(arpCreate.wait());
+
+  counters.update();
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
+}
+
+} // unnamed namespace
+
+TEST(ArpTest, BasicSendRequest) {
+  auto handle = setupTestHandle();
+  auto sw = handle->getSw();
+  VlanID vlanID(1);
+  IPAddressV4 senderIP = IPAddressV4("10.0.0.1");
+  IPAddressV4 targetIP = IPAddressV4("10.0.0.2");
+
+  WaitForArpEntryExpiration arpExpiry(sw, targetIP);
+  // Cache the current stats
+  CounterCache counters(sw);
+
+  auto state = sw->getState();
+  auto vlan = state->getVlans()->getVlanIf(vlanID);
+  EXPECT_NE(vlan, nullptr);
+  auto intf = state->getInterfaces()->getInterfaceIf(RouterID(0), senderIP);
+  EXPECT_NE(intf, nullptr);
+
   // Sending an ARP request will trigger state update for setting pending entry
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(1);
+  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(2);
   EXPECT_PKT(sw, "ARP request",
              checkArpRequest(senderIP, intf->getMac(), targetIP, vlanID));
 
@@ -218,156 +279,13 @@ void testSendArpRequest(SwSwitch* sw, VlanID vlanID,
   sw->getNeighborUpdater()->sentArpRequest(vlanID, targetIP);
 
   waitForStateUpdates(sw);
-}
+  EXPECT_TRUE(arpExpiry.wait());
 
-} // unnamed namespace
-
-TEST(ArpTest, SendRequest) {
-  auto handle = setupTestHandle();
-  auto sw = handle->getSw();
-  VlanID vlanID(1);
-  IPAddressV4 senderIP = IPAddressV4("10.0.0.1");
-  IPAddressV4 targetIP = IPAddressV4("10.0.0.2");
-
-  // Cache the current stats
-  CounterCache counters(sw);
-
-  testSendArpRequest(sw, vlanID, senderIP, targetIP);
   counters.update();
   counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 1);
   counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
   counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
   counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
-
-  // Create an IP pkt for 10.0.0.10
-  auto buf = make_unique<IOBuf>(PktUtil::parseHexData(
-    // dst mac, src mac
-    "02 00 01 00 00 01  02 00 02 01 02 03"
-    // 802.1q, VLAN 1
-    "81 00 00 01"
-    // IPv4
-    "08 00"
-    // Version(4), IHL(5), DSCP(0), ECN(0), Total Length(20)
-    "45  00  00 14"
-    // Identification(0), Flags(0), Fragment offset(0)
-    "00 00  00 00"
-    // TTL(31), Protocol(6), Checksum (0, fake)
-    "1F  06  00 00"
-    // Source IP (1.2.3.4)
-    "01 02 03 04"
-    // Destination IP (10.0.0.10)
-    "0a 00 00 0a"
-  ));
-
-  // Receiving this packet should trigger an ARP request out.
-  // The state will also update because a pending arp entry will be created
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(1);
-  EXPECT_PKT(sw, "ARP request",
-             checkArpRequest(senderIP, MacAddress("00:02:00:00:00:01"),
-                             IPAddressV4("10.0.0.10"), vlanID));
-
-  handle->rxPacket(std::move(buf), PortID(1), vlanID);
-  waitForStateUpdates(sw);
-
-  counters.update();
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.pkts.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.arp.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.drops.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.error.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.ipv4.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.nexthop.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.no_arp.sum", 0);
-
-  // Create an IP pkt for 10.0.10.10
-  buf = make_unique<IOBuf>(PktUtil::parseHexData(
-    // dst mac, src mac
-    "02 00 01 00 00 01  02 00 02 01 02 03"
-    // 802.1q, VLAN 1
-    "81 00 00 01"
-    // IPv4
-    "08 00"
-    // Version(4), IHL(5), DSCP(0), ECN(0), Total Length(20)
-    "45  00  00 14"
-    // Identification(0), Flags(0), Fragment offset(0)
-    "00 00  00 00"
-    // TTL(31), Protocol(6), Checksum (0, fake)
-    "1F  06  00 00"
-    // Source IP (1.2.3.4)
-    "01 02 03 04"
-    // Destination IP (10.0.10.10)
-    "0a 00 0a 0a"
-  ));
-
-  // Receiving this packet should not trigger a ARP request out,
-  // because no interface is able to reach that subnet
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
-  EXPECT_HW_CALL(sw, sendPacketSwitched_(_)).Times(0);
-
-  handle->rxPacket(std::move(buf), PortID(1), vlanID);
-
-  waitForStateUpdates(sw);
-  counters.update();
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.pkts.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.arp.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.drops.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.error.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.ipv4.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.nexthop.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.no_arp.sum", 1);
-
-  // Create an IP pkt for 10.1.1.10, reachable through 10.0.0.22 and 10.0.0.23
-  buf = make_unique<IOBuf>(PktUtil::parseHexData(
-    // dst mac, src mac
-    "02 00 01 00 00 01  02 00 02 01 02 03"
-    // 802.1q, VLAN 1
-    "81 00 00 01"
-    // IPv4
-    "08 00"
-    // Version(4), IHL(5), DSCP(0), ECN(0), Total Length(20)
-    "45  00  00 14"
-    // Identification(0), Flags(0), Fragment offset(0)
-    "00 00  00 00"
-    // TTL(31), Protocol(6), Checksum (0, fake)
-    "1F  06  00 00"
-    // Source IP (1.2.3.4)
-    "01 02 03 04"
-    // Destination IP (10.1.1.10)
-    "0a 01 01 0a"
-  ));
-
-  // Receiving this packet should trigger an ARP request to 10.0.0.22 and
-  // 10.0.0.23, which causes pending arp entries to be added to the state.
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(1));
-  EXPECT_PKT(sw, "ARP request",
-             checkArpRequest(senderIP, MacAddress("00:02:00:00:00:01"),
-                             IPAddressV4("10.0.0.22"), vlanID));
-  EXPECT_PKT(sw, "ARP request",
-             checkArpRequest(senderIP, MacAddress("00:02:00:00:00:01"),
-                             IPAddressV4("10.0.0.23"), vlanID));
-
-  handle->rxPacket(std::move(buf), PortID(1), vlanID);
-
-  waitForStateUpdates(sw);
-  counters.update();
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.pkts.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.arp.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 2);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.drops.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.error.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.ipv4.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.nexthop.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.no_arp.sum", 0);
 }
 
 TEST(ArpTest, TableUpdates) {
@@ -876,18 +794,9 @@ TEST(ArpTest, PendingArp) {
 
   VlanID vlanID(1);
   IPAddressV4 senderIP = IPAddressV4("10.0.0.1");
-  IPAddressV4 targetIP = IPAddressV4("10.0.0.2");
 
   // Cache the current stats
   CounterCache counters(sw);
-
-  testSendArpRequest(sw, vlanID, senderIP, targetIP);
-
-  counters.update();
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
 
   // Create an IP pkt for 10.0.0.10
   auto hex = PktUtil::parseHexData(
@@ -920,8 +829,7 @@ TEST(ArpTest, PendingArp) {
 
   // Should see a pending entry now
   waitForStateUpdates(sw);
-  auto entry = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(IPAddressV4("10.0.0.10"));
+  auto entry = getArpEntry(sw, IPAddressV4("10.0.0.10"), vlanID);
   EXPECT_NE(entry, nullptr);
   EXPECT_EQ(entry->isPending(), true);
 
@@ -946,8 +854,7 @@ TEST(ArpTest, PendingArp) {
 
   // Should still see a pending entry now
   waitForStateUpdates(sw);
-  entry = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(IPAddressV4("10.0.0.10"));
+  entry = getArpEntry(sw, IPAddressV4("10.0.0.10"), vlanID);
   EXPECT_NE(entry, nullptr);
   EXPECT_EQ(entry->isPending(), true);
 
@@ -970,8 +877,7 @@ TEST(ArpTest, PendingArp) {
 
   // The entry should now be valid instead of pending
   waitForStateUpdates(sw);
-  entry = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(IPAddressV4("10.0.0.10"));
+  entry = getArpEntry(sw, IPAddressV4("10.0.0.10"), vlanID);
   EXPECT_NE(entry, nullptr);
   EXPECT_EQ(entry->isPending(), false);
 
@@ -982,8 +888,7 @@ TEST(ArpTest, PendingArp) {
 
   handle->rxPacket(make_unique<IOBuf>(hex), PortID(1), vlanID);
   waitForStateUpdates(sw);
-  entry = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(IPAddressV4("10.0.0.10"));
+  entry = getArpEntry(sw, IPAddressV4("10.0.0.10"), vlanID);
   EXPECT_NE(entry, nullptr);
   EXPECT_EQ(entry->isPending(), false);
 };
@@ -994,46 +899,35 @@ TEST(ArpTest, PendingArpCleanup) {
 
   VlanID vlanID(1);
   IPAddressV4 senderIP = IPAddressV4("10.0.0.1");
-  IPAddressV4 targetIP = IPAddressV4("10.0.0.2");
+  std::array<IPAddressV4, 2> targetIP = {IPAddressV4("10.0.0.2"),
+                                         IPAddressV4("10.0.0.3")};
 
-  // Cache the current stats
-  CounterCache counters(sw);
-
-  testSendArpRequest(sw, vlanID, senderIP, targetIP);
-
-  counters.update();
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
+  testSendArpRequest(sw, vlanID, senderIP, targetIP[0]);
 
   // Should see a pending entry now
-  auto entry =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP);
-  EXPECT_NE(entry, nullptr);
-  EXPECT_EQ(entry->isPending(), true);
+  auto entry0 = getArpEntry(sw, targetIP[0], vlanID);
+  EXPECT_NE(entry0, nullptr);
+  EXPECT_EQ(entry0->isPending(), true);
 
   // Send an Arp request for a different neighbor
-  IPAddressV4 targetIP2 = IPAddressV4("10.0.0.3");
-
-  testSendArpRequest(sw, vlanID, senderIP, targetIP2);
-
-  counters.update();
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
+  testSendArpRequest(sw, vlanID, senderIP, targetIP[1]);
 
   // Should see another pending entry now
   waitForStateUpdates(sw);
-  entry = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP2);
-  EXPECT_NE(entry, nullptr);
-  EXPECT_EQ(entry->isPending(), true);
+  auto entry1 = getArpEntry(sw, targetIP[1], vlanID);
+  EXPECT_NE(entry1, nullptr);
+  EXPECT_EQ(entry1->isPending(), true);
 
- // Wait for pending entries to expire
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(1));
+  // Wait for pending entries to expire
+  std::array<std::unique_ptr<WaitForArpEntryExpiration>, 2> arpExpirations;
+  std::transform(
+      targetIP.begin(),
+      targetIP.end(),
+      arpExpirations.begin(),
+      [&](const IPAddressV4& ip) {
+        return make_unique<WaitForArpEntryExpiration>(sw, ip);
+      });
+
   std::promise<bool> done;
   auto* evb = sw->getBackgroundEvb();
   evb->runInEventBaseThread([&]() {
@@ -1041,17 +935,11 @@ TEST(ArpTest, PendingArpCleanup) {
         done.set_value(true);
       }, 1010);
     });
-  done.get_future().wait();
+  done.get_future().wait(); // Entries should be removed
 
-  // Entries should be removed
-  entry =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP);
-  auto entry2 =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP2);
-  EXPECT_EQ(entry, nullptr);
-  EXPECT_EQ(entry2, nullptr);
+  for (auto& arpExpiry : arpExpirations) {
+    EXPECT_TRUE(arpExpiry->wait());
+  }
 }
 
 TEST(ArpTest, ArpTableSerialization) {
@@ -1062,7 +950,6 @@ TEST(ArpTest, ArpTableSerialization) {
   IPAddressV4 senderIP = IPAddressV4("10.0.0.1");
   IPAddressV4 targetIP = IPAddressV4("10.0.0.2");
 
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
   auto vlan = sw->getState()->getVlans()->getVlanIf(vlanID);
   EXPECT_NE(vlan, nullptr);
   auto arpTable = vlan->getArpTable();
@@ -1072,6 +959,7 @@ TEST(ArpTest, ArpTableSerialization) {
 
   testSendArpRequest(sw, vlanID, senderIP, targetIP);
 
+  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
   vlan = sw->getState()->getVlans()->getVlanIf(vlanID);
   EXPECT_NE(vlan, nullptr);
   arpTable = vlan->getArpTable();
@@ -1080,10 +968,10 @@ TEST(ArpTest, ArpTableSerialization) {
   unserializedArpTable = arpTable->fromFollyDynamic(serializedArpTable);
 
   // Should also see a pending entry
-  auto entry =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP);
+  auto entry = getArpEntry(sw, targetIP, vlanID);
 
+  EXPECT_NE(entry, nullptr);
+  EXPECT_TRUE(entry->isPending());
   EXPECT_NE(sw, nullptr);
 }
 
@@ -1093,80 +981,71 @@ TEST(ArpTest, ArpExpiration) {
 
   VlanID vlanID(1);
   IPAddressV4 senderIP = IPAddressV4("10.0.0.1");
-  IPAddressV4 targetIP = IPAddressV4("10.0.0.2");
+  std::array<IPAddressV4, 2> targetIP = {IPAddressV4("10.0.0.2"),
+                                         IPAddressV4("10.0.0.3")};
+  std::array<MacAddress, 2> targetMAC = {MacAddress("02:10:20:30:40:22"),
+                                         MacAddress("02:10:20:30:40:23")};
 
-  // Cache the current stats
-  CounterCache counters(sw);
+  for (auto ip : targetIP) {
+    testSendArpRequest(sw, vlanID, senderIP, ip);
+  }
 
-  testSendArpRequest(sw, vlanID, senderIP, targetIP);
+  std::array<std::unique_ptr<WaitForArpEntryReachable>, 2> arpReachables;
 
-  counters.update();
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
-
-  // Should see a pending entry now
-  auto entry =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP);
-  EXPECT_NE(entry, nullptr);
-  EXPECT_EQ(entry->isPending(), true);
-
-  // Send an Arp request for a different neighbor
-  IPAddressV4 targetIP2 = IPAddressV4("10.0.0.3");
-
-  testSendArpRequest(sw, vlanID, senderIP, targetIP2);
-
-  counters.update();
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
-
-  // Should see another pending entry now
-  waitForStateUpdates(sw);
-  entry = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP2);
-  EXPECT_NE(entry, nullptr);
-  EXPECT_EQ(entry->isPending(), true);
+  std::transform(
+      targetIP.begin(),
+      targetIP.end(),
+      arpReachables.begin(),
+      [&](const IPAddressV4& ip) {
+        return make_unique<WaitForArpEntryReachable>(sw, ip);
+      });
 
   // Receive arp replies for our pending entries
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(1));
-  sendArpReply(handle.get(), "10.0.0.2", "02:10:20:30:40:22", 1);
-  sendArpReply(handle.get(), "10.0.0.3", "02:10:20:30:40:23", 1);
+  for (auto tuple : boost::combine(targetIP, targetMAC)) {
+    auto ip = tuple.get<0>();
+    auto mac = tuple.get<1>();
+    sendArpReply(handle.get(), ip.str(), mac.toString(), 1);
+  }
 
   // Have getAndClearNeighborHit return false for the first entry,
   // but true for the second. This should result in expiration
   // for the second entry kicking off first.
-  EXPECT_HW_CALL(sw, getAndClearNeighborHit(_, testing::Eq(targetIP)))
-    .WillRepeatedly(testing::Return(false));
-  EXPECT_HW_CALL(sw, getAndClearNeighborHit(_, testing::Eq(targetIP2)))
-    .WillRepeatedly(testing::Return(true));
+  EXPECT_HW_CALL(sw, getAndClearNeighborHit(_, testing::Eq(targetIP[0])))
+      .WillRepeatedly(testing::Return(false));
+  EXPECT_HW_CALL(sw, getAndClearNeighborHit(_, testing::Eq(targetIP[1])))
+      .WillRepeatedly(testing::Return(true));
 
   // The entries should now be valid instead of pending
   waitForStateUpdates(sw);
-  entry = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP);
-  auto entry2 = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP2);
-  EXPECT_NE(entry, nullptr);
-  EXPECT_NE(entry2, nullptr);
-  EXPECT_EQ(entry->isPending(), false);
-  EXPECT_EQ(entry2->isPending(), false);
+  for (auto& arpReachable : arpReachables) {
+    EXPECT_TRUE(arpReachable->wait());
+  }
 
-  // Expect one more probe to be sent out before targetIP2 is expired
+  // Expect one more probe to be sent out before targetIP[1] is expired
   auto intfs = sw->getState()->getInterfaces();
   auto intf = intfs->getInterfaceIf(RouterID(0), senderIP);
-  EXPECT_PKT(sw, "ARP request",
-             checkArpRequest(senderIP, intf->getMac(), targetIP2, vlanID));
+  EXPECT_PKT(
+      sw,
+      "ARP request",
+      checkArpRequest(senderIP, intf->getMac(), targetIP[1], vlanID));
 
- // Wait for the second entry to expire.
- // We wait 2.5 seconds(plus change):
- // Up to 1.5 seconds for lifetime.
- // 1 more second for probe
+  // Wait for the second entry to expire.
+  // We wait 2.5 seconds(plus change):
+  // Up to 1.5 seconds for lifetime.
+  // 1 more second for probe
   EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(1));
+  std::array<unique_ptr<WaitForArpEntryExpiration>, 2> arpExpirations;
+
+  std::transform(
+      targetIP.begin(),
+      targetIP.end(),
+      arpExpirations.begin(),
+      [&](const IPAddressV4& ip) {
+        return make_unique<WaitForArpEntryExpiration>(sw, ip);
+      });
+
   std::promise<bool> done;
+
   auto* evb = sw->getBackgroundEvb();
   evb->runInEventBaseThread([&]() {
       evb->tryRunAfterDelay([&]() {
@@ -1176,25 +1055,23 @@ TEST(ArpTest, ArpExpiration) {
   done.get_future().wait();
 
   // The first entry should not be expired, but the second should be
-  entry =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP);
-  entry2 =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP2);
+  EXPECT_TRUE(getArpEntry(sw, targetIP[0]) != nullptr);
+  EXPECT_TRUE(arpExpirations[1]->wait());
+
+  auto entry = getArpEntry(sw, targetIP[0], vlanID);
   EXPECT_NE(entry, nullptr);
-  EXPECT_EQ(entry2, nullptr);
 
   // Now return true for the getAndClearNeighborHit calls on the second entry
-  EXPECT_HW_CALL(sw, getAndClearNeighborHit(_, testing::Eq(targetIP)))
-    .WillRepeatedly(testing::Return(true));
+  EXPECT_HW_CALL(sw, getAndClearNeighborHit(_, testing::Eq(targetIP[0])))
+      .WillRepeatedly(testing::Return(true));
 
   // Expect one more probe to be sent out before targetIP is expired
-  EXPECT_PKT(sw, "ARP request",
-             checkArpRequest(senderIP, intf->getMac(), targetIP, vlanID));
+  EXPECT_PKT(
+      sw,
+      "ARP request",
+      checkArpRequest(senderIP, intf->getMac(), targetIP[0], vlanID));
 
- // Wait for the first entry to expire
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(1));
+  // Wait for the first entry to expire
   std::promise<bool> done2;
   evb->runInEventBaseThread([&]() {
       evb->tryRunAfterDelay([&]() {
@@ -1204,10 +1081,7 @@ TEST(ArpTest, ArpExpiration) {
   done2.get_future().wait();
 
   // First entry should now be expired
-  entry =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP);
-  EXPECT_EQ(entry, nullptr);
+  EXPECT_TRUE(arpExpirations[0]->wait());
 }
 
 TEST(ArpTest, PortFlapRecover) {
@@ -1223,75 +1097,56 @@ TEST(ArpTest, PortFlapRecover) {
 
   VlanID vlanID(1);
   IPAddressV4 senderIP = IPAddressV4("10.0.0.1");
-  IPAddressV4 targetIP = IPAddressV4("10.0.0.2");
+  std::vector<IPAddressV4> targetIP = {IPAddressV4("10.0.0.2"),
+                                       IPAddressV4("10.0.0.3"),
+                                       IPAddressV4("10.0.0.4")};
+  std::vector<MacAddress> targetMAC = {MacAddress("02:10:20:30:40:22"),
+                                       MacAddress("02:10:20:30:40:23"),
+                                       MacAddress("02:10:20:30:40:24")};
+  std::vector<unsigned int> targetPort = {1, 1, 2};
 
   // Cache the current stats
   CounterCache counters(sw);
 
-  testSendArpRequest(sw, vlanID, senderIP, targetIP);
+  // have arp entries to reachable state
+  for (auto tuple : boost::combine(targetIP, targetMAC, targetPort)) {
+    auto ip = tuple.get<0>();
+    auto mac = tuple.get<1>();
+    auto port = tuple.get<2>();
+
+    testSendArpRequest(sw, vlanID, senderIP, ip);
+
+    WaitForArpEntryReachable arpReachable(sw, ip);
+    sendArpReply(handle.get(), ip.str(), mac.toString(), port);
+    waitForStateUpdates(sw);
+    EXPECT_TRUE(arpReachable.wait());
+  }
 
   counters.update();
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 3);
   counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
   counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 3);
 
-  // Should see a pending entry now
-  auto entry =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP);
-  EXPECT_NE(entry, nullptr);
-  EXPECT_EQ(entry->isPending(), true);
+  // flapping port 1, so prune port 2's IP, MAC, PortID and waiter
+  auto unaffectedIP = targetIP.back();
+  targetIP.pop_back();
+  targetMAC.pop_back();
+  targetPort.pop_back();
 
-  // Send an Arp request for two different neighbors
-  IPAddressV4 targetIP2 = IPAddressV4("10.0.0.3");
-  IPAddressV4 targetIP3 = IPAddressV4("10.0.0.4");
-
-  testSendArpRequest(sw, vlanID, senderIP, targetIP2);
-  testSendArpRequest(sw, vlanID, senderIP, targetIP3);
-
-  counters.update();
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 2);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
-
-  // Should see two more pending entries now
-  waitForStateUpdates(sw);
-  auto entry2 = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP2);
-  auto entry3 = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP3);
-  EXPECT_NE(entry2, nullptr);
-  EXPECT_EQ(entry2->isPending(), true);
-  EXPECT_NE(entry3, nullptr);
-  EXPECT_EQ(entry3->isPending(), true);
-
-  // Receive arp replies for our pending entries
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(1));
-  sendArpReply(handle.get(), "10.0.0.2", "02:10:20:30:40:22", 1);
-  sendArpReply(handle.get(), "10.0.0.3", "02:10:20:30:40:23", 1);
-  sendArpReply(handle.get(), "10.0.0.4", "02:10:20:30:40:24", 2);
-
-  // The entries should now be valid instead of pending
-  waitForStateUpdates(sw);
-  entry = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP);
-  entry2 = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP2);
-  entry3 = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP3);
-  EXPECT_NE(entry, nullptr);
-  EXPECT_NE(entry2, nullptr);
-  EXPECT_NE(entry3, nullptr);
-  EXPECT_EQ(entry->isPending(), false);
-  EXPECT_EQ(entry2->isPending(), false);
-  EXPECT_EQ(entry3->isPending(), false);
+  // entries related to flapped port would go pending
+  std::vector<std::unique_ptr<WaitForArpEntryPending>> arpPendings(2);
+  std::transform(
+      targetIP.begin(),
+      targetIP.end(),
+      arpPendings.begin(),
+      [&](const IPAddressV4& ip) {
+        return make_unique<WaitForArpEntryPending>(sw, ip);
+      });
 
   // send a port down event to the switch for port 1
   EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(1));
   sw->linkStateChanged(PortID(1), false);
-
 
   // purging neighbor entries occurs on the background EVB via NeighorUpdater as
   // a StateObserver.
@@ -1303,42 +1158,215 @@ TEST(ArpTest, PortFlapRecover) {
   waitForStateUpdates(sw);
 
   // both entries should now be pending
-  entry =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP);
-  entry2 =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP2);
-  entry3 =
-      sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()->getEntryIf(
-          targetIP3);
-  EXPECT_NE(entry, nullptr);
-  EXPECT_NE(entry2, nullptr);
-  EXPECT_NE(entry3, nullptr);
-  EXPECT_EQ(entry->isPending(), true);
-  EXPECT_EQ(entry2->isPending(), true);
-  EXPECT_EQ(entry3->isPending(), false);
+  for (auto& arpPending : arpPendings) {
+    EXPECT_TRUE(arpPending->wait());
+  }
+
+  // ARP entry related to unflapped port must remain unaffected
+  auto unaffectedEntry = getArpEntry(sw, unaffectedIP, vlanID);
+  EXPECT_NE(unaffectedEntry, nullptr);
+  EXPECT_EQ(unaffectedEntry->isPending(), false);
 
   // send a port up event to the switch for port 1
   EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(1));
   sw->linkStateChanged(PortID(1), true);
-
-  // Receive arp replies for our pending entries
-  sendArpReply(handle.get(), "10.0.0.2", "02:10:20:30:40:22", 1);
-  sendArpReply(handle.get(), "10.0.0.3", "02:10:20:30:40:23", 1);
-
-  // The entries should now be valid again
   waitForStateUpdates(sw);
-  entry = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP);
-  entry2 = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP2);
-  entry3 = sw->getState()->getVlans()->getVlanIf(vlanID)->getArpTable()
-    ->getEntryIf(targetIP3);
-  EXPECT_NE(entry, nullptr);
-  EXPECT_NE(entry2, nullptr);
-  EXPECT_NE(entry3, nullptr);
-  EXPECT_EQ(entry->isPending(), false);
-  EXPECT_EQ(entry2->isPending(), false);
-  EXPECT_EQ(entry3->isPending(), false);
+
+  // Receive arp replies for entries on flapped port, port 1
+  for (auto tuple : boost::combine(targetIP, targetMAC, targetPort)) {
+    auto ip = tuple.get<0>();
+    auto mac = tuple.get<1>();
+    auto port = tuple.get<2>();
+
+    WaitForArpEntryReachable arpReachable(sw, ip);
+    sendArpReply(handle.get(), ip.str(), mac.toString(), port);
+    waitForStateUpdates(sw);
+    EXPECT_TRUE(arpReachable.wait());
+  }
+  unaffectedEntry = getArpEntry(sw, unaffectedIP, vlanID);
+  EXPECT_NE(unaffectedEntry, nullptr);
+  EXPECT_EQ(unaffectedEntry->isPending(), false);
+}
+
+TEST(ArpTest, receivedPacketWithDirectlyConnectedDestination) {
+  auto handle = setupTestHandle();
+  auto sw = handle->getSw();
+  VlanID vlanID(1);
+  IPAddressV4 senderIP = IPAddressV4("10.0.0.1");
+  IPAddressV4 targetIP = IPAddressV4("10.0.0.10");
+
+  WaitForArpEntryExpiration arpExpiry(sw, targetIP);
+
+  // Cache the current stats
+  CounterCache counters(sw);
+
+  // Create an IP pkt for 10.0.0.10
+  auto buf = make_unique<IOBuf>(PktUtil::parseHexData(
+    // dst mac, src mac
+    "02 00 01 00 00 01  02 00 02 01 02 03"
+    // 802.1q, VLAN 1
+    "81 00 00 01"
+    // IPv4
+    "08 00"
+    // Version(4), IHL(5), DSCP(0), ECN(0), Total Length(20)
+    "45  00  00 14"
+    // Identification(0), Flags(0), Fragment offset(0)
+    "00 00  00 00"
+    // TTL(31), Protocol(6), Checksum (0, fake)
+    "1F  06  00 00"
+    // Source IP (1.2.3.4)
+    "01 02 03 04"
+    // Destination IP (10.0.0.10)
+    "0a 00 00 0a"
+  ));
+
+  // Receiving this packet should trigger an ARP request out.
+  EXPECT_PKT(sw, "ARP request",
+             checkArpRequest(senderIP, MacAddress("00:02:00:00:00:01"),
+                             targetIP, vlanID));
+  // The state will be updated twice: once to create a pending ARP entry and
+  // once to expire the ARP entry
+  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(2);
+
+  handle->rxPacket(std::move(buf), PortID(1), vlanID);
+
+  waitForStateUpdates(sw);
+  EXPECT_TRUE(arpExpiry.wait());
+
+  counters.update();
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.pkts.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.arp.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.drops.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.error.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.ipv4.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.nexthop.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.no_arp.sum", 0);
+}
+
+TEST(ArpTest, receivedPacketWithNoRouteToDestination) {
+  auto handle = setupTestHandle();
+  auto sw = handle->getSw();
+  VlanID vlanID(1);
+
+  // Cache the current stats
+  CounterCache counters(sw);
+
+  // Create an IP pkt for 10.0.10.10
+  auto buf = make_unique<IOBuf>(PktUtil::parseHexData(
+    // dst mac, src mac
+    "02 00 01 00 00 01  02 00 02 01 02 03"
+    // 802.1q, VLAN 1
+    "81 00 00 01"
+    // IPv4
+    "08 00"
+    // Version(4), IHL(5), DSCP(0), ECN(0), Total Length(20)
+    "45  00  00 14"
+    // Identification(0), Flags(0), Fragment offset(0)
+    "00 00  00 00"
+    // TTL(31), Protocol(6), Checksum (0, fake)
+    "1F  06  00 00"
+    // Source IP (1.2.3.4)
+    "01 02 03 04"
+    // Destination IP (10.0.10.10)
+    "0a 00 0a 0a"
+  ));
+
+  // Receiving this packet should not trigger a ARP request out,
+  // because no interface is able to reach that subnet
+  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
+  EXPECT_HW_CALL(sw, sendPacketSwitched_(_)).Times(0);
+
+  handle->rxPacket(std::move(buf), PortID(1), vlanID);
+
+  waitForStateUpdates(sw);
+
+  counters.update();
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.pkts.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.arp.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.drops.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.error.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.ipv4.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.nexthop.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.no_arp.sum", 1);
+}
+
+TEST(ArpTest, receivedPacketWithRouteToDestination) {
+  auto handle = setupTestHandle();
+  auto sw = handle->getSw();
+  VlanID vlanID(1);
+  IPAddressV4 senderIP = IPAddressV4("10.0.0.1");
+  std::array<IPAddressV4, 2> nextHops = {IPAddressV4("10.0.0.22"),
+                                         IPAddressV4("10.0.0.23")};
+
+  // Cache the current stats
+  CounterCache counters(sw);
+
+  std::array<std::unique_ptr<WaitForArpEntryExpiration>, 2> arpExpirations;
+
+  std::transform(
+      nextHops.begin(),
+      nextHops.end(),
+      arpExpirations.begin(),
+      [&](const IPAddressV4& ip) {
+        return make_unique<WaitForArpEntryExpiration>(sw, ip);
+      });
+
+  // Create an IP pkt for 10.1.1.10, reachable through 10.0.0.22 and 10.0.0.23
+  auto buf = make_unique<IOBuf>(PktUtil::parseHexData(
+    // dst mac, src mac
+    "02 00 01 00 00 01  02 00 02 01 02 03"
+    // 802.1q, VLAN 1
+    "81 00 00 01"
+    // IPv4
+    "08 00"
+    // Version(4), IHL(5), DSCP(0), ECN(0), Total Length(20)
+    "45  00  00 14"
+    // Identification(0), Flags(0), Fragment offset(0)
+    "00 00  00 00"
+    // TTL(31), Protocol(6), Checksum (0, fake)
+    "1F  06  00 00"
+    // Source IP (1.2.3.4)
+    "01 02 03 04"
+    // Destination IP (10.1.1.10)
+    "0a 01 01 0a"
+  ));
+
+  // Receiving this packet should trigger an ARP request to 10.0.0.22 and
+  // 10.0.0.23, which causes pending arp entries to be added to the state.
+  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(2));
+  for (auto nexthop : nextHops) {
+    EXPECT_PKT(
+        sw,
+        "ARP request",
+        checkArpRequest(
+            senderIP, MacAddress("00:02:00:00:00:01"), nexthop, vlanID));
+  }
+
+  handle->rxPacket(std::move(buf), PortID(1), vlanID);
+
+  waitForStateUpdates(sw);
+  for (auto& arpExpiry : arpExpirations) {
+    EXPECT_TRUE(arpExpiry->wait());
+  }
+
+  counters.update();
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.pkts.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.arp.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.tx.sum", 2);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.request.rx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.tx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "arp.reply.rx.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.drops.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.error.sum", 0);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.ipv4.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.nexthop.sum", 1);
+  counters.checkDelta(SwitchStats::kCounterPrefix + "ipv4.no_arp.sum", 0);
 }

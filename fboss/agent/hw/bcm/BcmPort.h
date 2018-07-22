@@ -20,12 +20,11 @@ extern "C" {
 #include "common/stats/ExportedHistogramMapImpl.h"
 
 #include "fboss/agent/types.h"
-#include "fboss/agent/hw/bcm/BcmCosManager.h"
+#include "fboss/agent/hw/bcm/BcmCosQueueManager.h"
 #include "fboss/agent/hw/bcm/BcmPlatformPort.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/hw/bcm/gen-cpp2/hardware_stats_types.h"
 #include "fboss/agent/state/Port.h"
-#include "fboss/agent/state/PortQueue.h"
 
 #include <folly/Range.h>
 #include <folly/Synchronized.h>
@@ -38,7 +37,6 @@ class BcmSwitch;
 class BcmPortGroup;
 class SwitchState;
 
-using QueueConfig = PortFields::QueueConfig;
 /**
  * BcmPort is the class to abstract the physical port in BcmSwitch.
  */
@@ -124,6 +122,7 @@ class BcmPort {
   void setSpeed(const std::shared_ptr<Port>& swPort);
   void setSflowRates(const std::shared_ptr<Port>& swPort);
   void disableSflow();
+  void setPortResource(const std::shared_ptr<Port>& swPort);
 
   /*
    * Update this port's statistics.
@@ -154,12 +153,15 @@ class BcmPort {
 
   static opennsl_gport_t asGPort(opennsl_port_t port);
   static bool isValidLocalPort(opennsl_gport_t gport);
-  CosQueueGports* getCosQueueGports() {
-    return &cosQueueGports_;
+  BcmCosQueueManager* getQueueManager() const {
+    return queueManager_.get();
   }
 
  private:
   class BcmPortStats {
+    // All actions or instantiations of this class need to be done in a
+    // thread-safe way (for example, the way that locking is done on
+    // lastPortStats_) - the class itself does not guarantee this on it's own
    public:
     BcmPortStats() {}
     explicit BcmPortStats(int numUnicastQueues);
@@ -184,6 +186,7 @@ class BcmPort {
                   folly::StringPiece statName,
                   opennsl_stat_val_t type,
                   int64_t* portStatVal);
+  void updateBcmStats(std::chrono::seconds now, HwPortStats* curPortStats);
   void updatePktLenHist(std::chrono::seconds now,
                         stats::ExportedHistogramMapImpl::LockableHistogram* hist,
                         const std::vector<opennsl_stat_val_t>& stats);
@@ -192,22 +195,21 @@ class BcmPort {
   void setAdditionalStats(std::chrono::seconds now, HwPortStats* curPortStats);
   std::string statName(folly::StringPiece name) const;
 
+  cfg::PortSpeed getDesiredPortSpeed(const std::shared_ptr<Port>& swPort);
   opennsl_port_if_t getDesiredInterfaceMode(cfg::PortSpeed speed,
                                             PortID id,
                                             const std::string& name);
+  bool getDesiredFECEnabledStatus(const std::shared_ptr<Port>& swPort);
   TransmitterTechnology getTransmitterTechnology(const std::string& name);
 
   opennsl_pbmp_t getPbmp();
 
-  void setKR4Ability();
+  void setInterfaceMode(const std::shared_ptr<Port>& swPort);
   void setFEC(const std::shared_ptr<Port>& swPort);
   void setPause(const std::shared_ptr<Port>& swPort);
   void setTxSetting(const std::shared_ptr<Port>& swPort);
   bool isMmuLossy() const;
   uint8_t determinePipe() const;
-  int getNumUnicastQueues() {
-    return cosQueueGports_.unicast.size();
-  }
 
   BcmSwitch* const hw_{nullptr};
   const opennsl_port_t port_;    // Broadcom physical port number
@@ -224,7 +226,7 @@ class BcmPort {
   BcmPortGroup* portGroup_{nullptr};
 
   std::map<std::string, stats::MonotonicCounter> portCounters_;
-  CosQueueGports cosQueueGports_;
+  std::unique_ptr<BcmCosQueueManager> queueManager_;
 
   stats::ExportedStatMapImpl::LockableStat outQueueLen_;
   stats::ExportedHistogramMapImpl::LockableHistogram inPktLengths_;

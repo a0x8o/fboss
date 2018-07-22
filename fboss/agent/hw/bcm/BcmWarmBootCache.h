@@ -14,35 +14,40 @@ extern "C" {
 #include <opennsl/port.h>
 #include <opennsl/vlan.h>
 }
-#include <algorithm>
-#include <string>
-#include <list>
-#include <memory>
-#include <vector>
 #include <boost/container/flat_map.hpp>
 #include <boost/container/flat_set.hpp>
-#include <folly/dynamic.h>
+#include <folly/Conv.h>
 #include <folly/IPAddress.h>
 #include <folly/MacAddress.h>
 #include <folly/Optional.h>
-#include "fboss/agent/types.h"
+#include <folly/dynamic.h>
+#include <folly/logging/xlog.h>
+#include <algorithm>
+#include <list>
+#include <memory>
+#include <string>
+#include <vector>
+#include "fboss/agent/hw/bcm/BcmRtag7Module.h"
 #include "fboss/agent/state/RouteTypes.h"
+#include "fboss/agent/hw/bcm/types.h"
+
+#include "fboss/agent/hw/bcm/BcmAclRange.h"
 
 namespace facebook { namespace fboss {
 class AclMap;
-class AclRange;
 class BcmSwitch;
 class BcmSwitchIf;
 class InterfaceMap;
+class LoadBalancerMap;
 class RouteTableMap;
+class SwitchState;
 class Vlan;
 class VlanMap;
-class SwitchState;
 
 class BcmWarmBootCache {
  public:
   explicit BcmWarmBootCache(const BcmSwitchIf* hw);
-  void populate();
+  void populate(folly::Optional<folly::dynamic> warmBootState = folly::none);
   struct VlanInfo {
     VlanInfo(VlanID _vlan, opennsl_pbmp_t _untagged, opennsl_pbmp_t _allPorts,
              InterfaceID _intfID):
@@ -66,12 +71,13 @@ class BcmWarmBootCache {
   };
   typedef opennsl_if_t EcmpEgressId;
   typedef opennsl_if_t EgressId;
-  typedef boost::container::flat_set<EgressId> EgressIds;
-  typedef boost::container::flat_map<EgressId, EgressIds> Ecmp2EgressIds;
+  typedef boost::container::flat_multiset<EgressId> EgressIds;
+  typedef boost::container::flat_map<EcmpEgressId, EgressIds> Ecmp2EgressIds;
   static EgressIds toEgressIds(EgressId* egress, int count) {
     EgressIds egressIds;
-    std::for_each(egress, egress + count,
-        [&](EgressId egress) { egressIds.insert(egress);});
+    std::for_each(egress, egress + count, [&egressIds](EgressId egress) {
+      egressIds.insert(egress);
+    });
     return egressIds;
   }
   static std::string toEgressIdsStr(const EgressIds& egressIds);
@@ -91,6 +97,7 @@ class BcmWarmBootCache {
    * Reconstruct acl map
    */
   std::shared_ptr<AclMap> reconstructAclMap() const;
+  std::shared_ptr<LoadBalancerMap> reconstructLoadBalancers() const;
 
   /*
    * Get all cached ecmp egress Ids
@@ -132,13 +139,18 @@ class BcmWarmBootCache {
   using HostTableInWarmBootFile = boost::container::flat_map<HostKey, EgressId>;
 
   // current h/w acl ranges: value = <BcmAclRangeHandle, ref_count>
-  using BcmAclRangeHandle = uint32_t;
-  using BcmAclEntryHandle = int;
   using AclRange2BcmAclRangeHandle = boost::container::flat_map<
         AclRange, std::pair<BcmAclRangeHandle, uint32_t>>;
   // current h/w acls: key = priority, value = BcmAclEntryHandle
   using Priority2BcmAclEntryHandle = boost::container::flat_map<
         int, BcmAclEntryHandle>;
+  struct AclStatStatus {
+    BcmAclStatHandle stat{-1};
+    bool claimed{false};
+  };
+  // current h/w acl stats: key = BcmAclEntryHandle, value = AclStatStatus
+  using AclEntry2AclStat = boost::container::flat_map<
+    BcmAclEntryHandle, AclStatStatus>;
 
   /*
    * Callbacks for traversing entries in BCM h/w tables
@@ -159,14 +171,23 @@ class BcmWarmBootCache {
    */
   // retrieve all bcm acls of the specified group
   void populateAcls(const int groupId, AclRange2BcmAclRangeHandle& ranges,
+                    AclEntry2AclStat& stats,
                     Priority2BcmAclEntryHandle& acls);
   // retrieve bcm acl ranges for the specified acl
   void populateAclRanges(const BcmAclEntryHandle acl,
                          AclRange2BcmAclRangeHandle& ranges);
+  void populateAclStats(const BcmAclEntryHandle acl,
+                        AclEntry2AclStat& stats);
   // remove bcm acl directly from h/w
   void removeBcmAcl(BcmAclEntryHandle handle);
   // remove bcm acl range directly from h/w
   void removeBcmAclRange(BcmAclRangeHandle handle);
+  // remove bcm acl stat directly from h/w
+  void removeBcmAclStat(BcmAclStatHandle handle);
+  void detachBcmAclStat(BcmAclEntryHandle aclHandle,
+                        BcmAclStatHandle aclStatHandle);
+
+  void populateRtag7State();
 
  public:
   /*
@@ -181,8 +202,8 @@ class BcmWarmBootCache {
     return vlan2VlanInfo_.find(vlan);
   }
   void programmed(Vlan2VlanInfoCitr vitr) {
-    VLOG(1) << "Programmed vlan: " << vitr->first
-      << " removing from warm boot cache";
+    XLOG(DBG1) << "Programmed vlan: " << vitr->first
+               << " removing from warm boot cache";
     vlan2VlanInfo_.erase(vitr);
   }
   /*
@@ -195,8 +216,8 @@ class BcmWarmBootCache {
     return vlan2Station_.find(vlan);
   }
   void programmed(Vlan2StationCitr vsitr) {
-    VLOG(1) << "Programmed station : " << vsitr->first
-      << " removing from warm boot cache";
+    XLOG(DBG1) << "Programmed station : " << vsitr->first
+               << " removing from warm boot cache";
     vlan2Station_.erase(vsitr);
   }
   /*
@@ -213,9 +234,9 @@ class BcmWarmBootCache {
     return vlanAndMac2Intf_.find(VlanAndMac(vlan, mac));
   }
   void programmed(VlanAndMac2IntfCitr vmitr) {
-    VLOG(1) << "Programmed interface in vlan : " << vmitr->first.first
-      << " and mac: " << vmitr->first.second
-      << " removing from warm boot cache";
+    XLOG(DBG1) << "Programmed interface in vlan : " << vmitr->first.first
+               << " and mac: " << vmitr->first.second
+               << " removing from warm boot cache";
     vlanAndMac2Intf_.erase(vmitr);
   }
   /*
@@ -246,8 +267,8 @@ class BcmWarmBootCache {
       folly::Optional<opennsl_if_t> intf);
 
   void programmed(EgressId2EgressCitr citr) {
-    VLOG(1) << "Programmed egress entry: " << citr->first
-            << ". Removing from warmboot cache.";
+    XLOG(DBG1) << "Programmed egress entry: " << citr->first
+               << ". Removing from warmboot cache.";
     egressId2Egress_.erase(citr->first);
   }
   /*
@@ -261,8 +282,9 @@ class BcmWarmBootCache {
     return vrfIp2Host_.find(VrfAndIP(vrf, ip));
   }
   void programmed(VrfAndIP2HostCitr vrhitr) {
-    VLOG(1) << "Programmed host for vrf : " << vrhitr->first.first << " ip : "
-      << vrhitr->first.second << " removing from warm boot cache ";
+    XLOG(DBG1) << "Programmed host for vrf : " << vrhitr->first.first
+               << " ip : " << vrhitr->first.second
+               << " removing from warm boot cache ";
     vrfIp2Host_.erase(vrhitr);
   }
   /*
@@ -288,9 +310,10 @@ class BcmWarmBootCache {
        IPAddress(IPAddressV4(IPAddressV4::fetchMask(mask)))));
   }
   void programmed(VrfAndPfx2RouteCitr vrpitr) {
-    VLOG(1) << "Programmed route in vrf : " << std::get<0>(vrpitr->first)
-      << "  prefix: " << std::get<1>(vrpitr->first) << "/"
-      <<  std::get<2>(vrpitr->first) << " removing from warm boot cache ";
+    XLOG(DBG1) << "Programmed route in vrf : " << std::get<0>(vrpitr->first)
+               << "  prefix: " << std::get<1>(vrpitr->first) << "/"
+               << std::get<2>(vrpitr->first)
+               << " removing from warm boot cache ";
     vrfPrefix2Route_.erase(vrpitr);
   }
 
@@ -309,9 +332,9 @@ class BcmWarmBootCache {
     return vrfAndIP2Route_.find(VrfAndIP(vrf, ip));
   }
   void programmed(VrfAndIP2RouteCitr citr) {
-    VLOG(1) << "Programmed host route, removing from warm boot cache. "
-            << "vrf: " << citr->first.first << " "
-            << "ip: " << citr->first.second;
+    XLOG(DBG1) << "Programmed host route, removing from warm boot cache. "
+               << "vrf: " << citr->first.first << " "
+               << "ip: " << citr->first.second;
     vrfAndIP2Route_.erase(citr);
   }
 
@@ -329,8 +352,8 @@ class BcmWarmBootCache {
     return egressIds2Ecmp_.find(egressIds);
   }
   void programmed(EgressIds2EcmpCItr eeitr) {
-    VLOG(1) << "Programmed ecmp egress: " << eeitr->second.ecmp_intf
-      << " removing from warm boot cache";
+    XLOG(DBG1) << "Programmed ecmp egress: " << eeitr->second.ecmp_intf
+               << " removing from warm boot cache";
     // Remove from ecmp->egressId mapping since now a BcmEcmpEgress object
     // exists which has the egress id info.
     //
@@ -340,7 +363,7 @@ class BcmWarmBootCache {
   }
 
   /*
-   * Iterators and find functions for acls and aclRanges
+   * Iterators and find functions for acls, aclRanges and acl stats
    */
   using Prio2BcmAclItr = Priority2BcmAclEntryHandle::const_iterator;
   Prio2BcmAclItr priority2BcmAclEntryHandle_begin() {
@@ -353,8 +376,8 @@ class BcmWarmBootCache {
     return priority2BcmAclEntryHandle_.find(priority);
   }
   void programmed(Prio2BcmAclItr itr) {
-    VLOG(1) << "Programmed AclEntry, removing from warm boot cache. "
-            << "priority=" << itr->first << " acl entry=" << itr->second;
+    XLOG(DBG1) << "Programmed AclEntry, removing from warm boot cache. "
+               << "priority=" << itr->first << " acl entry=" << itr->second;
     priority2BcmAclEntryHandle_.erase(itr);
   }
 
@@ -369,6 +392,20 @@ class BcmWarmBootCache {
     return aclRange2BcmAclRangeHandle_.find(aclRange);
   }
   void programmed(Range2BcmHandlerItr itr);
+
+  bool unitControlMatches(
+      char module,
+      opennsl_switch_control_t switchControl,
+      int arg) const;
+  void programmed(char module, opennsl_switch_control_t switchControl);
+  using AclEntry2AclStatItr = AclEntry2AclStat::iterator;
+  AclEntry2AclStatItr AclEntry2AclStat_end() {
+    return aclEntry2AclStat_.end();
+  }
+  AclEntry2AclStatItr findAclStat(const BcmAclEntryHandle& bcmAclEntry) {
+    return aclEntry2AclStat_.find(bcmAclEntry);
+  }
+  void programmed(AclEntry2AclStatItr itr);
 
   /*
    * owner is done programming its entries remove any entries
@@ -392,7 +429,8 @@ class BcmWarmBootCache {
    * map
    */
   const EgressIds& getPathsForEcmp(EgressId ecmp) const;
-  void populateStateFromWarmbootFile();
+  folly::dynamic getWarmBootState() const;
+  void populateFromWarmBootState(const folly::dynamic& warmBootState);
   // No copy or assignment.
   BcmWarmBootCache(const BcmWarmBootCache&) = delete;
   BcmWarmBootCache& operator=(const BcmWarmBootCache&) = delete;
@@ -446,6 +484,12 @@ class BcmWarmBootCache {
   // acls and acl ranges
   AclRange2BcmAclRangeHandle aclRange2BcmAclRangeHandle_;
   Priority2BcmAclEntryHandle priority2BcmAclEntryHandle_;
+
+  BcmRtag7Module::ModuleState moduleAState_;
+  BcmRtag7Module::ModuleState moduleBState_;
+
+  // acl stats
+  AclEntry2AclStat aclEntry2AclStat_;
 
   std::unique_ptr<SwitchState> dumpedSwSwitchState_;
 };

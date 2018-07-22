@@ -16,16 +16,19 @@ extern "C" {
 #include <folly/IPAddress.h>
 #include <folly/IPAddressV4.h>
 #include <folly/IPAddressV6.h>
+#include <folly/logging/xlog.h>
 #include "fboss/agent/Constants.h"
 #include "fboss/agent/hw/bcm/BcmError.h"
-#include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmHost.h"
 #include "fboss/agent/hw/bcm/BcmIntf.h"
 #include "fboss/agent/hw/bcm/BcmPlatform.h"
+#include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmWarmBootCache.h"
 #include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 
 #include "fboss/agent/state/RouteTypes.h"
+
+#include <numeric>
 
 namespace facebook { namespace fboss {
 
@@ -39,6 +42,95 @@ auto constexpr kRoutes = "routes";
 
 // TODO: Assumes we have only one VRF
 auto constexpr kDefaultVrf = 0;
+
+auto constexpr kEcmpWidth = 64;
+
+// Next hops coming from the SwSwitch need to be normalized
+// in two ways:
+// 1) Weight=0 (ECMP that does not support UCMP) needs to be treated
+//    the same as Weight=1
+// 2) If the total weights of the next hops exceed the ECMP group width,
+//    we need to scale them down to within the ECMP group width.
+RouteNextHopEntry::NextHopSet normalizeNextHops(
+    const RouteNextHopEntry::NextHopSet& unnormalizedNextHops) {
+  RouteNextHopEntry::NextHopSet normalizedNextHops;
+  // 1)
+  for (const auto& nhop : unnormalizedNextHops) {
+    normalizedNextHops.insert(ResolvedNextHop(
+        nhop.addr(),
+        nhop.intf(),
+        std::max(nhop.weight(), NextHopWeight(1))));
+  }
+  // 2)
+  // Calculate the totalWeight. If that exceeds the max ecmp width, we use the
+  // following heuristic algorithm:
+  // 2a) Calculate the scaled factor kEcmpWidth/totalWeight. Without rounding,
+  //     multiplying each weight by this will still yield correct weight ratios
+  //     between the next hops.
+  // 2b) Scale each next hop by the scaling factor, rounding down by default
+  //     except for when weights go below 1. In that case, add them in as
+  //     weight 1. At this point, we might _still_ be above kEcmpWidth, because
+  //     we could have rounded too many 0s up to 1.
+  // 2c) Do a final pass where we make up any remaining excess weight above
+  //     kEcmpWidth by iteratively decrementing the max weight. If there are
+  //     more than kEcmpWidth next hops, this cannot possibly succeed.
+  NextHopWeight totalWeight = std::accumulate(
+      normalizedNextHops.begin(),
+      normalizedNextHops.end(),
+      0,
+      [](NextHopWeight w, const NextHop& nh) { return w + nh.weight(); });
+  // Total weight after applying the scaling factor
+  // kEcmpWidth/totalWeight to all next hops.
+  NextHopWeight scaledTotalWeight = 0;
+  if (totalWeight > kEcmpWidth) {
+    XLOG(DBG2) << "Total weight of next hops exceeds max ecmp width: "
+               << totalWeight << " > " << kEcmpWidth << " ("
+               << normalizedNextHops << ")";
+    // 2a)
+    double factor = kEcmpWidth / static_cast<double>(totalWeight);
+    RouteNextHopEntry::NextHopSet scaledNextHops;
+    // 2b)
+    for (const auto& nhop : normalizedNextHops) {
+      NextHopWeight w = std::max(
+          static_cast<NextHopWeight>(nhop.weight() * factor), NextHopWeight(1));
+      scaledNextHops.insert(ResolvedNextHop(nhop.addr(), nhop.intf(), w));
+      scaledTotalWeight += w;
+    }
+    // 2c)
+    if (scaledTotalWeight > kEcmpWidth) {
+      XLOG(WARNING) << "Total weight of scaled next hops STILL exceeds max "
+                    << "ecmp width: " << scaledTotalWeight << " > "
+                    << kEcmpWidth << " (" << scaledNextHops << ")";
+      // calculate number of times we need to decrement the max next hop
+      NextHopWeight overflow = scaledTotalWeight - kEcmpWidth;
+      for (int i = 0; i < overflow; ++i) {
+        // find the max weight next hop
+        auto maxItr = std::max_element(
+            scaledNextHops.begin(),
+            scaledNextHops.end(),
+            [](const NextHop& n1, const NextHop& n2) {
+              return n1.weight() < n2.weight();
+            });
+        XLOG(DBG2) << "Decrementing the weight of next hop: " << *maxItr;
+        // create a clone of the max weight next hop with weight decremented
+        ResolvedNextHop decMax = ResolvedNextHop(
+            maxItr->addr(), maxItr->intf(), maxItr->weight() - 1);
+        // remove the max weight next hop and replace with the
+        // decremented version, if the decremented version would
+        // not have weight 0. If it would have weight 0, that means
+        // that we have > kEcmpWidth next hops.
+        scaledNextHops.erase(maxItr);
+        if (decMax.weight() > 0) {
+          scaledNextHops.insert(decMax);
+        }
+      }
+    }
+    XLOG(DBG2) << "Scaled next hops from " << unnormalizedNextHops << " to "
+               << scaledNextHops;
+    normalizedNextHops = scaledNextHops;
+  }
+  return normalizedNextHops;
+}
 }
 
 BcmRoute::BcmRoute(const BcmSwitch* hw, opennsl_vrf_t vrf,
@@ -104,7 +196,7 @@ void BcmRoute::program(const RouteNextHopEntry& fwd) {
     egressId = hw_->getToCPUEgressId();
   } else {
     CHECK(action == RouteForwardAction::NEXTHOPS);
-    const RouteNextHopSet& nhops = fwd.getNextHopSet();
+    const auto& nhops = fwd.getNextHopSet();
     CHECK_GT(nhops.size(), 0);
     // need to get an entry from the host table for the forward info
     auto host = hw_->writableHostTable()->incRefOrCreateBcmEcmpHost(
@@ -126,9 +218,9 @@ void BcmRoute::program(const RouteNextHopEntry& fwd) {
       auto hostKey = BcmHostKey(vrf_, prefix_);
       auto host = hw_->getHostTable()->getBcmHostIf(hostKey);
       CHECK(host);
-      VLOG(3) << "Derefrencing host prefix for " << prefix_ << "/"
-              << static_cast<int>(len_)
-              << " host egress Id : " << host->getEgressId();
+      XLOG(DBG3) << "Derefrencing host prefix for " << prefix_ << "/"
+                 << static_cast<int>(len_)
+                 << " host egress Id : " << host->getEgressId();
       hw_->writableHostTable()->derefBcmHost(hostKey);
     }
     auto warmBootCache = hw_->getWarmBootCache();
@@ -160,8 +252,8 @@ void BcmRoute::program(const RouteNextHopEntry& fwd) {
 
 void BcmRoute::programHostRoute(opennsl_if_t egressId,
     const RouteNextHopEntry& fwd, bool replace) {
-  VLOG(3) << "creating a host route entry for " << prefix_.str() << " @egress "
-          << egressId << " with " << fwd;
+  XLOG(DBG3) << "creating a host route entry for " << prefix_.str()
+             << " @egress " << egressId << " with " << fwd;
   auto hostRouteHost = hw_->writableHostTable()->incRefOrCreateBcmHost(
       BcmHostKey(vrf_, prefix_));
   hostRouteHost->setEgressId(egressId);
@@ -198,22 +290,22 @@ void BcmRoute::programLpmRoute(opennsl_if_t egressId,
       existingRoute.l3a_intf == newRoute.l3a_intf;
     };
     if (!equivalent(rt, vrfAndPfx2RouteCitr->second)) {
-      VLOG(3) << "Updating route for : " << prefix_ << "/"
-        << static_cast<int>(len_) << " in vrf : " << vrf_;
+      XLOG(DBG3) << "Updating route for : " << prefix_ << "/"
+                 << static_cast<int>(len_) << " in vrf : " << vrf_;
       // This is a change
       rt.l3a_flags |= OPENNSL_L3_REPLACE;
       addRoute = true;
     } else {
-      VLOG(3) << " Route for : " << prefix_ << "/" << static_cast<int>(len_)
-        << " in vrf : " << vrf_ << " already exists";
+      XLOG(DBG3) << " Route for : " << prefix_ << "/" << static_cast<int>(len_)
+                 << " in vrf : " << vrf_ << " already exists";
     }
   } else {
     addRoute = true;
   }
   if (addRoute) {
     if (vrfAndPfx2RouteCitr == warmBootCache->vrfAndPrefix2Route_end()) {
-      VLOG(3) << "Adding route for : " << prefix_ << "/"
-        << static_cast<int>(len_) << " in vrf : " << vrf_;
+      XLOG(DBG3) << "Adding route for : " << prefix_ << "/"
+                 << static_cast<int>(len_) << " in vrf : " << vrf_;
     }
     if (added_) {
       rt.l3a_flags |= OPENNSL_L3_REPLACE;
@@ -221,9 +313,9 @@ void BcmRoute::programLpmRoute(opennsl_if_t egressId,
     auto rc = opennsl_l3_route_add(hw_->getUnit(), &rt);
     bcmCheckError(rc, "failed to create a route entry for ", prefix_, "/",
         static_cast<int>(len_), " @ ", fwd, " @egress ", egressId);
-    VLOG(3) << "created a route entry for " << prefix_.str() << "/"
-      << static_cast<int>(len_) << " @egress " << egressId
-      << " with " << fwd;
+    XLOG(DBG3) << "created a route entry for " << prefix_.str() << "/"
+               << static_cast<int>(len_) << " @egress " << egressId << " with "
+               << fwd;
   }
   if (vrfAndPfx2RouteCitr != warmBootCache->vrfAndPrefix2Route_end()) {
     warmBootCache->programmed(vrfAndPfx2RouteCitr);
@@ -238,13 +330,13 @@ bool BcmRoute::deleteLpmRoute(int unitNumber,
   initL3RouteFromArgs(&rt, vrf, prefix, prefixLength);
   auto rc = opennsl_l3_route_delete(unitNumber, &rt);
   if (OPENNSL_FAILURE(rc)) {
-    LOG(ERROR) << "Failed to delete a route entry for " << prefix << "/"
-               << static_cast<int>(prefixLength)
-               << " Error: " << opennsl_errmsg(rc);
+    XLOG(ERR) << "Failed to delete a route entry for " << prefix << "/"
+              << static_cast<int>(prefixLength)
+              << " Error: " << opennsl_errmsg(rc);
     return false;
   } else {
-    VLOG(3) << "deleted a route entry for " << prefix.str() << "/"
-            << static_cast<int>(prefixLength);
+    XLOG(DBG3) << "deleted a route entry for " << prefix.str() << "/"
+               << static_cast<int>(prefixLength);
   }
   return true;
 }
@@ -274,8 +366,8 @@ BcmRoute::~BcmRoute() {
     auto hostKey = BcmHostKey(vrf_, prefix_);
     auto host = hw_->getHostTable()->getBcmHostIf(hostKey);
     CHECK(host);
-    VLOG(3) << "Deleting host route; derefrence host prefix for : " << prefix_
-            << "/" << static_cast<int>(len_) << " host: " << host;
+    XLOG(DBG3) << "Deleting host route; derefrence host prefix for : "
+               << prefix_ << "/" << static_cast<int>(len_) << " host: " << host;
     hw_->writableHostTable()->derefBcmHost(hostKey);
   } else {
     deleteLpmRoute(hw_->getUnit(), vrf_, prefix_, len_);
@@ -344,7 +436,12 @@ void BcmRouteTable::addRoute(opennsl_vrf_t vrf, const RouteT *route) {
                                         prefix.mask));
   }
   CHECK(route->isResolved());
-  ret.first->second->program(route->getForwardInfo());
+  RouteNextHopEntry fwd(route->getForwardInfo());
+  if (fwd.getAction() == RouteForwardAction::NEXTHOPS) {
+    RouteNextHopSet nhops = normalizeNextHops(fwd.getNextHopSet());
+    fwd = RouteNextHopEntry(nhops, fwd.getAdminDistance());
+  }
+  ret.first->second->program(fwd);
 }
 
 template<typename RouteT>
@@ -372,5 +469,4 @@ template void BcmRouteTable::addRoute(opennsl_vrf_t, const RouteV4 *);
 template void BcmRouteTable::addRoute(opennsl_vrf_t, const RouteV6 *);
 template void BcmRouteTable::deleteRoute(opennsl_vrf_t, const RouteV4 *);
 template void BcmRouteTable::deleteRoute(opennsl_vrf_t, const RouteV6 *);
-
 }}

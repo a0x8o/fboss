@@ -18,6 +18,7 @@
 #include "fboss/agent/SysError.h"
 #include "fboss/agent/hw/bcm/BcmAPI.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
+#include "fboss/agent/hw/bcm/BcmWarmBootHelper.h"
 #include "fboss/agent/state/Port.h"
 #include "fboss/agent/platforms/wedge/WedgePort.h"
 #include "fboss/qsfp_service/lib/QsfpCache.h"
@@ -54,10 +55,12 @@ void WedgePlatform::init() {
   initLocalMac();
   auto mode = getMode();
   bool isLc = (mode == WedgePlatformMode::GALAXY_LC);
-  // HACK - looking at mode == LC or isDu to determine HASH mode.
+  bool isMinipackFsw = (mode == WedgePlatformMode::MINIPACK);
+  // HACK - looking at mode == LC or isDu or minipack fsw to determine HASH mode
   // How to set up hashing should really come from config - T21721301
-  hw_.reset(new BcmSwitch(this, (isLc || isDu()) ? BcmSwitch::HALF_HASH :
-        BcmSwitch::FULL_HASH));
+  auto hashMode = (isLc || isDu() || isMinipackFsw) ?
+                  BcmSwitch::HALF_HASH : BcmSwitch::FULL_HASH;
+  hw_.reset(new BcmSwitch(this, hashMode));
 }
 
 WedgePlatform::~WedgePlatform() {}
@@ -112,6 +115,10 @@ string WedgePlatform::getPersistentStateDir() const {
   return FLAGS_persistent_state_dir;
 }
 
+void WedgePlatform::onUnitCreate(int unit) {
+  warmBootHelper_ =
+      std::make_unique<DiscBackedBcmWarmBootHelper>(unit, getWarmBootDir());
+}
 void WedgePlatform::onUnitAttach(int /*unit*/) {}
 
 void WedgePlatform::getProductInfo(ProductInfo& info) {

@@ -45,6 +45,7 @@ constexpr auto kNdpTimeout = "ndpTimeout";
 constexpr auto kArpAgerInterval = "arpAgerInterval";
 constexpr auto kMaxNeighborProbes = "maxNeighborProbes";
 constexpr auto kStaleEntryInterval = "staleEntryInterval";
+constexpr auto kLoadBalancers = "loadBalancers";
 }
 
 namespace facebook { namespace fboss {
@@ -57,7 +58,8 @@ SwitchStateFields::SwitchStateFields()
       routeTables(make_shared<RouteTableMap>()),
       acls(make_shared<AclMap>()),
       sFlowCollectors(make_shared<SflowCollectorMap>()),
-      controlPlane(make_shared<ControlPlane>()) {}
+      controlPlane(make_shared<ControlPlane>()),
+      loadBalancers(make_shared<LoadBalancerMap>()) {}
 
 folly::dynamic SwitchStateFields::toFollyDynamic() const {
   folly::dynamic switchState = folly::dynamic::object;
@@ -69,6 +71,7 @@ folly::dynamic SwitchStateFields::toFollyDynamic() const {
   switchState[kSflowCollectors] = sFlowCollectors->toFollyDynamic();
   switchState[kDefaultVlan] = static_cast<uint32_t>(defaultVlan);
   switchState[kControlPlane] = controlPlane->toFollyDynamic();
+  switchState[kLoadBalancers] = loadBalancers->toFollyDynamic();
   return switchState;
 }
 
@@ -90,6 +93,10 @@ SwitchStateFields::fromFollyDynamic(const folly::dynamic& swJson) {
   if (swJson.find(kControlPlane) != swJson.items().end()) {
     switchState.controlPlane = ControlPlane::fromFollyDynamic(
       swJson[kControlPlane]);
+  }
+  if (swJson.find(kLoadBalancers) != swJson.items().end()) {
+    switchState.loadBalancers =
+        LoadBalancerMap::fromFollyDynamic(swJson[kLoadBalancers]);
   }
   //TODO verify that created state here is internally consistent t4155406
   return switchState;
@@ -215,6 +222,15 @@ void SwitchState::resetSflowCollectors(
 void SwitchState::resetControlPlane(
     std::shared_ptr<ControlPlane> controlPlane) {
   writableFields()->controlPlane = controlPlane;
+}
+
+void SwitchState::resetLoadBalancers(
+    std::shared_ptr<LoadBalancerMap> loadBalancers) {
+  writableFields()->loadBalancers.swap(loadBalancers);
+}
+
+const std::shared_ptr<LoadBalancerMap>& SwitchState::getLoadBalancers() const {
+  return getFields()->loadBalancers;
 }
 
 template class NodeBaseT<SwitchState, SwitchStateFields>;

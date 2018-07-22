@@ -14,6 +14,8 @@
 #include <thrift/lib/cpp2/protocol/Serializer.h>
 
 #include "fboss/agent/FbossError.h"
+#include "fboss/agent/LacpTypes.h"
+#include "fboss/agent/LoadBalancerConfigApplier.h"
 #include "fboss/agent/Platform.h"
 #include "fboss/agent/state/AclEntry.h"
 #include "fboss/agent/state/AclMap.h"
@@ -28,7 +30,6 @@
 #include "fboss/agent/state/NdpResponseTable.h"
 #include "fboss/agent/state/Port.h"
 #include "fboss/agent/state/PortMap.h"
-#include "fboss/agent/state/PortQueue.h"
 #include "fboss/agent/state/RouteTypes.h"
 #include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/state/Vlan.h"
@@ -38,7 +39,6 @@
 #include "fboss/agent/state/RouteTable.h"
 #include "fboss/agent/state/RouteTableMap.h"
 #include "fboss/agent/state/RouteUpdater.h"
-#include "fboss/agent/LacpTypes.h"
 
 #include <algorithm>
 #include <boost/container/flat_set.hpp>
@@ -69,8 +69,6 @@ const int kAclStartPriority = 100000;
 } // anonymous namespace
 
 namespace facebook { namespace fboss {
-
-using QueueConfig = PortFields::QueueConfig;
 
 /*
  * A class for implementing applyThriftConfig().
@@ -160,12 +158,18 @@ class ThriftConfigApplier {
   std::shared_ptr<Port> updatePort(const std::shared_ptr<Port>& orig,
                                    const cfg::Port* cfg);
   QueueConfig updatePortQueues(
-      const std::shared_ptr<Port>& orig,
-      const cfg::Port* cfg);
+      const std::vector<std::shared_ptr<PortQueue>>& origPortQueues,
+      const std::vector<cfg::PortQueue>& cfgPortQueues);
+  // update cfg port queue attribute to state port queue object
+  void setPortQueue(
+      std::shared_ptr<PortQueue> newQueue,
+      const cfg::PortQueue* cfg);
   std::shared_ptr<PortQueue> updatePortQueue(
       const std::shared_ptr<PortQueue>& orig,
       const cfg::PortQueue* cfg);
-  std::shared_ptr<PortQueue> createPortQueue(const cfg::PortQueue& cfg);
+  std::shared_ptr<PortQueue> createPortQueue(const cfg::PortQueue* cfg);
+  void checkPortQueueAQMValid(
+      const std::vector<cfg::ActiveQueueManagement>& aqms);
   std::shared_ptr<AggregatePortMap> updateAggregatePorts();
   std::shared_ptr<AggregatePort> updateAggPort(
       const std::shared_ptr<AggregatePort>& orig,
@@ -194,8 +198,7 @@ class ThriftConfigApplier {
   bool updateDhcpOverrides(Vlan* vlan, const cfg::Vlan* config);
   std::shared_ptr<InterfaceMap> updateInterfaces();
   std::shared_ptr<RouteTableMap> updateInterfaceRoutes();
-  std::shared_ptr<RouteTableMap> updateStaticRoutes(
-      const std::shared_ptr<RouteTableMap>& curRoutingTables);
+  std::shared_ptr<RouteTableMap> syncStaticRoutes();
   shared_ptr<Interface> createInterface(const cfg::Interface* config,
                                         const Interface::Addresses& addrs);
   shared_ptr<Interface> updateInterface(const shared_ptr<Interface>& orig,
@@ -302,8 +305,7 @@ shared_ptr<SwitchState> ThriftConfigApplier::run() {
       newState->resetRouteTables(newTables);
       changed = true;
     }
-    auto newerTables = updateStaticRoutes(newTables ? newTables :
-        orig_->getRouteTables());
+    auto newerTables = syncStaticRoutes();
     if (newerTables) {
       newState->resetRouteTables(std::move(newerTables));
       changed = true;
@@ -404,6 +406,16 @@ shared_ptr<SwitchState> ThriftConfigApplier::run() {
     auto newCollectors = updateSflowCollectors();
     if (newCollectors) {
       newState->resetSflowCollectors(std::move(newCollectors));
+      changed = true;
+    }
+  }
+
+  {
+    LoadBalancerConfigApplier loadBalancerConfigApplier(
+        orig_->getLoadBalancers(), cfg_->get_loadBalancers(), platform_);
+    auto newLoadBalancers = loadBalancerConfigApplier.updateLoadBalancers();
+    if (newLoadBalancers) {
+      newState->resetLoadBalancers(std::move(newLoadBalancers));
       changed = true;
     }
   }
@@ -524,76 +536,78 @@ shared_ptr<PortMap> ThriftConfigApplier::updatePorts() {
   return origPorts->clone(newPorts);
 }
 
+void ThriftConfigApplier::checkPortQueueAQMValid(
+    const std::vector<cfg::ActiveQueueManagement>& aqms) {
+  if (aqms.empty()) {
+    return;
+  }
+  std::set<cfg::QueueCongestionBehavior> behaviors;
+  for (const auto& aqm: aqms) {
+    if (aqm.detection.getType() ==
+        cfg::QueueCongestionDetection::Type::__EMPTY__) {
+      throw FbossError(
+        "Active Queue Management must specify a congestion detection method");
+    }
+    if (behaviors.find(aqm.behavior) != behaviors.end()) {
+      throw FbossError(
+        "Same Active Queue Management behavior already exists");
+    }
+    behaviors.insert(aqm.behavior);
+  }
+}
+
 std::shared_ptr<PortQueue> ThriftConfigApplier::updatePortQueue(
     const std::shared_ptr<PortQueue>& orig,
     const cfg::PortQueue* cfg) {
   CHECK_EQ(orig->getID(), cfg->id);
 
-  if (orig->getStreamType() == cfg->streamType &&
-      orig->getScheduling() == cfg->scheduling &&
-      orig->getWeight() == cfg->weight &&
-      orig->getReservedBytes() == cfg->reservedBytes &&
-      orig->getScalingFactor() == cfg->scalingFactor &&
-      orig->getAqm() == cfg->aqm) {
+  if (checkSwConfPortQueueMatch(orig, cfg)) {
     return orig;
   }
 
-  auto newQueue = orig->clone();
-  newQueue->setStreamType(cfg->streamType);
-  newQueue->setScheduling(cfg->scheduling);
-  if (cfg->__isset.weight) {
-    newQueue->setWeight(cfg->weight);
-  }
-  if (cfg->__isset.reservedBytes) {
-    newQueue->setReservedBytes(cfg->reservedBytes);
-  }
-  if (cfg->__isset.scalingFactor) {
-    newQueue->setScalingFactor(cfg->scalingFactor);
-  }
-  if (cfg->__isset.aqm) {
-    if (cfg->aqm.detection.getType() ==
-        cfg::QueueCongestionDetection::Type::__EMPTY__) {
-      throw FbossError(
-          "Active Queue Management must specify a congestion detection method");
-    }
-    newQueue->setAqm(cfg->aqm);
-  }
-  return newQueue;
+  // We should always use the PortQueue settings from config, so that if some of
+  // the attributes is removed from config, we can make sure that attribute can
+  // set back to default
+  return createPortQueue(cfg);
 }
 
 std::shared_ptr<PortQueue> ThriftConfigApplier::createPortQueue(
-    const cfg::PortQueue& cfg) {
-  auto queue = std::make_shared<PortQueue>(cfg.id);
-  queue->setStreamType(cfg.streamType);
-  queue->setScheduling(cfg.scheduling);
-  if (cfg.__isset.weight) {
-    queue->setWeight(cfg.weight);
+    const cfg::PortQueue* cfg) {
+  auto queue = std::make_shared<PortQueue>(cfg->id);
+  queue->setStreamType(cfg->streamType);
+  queue->setScheduling(cfg->scheduling);
+  if (cfg->__isset.weight) {
+    queue->setWeight(cfg->weight);
   }
-  if (cfg.__isset.reservedBytes) {
-    queue->setReservedBytes(cfg.reservedBytes);
+  if (cfg->__isset.reservedBytes) {
+    queue->setReservedBytes(cfg->reservedBytes);
   }
-  if (cfg.__isset.scalingFactor) {
-    queue->setScalingFactor(cfg.scalingFactor);
+  if (cfg->__isset.scalingFactor) {
+    queue->setScalingFactor(cfg->scalingFactor);
   }
-  if (cfg.__isset.aqm) {
-    if (cfg.aqm.detection.getType() ==
-        cfg::QueueCongestionDetection::Type::__EMPTY__) {
-      throw FbossError(
-          "Active Queue Management must specify a congestion detection method");
-    }
-    queue->setAqm(cfg.aqm);
+  if (cfg->__isset.aqms) {
+    checkPortQueueAQMValid(cfg->aqms);
+    queue->resetAqms(cfg->aqms);
+  }
+  if (cfg->__isset.sharedBytes) {
+    queue->setSharedBytes(cfg->sharedBytes);
+  }
+  if (cfg->__isset.packetsPerSec) {
+    queue->setPacketsPerSec(cfg->packetsPerSec);
+  }
+  if (cfg->__isset.name) {
+    queue->setName(cfg->name);
   }
   return queue;
 }
 
 QueueConfig ThriftConfigApplier::updatePortQueues(
-    const std::shared_ptr<Port>& orig,
-    const cfg::Port* cfg) {
-  auto origPortQueues = orig->getPortQueues();
+    const QueueConfig& origPortQueues,
+    const std::vector<cfg::PortQueue>& cfgPortQueues) {
   QueueConfig newPortQueues;
 
   flat_map<int, const cfg::PortQueue*> newQueues;
-  for (const auto& queue : cfg->queues) {
+  for (const auto& queue : cfgPortQueues) {
     newQueues.emplace(std::make_pair(queue.id, &queue));
   }
 
@@ -605,6 +619,7 @@ QueueConfig ThriftConfigApplier::updatePortQueues(
   for (int i = 0; i < origPortQueues.size(); i++) {
     auto newQueueIter = newQueues.find(i);
     auto newQueue = std::make_shared<PortQueue>(i);
+    newQueue->setStreamType(origPortQueues.at(i)->getStreamType());
     if (newQueueIter != newQueues.end()) {
       newQueue = updatePortQueue(origPortQueues.at(i), newQueueIter->second);
       newQueues.erase(newQueueIter);
@@ -625,7 +640,7 @@ shared_ptr<Port> ThriftConfigApplier::updatePort(const shared_ptr<Port>& orig,
 
   auto vlans = portVlans_[orig->getID()];
 
-  auto portQueues = updatePortQueues(orig, portConf);
+  auto portQueues = updatePortQueues(orig->getPortQueues(), portConf->queues);
   bool queuesUnchanged = portQueues.size() == orig->getPortQueues().size();
   for (int i=0; i<portQueues.size() && queuesUnchanged; i++) {
     if (*(portQueues.at(i)) != *(orig->getPortQueues().at(i))) {
@@ -990,7 +1005,14 @@ std::shared_ptr<AclMap> ThriftConfigApplier::updateAcls() {
 
       // Here is sending to regular port queue action
       MatchAction matchAction = MatchAction();
-      matchAction.setSendToQueue(std::make_pair(mta.action.sendToQueue, false));
+      if (mta.action.__isset.sendToQueue) {
+        matchAction.setSendToQueue(
+          std::make_pair(mta.action.sendToQueue, false));
+      }
+      if (mta.action.__isset.packetCounter) {
+        matchAction.setPacketCounter(mta.action.packetCounter);
+      }
+
       auto acl = updateAcl(aclCfg, priority++, &numExistingProcessed,
         &changed, &matchAction);
       entries.push_back(std::make_pair(acl->getID(), acl));
@@ -998,20 +1020,7 @@ std::shared_ptr<AclMap> ThriftConfigApplier::updateAcls() {
     return entries;
   };
 
-  // Add acls defined in any per port traffic policies
-  folly::gen::from(cfg_->ports)
-    | folly::gen::filter([](const cfg::Port& port) {
-        return port.__isset.egressTrafficPolicy;
-      })
-    | folly::gen::map([addToAcls](const cfg::Port& port) {
-        return addToAcls(port.egressTrafficPolicy,
-          folly::to<std::string>(port.name, ":"),
-          port.logicalID);
-      })
-    | folly::gen::rconcat
-    | folly::gen::appendTo(newAcls);
-
-  // Now add the global acls in defined
+  // Add the global acls in defined
   if (cfg_->__isset.globalEgressTrafficPolicy) {
     folly::gen::from(addToAcls(cfg_->globalEgressTrafficPolicy, ""))
       | folly::gen::appendTo(newAcls);;
@@ -1101,6 +1110,18 @@ void ThriftConfigApplier::checkAcl(const cfg::AclEntry *config) const {
     throw FbossError("proto must be either icmp or icmpv6 ",
       "if icmp type is set");
   }
+  if (config->__isset.ttl && config->ttl.value > 255) {
+    throw FbossError("ttl value is larger than 255");
+  }
+  if (config->__isset.ttl && config->ttl.value < 0) {
+    throw FbossError("ttl value is less than 0");
+  }
+  if (config->__isset.ttl && config->ttl.mask > 255) {
+    throw FbossError("ttl mask is larger than 255");
+  }
+  if (config->__isset.ttl && config->ttl.mask < 0) {
+    throw FbossError("ttl mask is less than 0");
+  }
 }
 
 shared_ptr<AclEntry> ThriftConfigApplier::createAcl(
@@ -1156,6 +1177,12 @@ shared_ptr<AclEntry> ThriftConfigApplier::createAcl(
   }
   if (config->__isset.dstMac) {
     newAcl->setDstMac(MacAddress(config->dstMac));
+  }
+  if (config->__isset.ipType) {
+      newAcl->setIpType(config->ipType);
+  }
+  if (config->__isset.ttl) {
+      newAcl->setTtl(AclTtl(config->ttl.value, config->ttl.mask));
   }
   return newAcl;
 }
@@ -1240,7 +1267,7 @@ shared_ptr<RouteTableMap> ThriftConfigApplier::updateInterfaceRoutes() {
       auto intf = entry.second.first;
       const auto& addr = entry.second.second;
       auto len = entry.first.second;
-      auto nhop = RouteNextHop::createInterfaceNextHop(addr, intf);
+      auto nhop = ResolvedNextHop(addr, intf, UCMP_DEFAULT_WEIGHT);
       updater.addRoute(table.first,
                        addr,
                        len,
@@ -1290,11 +1317,85 @@ shared_ptr<RouteTableMap> ThriftConfigApplier::updateInterfaceRoutes() {
   return updater.updateDone();
 }
 
-
-std::shared_ptr<RouteTableMap> ThriftConfigApplier::updateStaticRoutes(
-    const std::shared_ptr<RouteTableMap>& curRoutingTables) {
-  RouteUpdater updater(curRoutingTables);
-  updater.updateStaticRoutes(*cfg_, *prevCfg_);
+/**
+ * syncStaticRoutes:
+ *
+ * A long note about why we "sync" static routes from config file.
+ * To set the stage, we come here in one of two ways:
+ * (a) Switch is coming up after a warm or cold boot and is loading config
+ * (b) "reloadConfig" has been issued from thrift API
+ *
+ * In both cases, there may already exist static routes in our SwitchState.
+ * (In the case of warm boot, we read and reload our state from the warm
+ * boot file.)
+ *
+ * The intent of this function is that after we applyUpdate(), the static
+ * routes in our new SwitchState will be exactly what is in the new config,
+ * no more no less.  Note that this means that any static routes added using
+ * addUnicastRoute() API will be removed after we reloadConfig, or when we
+ * come up after restart.  This is by design.
+ *
+ * There are two ways to do the above.  One way would be to go through the
+ * existing static routes in SwitchState and "reconcile" with that in
+ * config.  I.e., add, delete, modify, or leave unchanged, as necessary.
+ *
+ * The second approach, the one we adopt here, not very intuitive but a lot
+ * cleaner to code, is to simply delete all static routes in current state,
+ * and to add back static routes from config file.  This works because the
+ * "delete" in this step does not take immediate effect.  It is only the
+ * state delta, after all processing is done, that is sent to the hardware
+ * switch.
+ *
+ * As a side note, there is a third (incorrect) approach that was tried, but
+ * does not work.  The old approach was to compute the delta between old and
+ * new config files, and to only apply that delta.  This would work for
+ * "reloadConfig", but does not work when the switch restarts, because we do
+ * not save the old config.  In particular, it does not work in the case of
+ * "delete", i.e., the new config does not have an entry that was there in
+ * the old config, because there is no old config to compare with.
+ */
+std::shared_ptr<RouteTableMap> ThriftConfigApplier::syncStaticRoutes() {
+  RouteUpdater updater(orig_->getRouteTables());
+  auto staticClientId = StdClientIds2ClientID(StdClientIds::STATIC_ROUTE);
+  auto staticAdminDistance = AdminDistance::STATIC_ROUTE;
+  updater.removeAllRoutesForClient(RouterID(0), staticClientId);
+  if (cfg_->__isset.staticRoutesToNull) {
+    for (const auto& route : cfg_->staticRoutesToNull) {
+      auto prefix = folly::IPAddress::createNetwork(route.prefix);
+      updater.addRoute(RouterID(route.routerID), prefix.first, prefix.second,
+                       staticClientId,
+                       RouteNextHopEntry(RouteForwardAction::DROP,
+                                         staticAdminDistance));
+    }
+  }
+  if (cfg_->__isset.staticRoutesToCPU) {
+    for (const auto& route : cfg_->staticRoutesToCPU) {
+      auto prefix = folly::IPAddress::createNetwork(route.prefix);
+      updater.addRoute(RouterID(route.routerID), prefix.first, prefix.second,
+                       staticClientId,
+                       RouteNextHopEntry(RouteForwardAction::TO_CPU,
+                                         staticAdminDistance));
+    }
+  }
+  if (cfg_->__isset.staticRoutesWithNhops) {
+    for (const auto& route : cfg_->staticRoutesWithNhops) {
+      auto prefix = folly::IPAddress::createNetwork(route.prefix);
+      RouteNextHopSet nhops;
+      // NOTE: Static routes use the default UCMP weight so that they can be
+      // compatible with UCMP, i.e., so that we can do ucmp where the next
+      // hops resolve to a static route.  If we define recursive static
+      // routes, that may lead to unexpected behavior where some interface
+      // gets more traffic.  If necessary, in the future, we can make it
+      // possible to configure strictly ECMP static routes
+      for (auto& nhopStr : route.nexthops) {
+        nhops.emplace(UnresolvedNextHop(folly::IPAddress(nhopStr),
+                                        UCMP_DEFAULT_WEIGHT));
+      }
+      updater.addRoute(RouterID(route.routerID), prefix.first, prefix.second,
+                       staticClientId, RouteNextHopEntry(std::move(nhops),
+                                                         staticAdminDistance));
+    }
+  }
   return updater.updateDone();
 }
 
@@ -1448,8 +1549,23 @@ shared_ptr<Interface> ThriftConfigApplier::updateInterface(
 }
 
 shared_ptr<ControlPlane> ThriftConfigApplier::updateControlPlane() {
-  // TODO(joseph5wu) Add processing cpu queue setting and reason mapping logics
-  return nullptr;
+  auto origCPU = orig_->getControlPlane();
+  // first check whether queue setting changed
+  auto newQueues = updatePortQueues(origCPU->getQueues(), cfg_->cpuQueues);
+  bool queuesUnchanged = newQueues.size() == origCPU->getQueues().size();
+  for (int i = 0; i < newQueues.size() && queuesUnchanged; i++) {
+    if (*(newQueues.at(i)) != *(origCPU->getQueues().at(i))) {
+      queuesUnchanged = false;
+    }
+  }
+
+  if (queuesUnchanged) {
+    return nullptr;
+  }
+
+  auto newCPU = origCPU->clone();
+  newCPU->resetQueues(newQueues);
+  return newCPU;
 }
 
 std::string

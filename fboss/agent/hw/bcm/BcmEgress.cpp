@@ -15,6 +15,7 @@
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmWarmBootCache.h"
 
+#include <folly/logging/xlog.h>
 #include <string>
 
 namespace facebook { namespace fboss {
@@ -112,13 +113,12 @@ void BcmEgress::program(opennsl_if_t intfId, opennsl_vrf_t vrf,
     id_ = existingEgressId;
     auto existingEgressObject = egressId2EgressCitr->second;
     if (!equivalent(eObj, existingEgressObject)) {
-      VLOG(1) << "Updating egress object for next hop : " << ip
-              << " @ brcmif " << intfId;
+      XLOG(DBG1) << "Updating egress object for next hop : " << ip
+                 << " @ brcmif " << intfId;
       addOrUpdateEgress = true;
     } else {
-      VLOG(1) << "Egress object for: " << ip
-              << " @ brcmif " << intfId
-              << " already exists";
+      XLOG(DBG1) << "Egress object for: " << ip << " @ brcmif " << intfId
+                 << " already exists";
     }
   } else {
     addOrUpdateEgress = true;
@@ -142,21 +142,19 @@ void BcmEgress::program(opennsl_if_t intfId, opennsl_vrf_t vrf,
           " ", (mac) ? mac->toString() : "ToCPU",
           " on port ", port,
           " on unit ", hw_->getUnit());
-      VLOG(3) << "programmed L3 egress object " << id_ << " for "
-              << ((mac) ? mac->toString() : "to CPU") << " on unit "
-              << hw_->getUnit() << " for ip: " << ip
-              << " @ brcmif " << intfId
-              << " flags " << eObj.flags
-              << " towards port " << eObj.port;
+      XLOG(DBG3) << "programmed L3 egress object " << id_ << " for "
+                 << ((mac) ? mac->toString() : "to CPU") << " on unit "
+                 << hw_->getUnit() << " for ip: " << ip << " @ brcmif "
+                 << intfId << " flags " << eObj.flags << " towards port "
+                 << eObj.port;
     } else {
       // This could happen when neighbor entry is confirmed with the same MAC
       // after warmboot, as it will trigger another egress programming with the
       // same MAC.
-      VLOG(1) << "Identical egress object for : " << ip
-              << " @ brcmif " << intfId
-              << " pointing to "
-              << (mac ? mac->toString() : "CPU ") << " already exists "
-              << "skipping egress programming ";
+      XLOG(DBG1) << "Identical egress object for : " << ip << " @ brcmif "
+                 << intfId << " pointing to "
+                 << (mac ? mac->toString() : "CPU ") << " already exists "
+                 << "skipping egress programming ";
     }
   }
   // update our internal fields
@@ -187,8 +185,8 @@ void BcmEgress::programToCPU() {
   auto rc = opennsl_l3_egress_create(hw_->getUnit(), flags, &eObj, &id_);
   bcmCheckError(rc, "failed to program L3 egress object ", id_,
                 " to CPU on unit ", hw_->getUnit());
-  VLOG(3) << "programmed L3 egress object " << id_
-          << " to CPU on unit " << hw_->getUnit();
+  XLOG(DBG3) << "programmed L3 egress object " << id_ << " to CPU on unit "
+             << hw_->getUnit();
 }
 
 BcmEgress::~BcmEgress() {
@@ -198,15 +196,19 @@ BcmEgress::~BcmEgress() {
   auto rc = opennsl_l3_egress_destroy(hw_->getUnit(), id_);
   bcmLogFatal(rc, hw_, "failed to destroy L3 egress object ",
       id_, " on unit ", hw_->getUnit());
-  VLOG(3) << "destroyed L3 egress object " << id_
-          << " on unit " << hw_->getUnit();
+  XLOG(DBG3) << "destroyed L3 egress object " << id_ << " on unit "
+             << hw_->getUnit();
+}
+
+BcmEcmpEgress::BcmEcmpEgress(const BcmSwitchIf* hw, const Paths& paths)
+    : BcmEgressBase(hw), paths_(paths) {
+  program();
 }
 
 void BcmEcmpEgress::program() {
   opennsl_l3_egress_ecmp_t obj;
   opennsl_l3_egress_ecmp_t_init(&obj);
-  auto n_path = paths_.size();
-  obj.max_paths = ((n_path + 3) >> 2) << 2; // multiple of 4
+  obj.max_paths = ((paths_.size() + 3) >> 2) << 2; // multiple of 4
 
   const auto warmBootCache = hw_->getWarmBootCache();
   auto egressIds2EcmpCItr = warmBootCache->findEcmp(paths_);
@@ -220,34 +222,34 @@ void BcmEcmpEgress::program() {
     // the next multiple of 4 as we desired.
     // CHECK(obj.max_paths == existing.max_paths);
     id_ = existing.ecmp_intf;
-    VLOG(1) << "Ecmp egress object for egress : " <<
-      BcmWarmBootCache::toEgressIdsStr(paths_)
-      << " already exists ";
+    XLOG(DBG1) << "Ecmp egress object for egress : "
+               << BcmWarmBootCache::toEgressIdsStr(paths_)
+               << " already exists ";
     warmBootCache->programmed(egressIds2EcmpCItr);
   } else {
-    VLOG(1) << "Adding ecmp egress with egress : " <<
-      BcmWarmBootCache::toEgressIdsStr(paths_);
+    XLOG(DBG1) << "Adding ecmp egress with egress : "
+               << BcmWarmBootCache::toEgressIdsStr(paths_);
     if (id_ != INVALID) {
       obj.flags |= OPENNSL_L3_REPLACE|OPENNSL_L3_WITH_ID;
       obj.ecmp_intf = id_;
     }
     opennsl_if_t pathsArray[paths_.size()];
     auto index = 0;
-    for (auto path: paths_) {
+    for (const auto& path : paths_) {
       if (hw_->getHostTable()->isResolved(path)) {
         pathsArray[index++] = path;
       } else {
-        VLOG(1) << "Skipping unresolved egress : " << path << " while "
-          << "programming ECMP group ";
+        XLOG(DBG1) << "Skipping unresolved egress : " << path << " while "
+                   << "programming ECMP group ";
       }
     }
     auto ret = opennsl_l3_egress_ecmp_create(hw_->getUnit(), &obj, index,
                                              pathsArray);
     bcmCheckError(ret, "failed to program L3 ECMP egress object ", id_,
-                " with ", n_path, " paths");
+                " with ", paths_.size(), " paths");
     id_ = obj.ecmp_intf;
-    VLOG(2) << "Programmed L3 ECMP egress object " << id_ << " for "
-          << n_path << " paths";
+    XLOG(DBG2) << "Programmed L3 ECMP egress object " << id_ << " for "
+               << paths_.size() << " paths";
   }
   CHECK_NE(id_, INVALID);
 }
@@ -262,8 +264,8 @@ BcmEcmpEgress::~BcmEcmpEgress() {
   auto ret = opennsl_l3_egress_ecmp_destroy(hw_->getUnit(), &obj);
   bcmLogFatal(ret, hw_, "failed to destroy L3 ECMP egress object ",
       id_, " on unit ", hw_->getUnit());
-  VLOG(3) << "Destroyed L3 ECMP egress object " << id_
-          << " on unit " << hw_->getUnit();
+  XLOG(DBG3) << "Destroyed L3 ECMP egress object " << id_ << " on unit "
+             << hw_->getUnit();
 }
 
 folly::dynamic BcmEgress::toFollyDynamic() const {
@@ -278,7 +280,7 @@ folly::dynamic BcmEcmpEgress::toFollyDynamic() const {
   folly::dynamic ecmpEgress = folly::dynamic::object;
   ecmpEgress[kEgressId] = getID();
   folly::dynamic paths = folly::dynamic::array;
-  for (auto path: paths_) {
+  for (const auto& path : paths_) {
     paths.push_back(path);
   }
   ecmpEgress[kPaths] = std::move(paths);
@@ -331,7 +333,7 @@ void BcmEgress::programToTrunk(opennsl_if_t intfId, opennsl_vrf_t /* vrf */,
         " on unit ",
         hw_->getUnit());
     bcmCheckError(rc, "failed to program ", desc);
-    VLOG(3) << "programmed " << desc;
+    XLOG(DBG3) << "programmed " << desc;
   }
 
   intfId_ = intfId;

@@ -11,8 +11,10 @@
 
 #include "fboss/agent/hw/BufferStatsLogger.h"
 #include "fboss/agent/hw/bcm/BcmRxPacket.h"
+#include "fboss/agent/hw/bcm/gen-cpp2/packettrace_types.h"
 
 #include <folly/Memory.h>
+#include <folly/logging/xlog.h>
 
 extern "C" {
 #include <opennsl/link.h>
@@ -36,9 +38,14 @@ bool BcmSwitch::isAlpmEnabled() {
 
 void BcmSwitch::dropDhcpPackets() {}
 
+void BcmSwitch::setL3MtuFailPackets() {}
+
 void BcmSwitch::setupCos() {}
 
-void BcmSwitch::setupChangedOrMissingFPGroups() {
+void BcmSwitch::setupFPGroups() {}
+
+bool BcmSwitch::haveMissingOrQSetChangedFPGroups() const {
+  return false;
 }
 
 void BcmSwitch::copyIPv6LinkLocalMcastPackets() {
@@ -85,9 +92,11 @@ int BcmSwitch::getHighresSamplers(
 
 void BcmSwitch::exportSdkVersion() const {}
 
+#ifdef OPENNSL_6_4_6_6_ODP
 void BcmSwitch::fetchL2Table(std::vector<L2EntryThrift>* /*l2Table*/) {
   return;
 }
+#endif
 
 void BcmSwitch::initFieldProcessor() const {
   // API not available in opennsl
@@ -118,11 +127,11 @@ opennsl_gport_t BcmSwitch::getCpuGPort() const {
 }
 
 bool BcmSwitch::startBufferStatCollection() {
-  LOG(INFO) << "Buffer stats collection not supported";
+  XLOG(INFO) << "Buffer stats collection not supported";
   return bufferStatsEnabled_;
 }
 bool BcmSwitch::stopBufferStatCollection() {
-  LOG(INFO) << "no op, buffer stats collection is not supported";
+  XLOG(INFO) << "no op, buffer stats collection is not supported";
   return !bufferStatsEnabled_;
 }
 void BcmSwitch::exportDeviceBufferUsage() {}
@@ -131,8 +140,7 @@ std::unique_ptr<BufferStatsLogger> BcmSwitch::createBufferStatsLogger() {
   return std::make_unique<GlogBufferStatsLogger>();
 }
 
-void BcmSwitch::printDiagCmd(const std::string& cmd) const {}
+void BcmSwitch::printDiagCmd(const std::string& /*cmd*/) const {}
 
-void BcmSwitch::forceLinkscanOn(opennsl_pbmp_t ports) {}
-
+void BcmSwitch::forceLinkscanOn(opennsl_pbmp_t /*ports*/) {}
 }} //facebook::fboss

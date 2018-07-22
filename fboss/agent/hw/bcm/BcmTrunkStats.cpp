@@ -13,6 +13,7 @@
 #include "fboss/agent/hw/bcm/BcmStatsConstants.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
 
+#include <folly/logging/xlog.h>
 #include <chrono>
 
 namespace facebook {
@@ -46,6 +47,7 @@ void BcmTrunkStats::initialize(
   initializeCounter(kOutErrors());
   initializeCounter(kOutPause());
   initializeCounter(kOutCongestionDiscards());
+  initializeCounter(kOutEcnCounter());
 }
 
 void BcmTrunkStats::initializeCounter(folly::StringPiece counterKey) {
@@ -67,8 +69,8 @@ void BcmTrunkStats::grantMembership(PortID memberPortID) {
   std::tie(std::ignore, inserted) =
       memberPortIDs_.wlock()->insert(memberPortID);
   if (!inserted) {
-    LOG(WARNING) << "BcmTrunkStats for AggregatePort " << aggregatePortID_
-                 << " is out of sync for member " << memberPortID;
+    XLOG(WARNING) << "BcmTrunkStats for AggregatePort " << aggregatePortID_
+                  << " is out of sync for member " << memberPortID;
   }
 }
 
@@ -76,8 +78,8 @@ void BcmTrunkStats::revokeMembership(PortID memberPortID) {
   auto numErased = memberPortIDs_.wlock()->erase(memberPortID);
 
   if (numErased != 0) {
-    LOG(WARNING) << "BcmTrunkStats for AggregatePort " << aggregatePortID_
-                 << " is out of sync for member " << memberPortID;
+    XLOG(WARNING) << "BcmTrunkStats for AggregatePort " << aggregatePortID_
+                  << " is out of sync for member " << memberPortID;
   }
 }
 
@@ -123,8 +125,8 @@ BcmTrunkStats::accumulateMemberStats() const {
        */
       auto memberPort = portTable->getBcmPortIf(memberPortID);
       if (!memberPort) {
-        LOG(WARNING) << "BcmTrunkStats for AggregatePort " << aggregatePortID_
-                     << " is out of sync for member " << memberPort;
+        XLOG(WARNING) << "BcmTrunkStats for AggregatePort " << aggregatePortID_
+                      << " is out of sync for member " << memberPort;
         continue;
       }
 
@@ -230,6 +232,7 @@ void BcmTrunkStats::update() {
   updateCounter(then, kOutPause(), stats.outPause_);
   updateCounter(
       then, kOutCongestionDiscards(), stats.outCongestionDiscardPkts_);
+  updateCounter(then, kOutEcnCounter(), stats.outEcnCounter_);
 }
 
 std::string BcmTrunkStats::constructCounterName(

@@ -23,8 +23,11 @@ Defaults = {
     "log_file": "{dir}/result-{test}.log",
     "test_topology": None,
     "min_hosts": 2,
+    "repeat-tests": 1,  # number of times we run tests before exiting
     "tags": user_requested_tags,
-    "list_tests": False
+    "list_tests": False,
+    "test_dirs": ["tests"],
+    "sdk_list": ["chef"],
 }
 
 
@@ -54,13 +57,21 @@ def generate_default_test_argparse(**kwargs):
                         help="List of test classes to run. For example:\n"
                              "basset_test_runner.par [options] TestClass\n"
                              "basset_test_runner.par[options] TestClass1 TestClass2")
-    parser.add_argument('--test_dirs', required=True, action='append')
+    parser.add_argument('--test_dirs', action='append',
+                        help="List of directories to discover tests",
+                        default=Defaults['test_dirs'])
+    parser.add_argument('--override-test-dirs', action='store_const', const=[],
+                        dest='test_dirs',
+                        help="Ignore the default test directories, only "
+                             "consider explicit --test_dir <dir> directories")
     parser.add_argument('--config', default=Defaults['config'])
     parser.add_argument('--log_dir', default=Defaults['log_dir'])
     parser.add_argument('--log_file', default=Defaults['log_file'])
-    parser.add_argument('--min_hosts', default=Defaults['min_hosts'])
+    parser.add_argument('--min_hosts', type=int, default=Defaults['min_hosts'])
     parser.add_argument('--console_log_level', default=Defaults['console_log_level'])
     parser.add_argument('--file_log_level', default=Defaults['file_log_level'])
+    parser.add_argument('--repeat-tests', help="Times to repeatedly run tests",
+                            type=int, default=Defaults['repeat-tests'])
     parser.add_argument('--tags',
                         help="Provide list of test tags, default is all tests "
                              "Example tags qsfp, port etc",
@@ -69,6 +80,10 @@ def generate_default_test_argparse(**kwargs):
                         help="List all tests without running them",
                         action="store_true",
                         default=Defaults['list_tests'])
+    parser.add_argument('--sdk_list', action='append',
+                        help="SDKs to test against\n"
+                             "('chef' for switch default SDK)",
+                        default=Defaults['sdk_list'])
 
     return parser
 
@@ -111,7 +126,9 @@ def setup_logging(options):
 class FbossBaseSystemTest(unittest.TestCase):
     """ This Class is the base class of all Fboss System Tests """
     _format = "%(asctime)s.%(msecs)03d  %(name)-10s: %(levelname)-8s: %(message)s"
-    _datefmt = "%H:%M:%S"
+    _datefmt = "%m/%d/%Y-%H:%M:%S"
+
+    TopologyIsSane = True
 
     def setUp(self):
         if self.options is None:
@@ -121,7 +138,7 @@ class FbossBaseSystemTest(unittest.TestCase):
             raise Exception("options.test_topology not set - " +
                             "did you call run_tests()?")
         self.test_topology = self.options.test_topology  # save typing
-        my_name = str(self.__class__.__name__)
+        my_name = str(self.__class__.__name__ + "." + self._testMethodName)
         self.log = logging.getLogger(my_name)
         self.log.setLevel(logging.DEBUG)  # logging controlled by handlers
         logfile_opts = {'test': my_name, 'dir': self.options.log_dir}
@@ -136,17 +153,27 @@ class FbossBaseSystemTest(unittest.TestCase):
         handler.setFormatter(logging.Formatter(self._format, self._datefmt))
         self.log.addHandler(handler)
         self.test_hosts_in_topo = self.test_topology.number_of_hosts()
+        # We have seen cases where previous testcase brings down the system
+        # and all following testcaes fails. Instead we should skip a testcase
+        # if system went to bad state.
+        if not self.TopologyIsSane:
+            raise unittest.SkipTest("Topology is in bad state, Skip Test")
 
     def tearDown(self):
         '''
         Make sure our topology is still in healthy state
         and no hosts got busted during test
         '''
-        self.log.info("Testing connection to switch")
-        self.assertTrue(self.test_topology.verify_switch())
-        self.log.info("Testing connection to hosts")
-        self.assertTrue(self.test_topology.verify_hosts(
-            self.test_hosts_in_topo))
+        if self.TopologyIsSane:     # don't test if things are already broken
+            self.log.info("Testing connection to switch")
+            self.TopologyIsSane = self.test_topology.verify_switch(log=self.log)
+            self.assertTrue(self.TopologyIsSane)
+            self.log.info("Testing connection to hosts")
+            self.TopologyIsSane = \
+                self.test_topology.verify_hosts(min_hosts=self.options.min_hosts,
+                                                log=self.log)
+            self.assertTrue(self.TopologyIsSane,
+                            "Test broke connectivity to hosts?")
 
 
 def frob_options_into_tests(suite, options):
@@ -196,28 +223,34 @@ def run_tests(options):
         if not os.path.exists(directory):
             raise Exception("Specified test directory '%s' does not exist" %
                             directory)
-        print("Loading tests from test_dir=%s" % directory)
+        options.log.info("Loading tests from test_dir=%s" % directory)
         testsdir = unittest.TestLoader().discover(start_dir=directory,
                                                   pattern='*test*.py')
-
         add_interested_tests_to_test_suite(testsdir, suite)
     frob_options_into_tests(suite, options)
+    # useful for debugging flakey tests
+    repeated_suite = unittest.TestSuite()
+    for _i in range(options.repeat_tests):
+        repeated_suite.addTests(suite)
+    all_tests = []
+    for test in suite:
+        all_tests.append(test)
     options.log.info("""
     ===================================================
     ================ STARTING TESTS ===================
     ===================================================
     """)
-    ret = SystemTestsRunner(
-        list_tests=options.list_tests,
-        tests=options.tests,
-        log=options.log,
-        verbosity=2).run(suite)
+    testRunner = SystemTestsRunner(list_tests=options.list_tests,
+                                   tests=options.tests,
+                                   log=options.log,
+                                   verbosity=2)
+    ret = testRunner.run(repeated_suite)
     options.log.info("""
     ===================================================
     ================  ENDING TESTS  ===================
     ===================================================
     """)
-    return ret
+    return ret, all_tests
 
 
 def main(args):

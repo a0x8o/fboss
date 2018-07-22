@@ -12,11 +12,9 @@
 #include <folly/MacAddress.h>
 #include <folly/io/Cursor.h>
 
-
 #include "fboss/agent/LacpMachines.h"
 #include "fboss/agent/LacpTypes.h"
 #include "fboss/agent/LinkAggregationManager.h"
-#include "fboss/agent/state/AggregatePort.h"
 #include "fboss/agent/types.h"
 
 namespace folly {
@@ -27,15 +25,14 @@ namespace facebook {
 namespace fboss {
 
 class AggregatePort;
-class SwSwitch;
+class LacpServicerIf;
 
 class LacpController : public std::enable_shared_from_this<LacpController> {
  public:
   LacpController(
       PortID portID,
       folly::EventBase* evb,
-      LinkAggregationManager* lagMgr,
-      SwSwitch* sw);
+      LacpServicerIf* servicer);
   LacpController(
       PortID portID,
       folly::EventBase* evb,
@@ -46,8 +43,7 @@ class LacpController : public std::enable_shared_from_this<LacpController> {
       uint16_t systemPriority,
       folly::MacAddress systemID,
       uint8_t minLinkCount,
-      LinkAggregationManager* lagMgr,
-      SwSwitch* sw);
+      LacpServicerIf* servicer);
 
   ~LacpController();
 
@@ -60,7 +56,7 @@ class LacpController : public std::enable_shared_from_this<LacpController> {
   // Invoked from LinkAggregationManager
   void portUp();
   void portDown();
-  void receivedLACPDU(folly::io::Cursor c);
+  void received(const LACPDU& lacpdu);
   ParticipantInfo actorInfo() const;
   ParticipantInfo partnerInfo() const;
 
@@ -75,22 +71,12 @@ class LacpController : public std::enable_shared_from_this<LacpController> {
 
   void ntt();
   void selected();
-  template <typename Iterator> void selected(folly::Range<Iterator> ports) {
-    auto controllersToSignal = lagMgr_->getControllersFor(ports);
+  void selected(folly::Range<std::vector<PortID>::const_iterator> ports);
 
-    for (const auto& controller : controllersToSignal) {
-      controller->selected();
-    }
-  }
   void unselected();
   void standby();
-  template <typename Iterator> void standby(folly::Range<Iterator> ports) {
-    auto controllersToSignal = lagMgr_->getControllersFor(ports);
+  void standby(folly::Range<std::vector<PortID>::const_iterator> ports);
 
-    for (const auto& controller : controllersToSignal) {
-      controller->standby();
-    }
-  }
   void matched();
   void notMatched();
 
@@ -113,7 +99,7 @@ class LacpController : public std::enable_shared_from_this<LacpController> {
   Selector selector_;
 
   folly::EventBase* evb_{nullptr};
-  LinkAggregationManager* lagMgr_{nullptr};
+  LacpServicerIf* servicer_{nullptr};
 
   // Forbidden copy constructor and assignment operator
   LacpController(LacpController const&) = delete;

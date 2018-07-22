@@ -8,24 +8,29 @@
  *
  */
 #include "BcmWarmBootCache.h"
+#include <sstream>
+#include <algorithm>
 #include <string>
 #include <utility>
 
 #include <folly/Conv.h>
-#include <folly/FileUtil.h>
 #include <folly/dynamic.h>
 #include <folly/json.h>
+#include <folly/logging/xlog.h>
 
 #include "fboss/agent/Constants.h"
 #include "fboss/agent/SysError.h"
+#include "fboss/agent/hw/bcm/BcmAclTable.h"
 #include "fboss/agent/hw/bcm/BcmEgress.h"
 #include "fboss/agent/hw/bcm/BcmError.h"
 #include "fboss/agent/hw/bcm/BcmPlatform.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
-#include "fboss/agent/hw/bcm/Utils.h"
+#include "fboss/agent/hw/bcm/BcmWarmBootHelper.h"
+#include "fboss/agent/hw/bcm/BcmAddressFBConvertors.h"
 #include "fboss/agent/state/ArpTable.h"
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/InterfaceMap.h"
+#include "fboss/agent/state/LoadBalancerMap.h"
 #include "fboss/agent/state/NdpTable.h"
 #include "fboss/agent/state/NeighborEntry.h"
 #include "fboss/agent/state/Port.h"
@@ -172,17 +177,15 @@ shared_ptr<VlanMap> BcmWarmBootCache::reconstructVlanMap() const {
           InterfaceID(bcmEgress.vlan),
           NeighborState::UNVERIFIED);
     }
-    VLOG (1) << "Reconstructed a neighbor entry."
-             << " ip=" << ip
-             << " mac=" << macFromBcm(bcmEgress.mac_addr)
-             << " port=" << PortID(bcmEgress.port)
-             << " vlan=" << bcmEgress.vlan;
-
+    XLOG(DBG1) << "Reconstructed a neighbor entry."
+               << " ip=" << ip << " mac=" << macFromBcm(bcmEgress.mac_addr)
+               << " port=" << PortID(bcmEgress.port)
+               << " vlan=" << bcmEgress.vlan;
   }
   for (auto vlanAndAddrTable: vlan2AddrTables) {
     auto vlan = vlans->getVlanIf(vlanAndAddrTable.first);
     if(!vlan) {
-      LOG(FATAL) << "Vlan: " << vlanAndAddrTable.first <<  " not found";
+      XLOG(FATAL) << "Vlan: " << vlanAndAddrTable.first << " not found";
     }
     vlan->setArpTable(vlanAndAddrTable.second.arpTable);
     vlan->setNdpTable(vlanAndAddrTable.second.ndpTable);
@@ -208,13 +211,17 @@ BcmWarmBootCache::reconstructAclMap() const {
   return dumpedSwSwitchState_->getAcls();
 }
 
+std::shared_ptr<LoadBalancerMap> BcmWarmBootCache::reconstructLoadBalancers()
+    const {
+  return dumpedSwSwitchState_->getLoadBalancers();
+}
+
 void BcmWarmBootCache::programmed(Range2BcmHandlerItr itr) {
-  VLOG(1) << "Programmed AclRange, removing from warm boot cache."
-          << " flags=" << itr->first.getFlags()
-          << " min=" << itr->first.getMin()
-          << " max=" << itr->first.getMax()
-          << " handle= " << itr->second.first
-          << " current ref count=" << itr->second.second;
+  XLOG(DBG1) << "Programmed AclRange, removing from warm boot cache."
+             << " flags=" << itr->first.getFlags()
+             << " min=" << itr->first.getMin() << " max=" << itr->first.getMax()
+             << " handle= " << itr->second.first
+             << " current ref count=" << itr->second.second;
   if (itr->second.second > 1) {
     itr->second.second--;
   } else {
@@ -222,8 +229,13 @@ void BcmWarmBootCache::programmed(Range2BcmHandlerItr itr) {
   }
 }
 
-const BcmWarmBootCache::EgressIds&
-BcmWarmBootCache::getPathsForEcmp(EgressId ecmp) const {
+void BcmWarmBootCache::programmed(AclEntry2AclStatItr itr) {
+  XLOG(DBG1) << "Programmed acl stat=" << itr->second.stat;
+  itr->second.claimed = true;
+}
+
+const BcmWarmBootCache::EgressIds& BcmWarmBootCache::getPathsForEcmp(
+    EgressId ecmp) const {
   static const EgressIds kEmptyEgressIds;
   if (hwSwitchEcmp2EgressIds_.empty()) {
     // We may have empty hwSwitchEcmp2EgressIds_ when
@@ -247,7 +259,7 @@ folly::dynamic BcmWarmBootCache::toFollyDynamic() const {
     folly::dynamic ecmp = folly::dynamic::object;
     ecmp[kEcmpEgressId] = ecmpAndEgressIds.first;
     folly::dynamic paths = folly::dynamic::array;
-    for (auto path : ecmpAndEgressIds.second) {
+    for (const auto& path : ecmpAndEgressIds.second) {
       paths.push_back(path);
     }
     ecmp[kPaths] = std::move(paths);
@@ -257,20 +269,20 @@ folly::dynamic BcmWarmBootCache::toFollyDynamic() const {
   return warmBootCache;
 }
 
-void BcmWarmBootCache::populateStateFromWarmbootFile() {
-  string warmBootJson;
-  const auto& warmBootFile = hw_->getPlatform()->getWarmBootSwitchStateFile();
-  auto ret = folly::readFile(warmBootFile.c_str(), warmBootJson);
-  sysCheckError(ret, "Unable to read switch state from : ", warmBootFile);
-  auto switchStateJson = folly::parseJson(warmBootJson);
+folly::dynamic BcmWarmBootCache::getWarmBootState() const {
+  return hw_->getPlatform()->getWarmBootHelper()->getWarmBootState();
+}
+
+void BcmWarmBootCache::populateFromWarmBootState(const folly::dynamic&
+    warmBootState) {
+
   dumpedSwSwitchState_ =
-    SwitchState::uniquePtrFromFollyDynamic(switchStateJson[kSwSwitch]);
+    SwitchState::uniquePtrFromFollyDynamic(warmBootState[kSwSwitch]);
   CHECK(dumpedSwSwitchState_)
-      << "Was not able to recover software state after warmboot from state "
-         "file: " << hw_->getPlatform()->getWarmBootSwitchStateFile();
+      << "Was not able to recover software state after warmboot";
 
   // Extract ecmps for dumped host table
-  auto hostTable = switchStateJson[kHwSwitch][kHostTable];
+  auto hostTable = warmBootState[kHwSwitch][kHostTable];
   for (const auto& ecmpEntry : hostTable[kEcmpHosts]) {
     auto ecmpEgressId = ecmpEntry[kEcmpEgressId].asInt();
     if (ecmpEgressId == BcmEgressBase::INVALID) {
@@ -278,23 +290,25 @@ void BcmWarmBootCache::populateStateFromWarmbootFile() {
     }
     // If the entry is valid, then there must be paths associated with it.
     for (auto path : ecmpEntry[kEcmpEgress][kPaths]) {
-      hwSwitchEcmp2EgressIds_[ecmpEgressId].insert(path.asInt());
+      EgressId e = path.asInt();
+      hwSwitchEcmp2EgressIds_[ecmpEgressId].insert(e);
     }
   }
   // Extract ecmps from dumped warm boot cache. We
   // may have shut down before a FIB sync
-  auto ecmpObjects = switchStateJson[kHwSwitch][kWarmBootCache][kEcmpObjects];
+  auto ecmpObjects = warmBootState[kHwSwitch][kWarmBootCache][kEcmpObjects];
   for (const auto& ecmpEntry : ecmpObjects) {
     auto ecmpEgressId = ecmpEntry[kEcmpEgressId].asInt();
     CHECK(ecmpEgressId != BcmEgressBase::INVALID);
-    for (auto path : ecmpEntry[kPaths]) {
-      hwSwitchEcmp2EgressIds_[ecmpEgressId].emplace(path.asInt());
+    for (const auto& path : ecmpEntry[kPaths]) {
+      EgressId e = path.asInt();
+      hwSwitchEcmp2EgressIds_[ecmpEgressId].insert(e);
     }
   }
-  VLOG (1) << "Reconstructed following ecmp path map ";
+  XLOG(DBG1) << "Reconstructed following ecmp path map ";
   for (auto& ecmpIdAndEgress : hwSwitchEcmp2EgressIds_) {
-    VLOG(1) << ecmpIdAndEgress.first << " (from warmboot file) ==> "
-            << toEgressIdsStr(ecmpIdAndEgress.second);
+    XLOG(DBG1) << ecmpIdAndEgress.first << " (from warmboot file) ==> "
+               << toEgressIdsStr(ecmpIdAndEgress.second);
   }
 
   // Extract BcmHost and its egress object from the warm boot file
@@ -305,7 +319,7 @@ void BcmWarmBootCache::populateStateFromWarmbootFile() {
     }
     egressIdsFromBcmHostInWarmBootFile_.insert(egressId);
 
-    folly::Optional<opennsl_if_t> intf;
+    folly::Optional<opennsl_if_t> intf{folly::none};
     auto ip = folly::IPAddress(hostEntry[kIp].stringPiece());
     if (ip.isV6() && ip.isLinkLocal()) {
       auto egressIt = hostEntry.find(kEgress);
@@ -322,12 +336,11 @@ void BcmWarmBootCache::populateStateFromWarmbootFile() {
     auto key = std::make_tuple(vrf, ip, intf);
     vrfIp2EgressFromBcmHostInWarmBootFile_[key] = egressId;
 
-    VLOG(1) << "Construct a host entry (vrf=" << vrf
-            << ",ip=" << ip
-            << ",intf=" << (intf.hasValue()
-                            ? folly::to<std::string>(intf.value())
-                            : "None")
-            << ") pointing to the egress entry, id=" << egressId;
+    XLOG(DBG1) << "Construct a host entry (vrf=" << vrf << ",ip=" << ip
+               << ",intf="
+               << (intf.hasValue() ? folly::to<std::string>(intf.value())
+                                   : "None")
+               << ") pointing to the egress entry, id=" << egressId;
   }
 }
 
@@ -354,8 +367,12 @@ BcmWarmBootCache::findEgressFromHost(
   return findEgress(it->second);
 }
 
-void BcmWarmBootCache::populate() {
-  populateStateFromWarmbootFile();
+void BcmWarmBootCache::populate(folly::Optional<folly::dynamic> warmBootState) {
+  if (warmBootState) {
+    populateFromWarmBootState(*warmBootState);
+  } else {
+    populateFromWarmBootState(getWarmBootState());
+  }
   opennsl_vlan_data_t* vlanList = nullptr;
   int vlanCount = 0;
   SCOPE_EXIT {
@@ -367,8 +384,8 @@ void BcmWarmBootCache::populate() {
     opennsl_vlan_data_t& vlanData = vlanList[i];
     int portCount;
     OPENNSL_PBMP_COUNT(vlanData.port_bitmap, portCount);
-    VLOG (1) << "Got vlan : " << vlanData.vlan_tag
-      <<" with : " << portCount << " ports";
+    XLOG(DBG1) << "Got vlan : " << vlanData.vlan_tag << " with : " << portCount
+               << " ports";
     // TODO: Investigate why port_bitmap contains
     // the untagged ports rather than ut_port_bitmap
     vlan2VlanInfo_.insert(make_pair
@@ -391,17 +408,18 @@ void BcmWarmBootCache::populate() {
       intfFound = true;
       vlanAndMac2Intf_[make_pair(BcmSwitch::getVlanId(l3Intf.l3a_vid),
           macFromBcm(l3Intf.l3a_mac_addr))] = l3Intf;
-      VLOG(1) << "Found l3 interface for vlan : " << vlanData.vlan_tag;
+      XLOG(DBG1) << "Found l3 interface for vlan : " << vlanData.vlan_tag;
     }
     if (intfFound) {
       opennsl_l2_station_t l2Station;
       opennsl_l2_station_t_init(&l2Station);
       rv = opennsl_l2_station_get(hw_->getUnit(), l3Intf.l3a_vid, &l2Station);
       if (!OPENNSL_FAILURE(rv)) {
-        VLOG (1) << " Found l2 station with id : " << l3Intf.l3a_vid;
+        XLOG(DBG1) << " Found l2 station with id : " << l3Intf.l3a_vid;
         vlan2Station_[VlanID(vlanData.vlan_tag)] = l2Station;
       } else {
-        VLOG(1) << "Could not get l2 station for vlan : " << vlanData.vlan_tag;
+        XLOG(DBG1) << "Could not get l2 station for vlan : "
+                   << vlanData.vlan_tag;
       }
     }
   }
@@ -430,9 +448,12 @@ void BcmWarmBootCache::populate() {
   opennsl_l3_egress_ecmp_traverse(hw_->getUnit(), ecmpEgressTraversalCallback,
       this);
 
-  // populate acls and acl ranges
+  // populate acls, acl stats and acl ranges
   populateAcls(kACLFieldGroupID, this->aclRange2BcmAclRangeHandle_,
+    this->aclEntry2AclStat_,
     this->priority2BcmAclEntryHandle_);
+
+  populateRtag7State();
 }
 
 bool BcmWarmBootCache::fillVlanPortInfo(Vlan* vlan) {
@@ -465,8 +486,8 @@ int BcmWarmBootCache::hostTraversalCallback(
           sizeof(host->l3a_ip6_addr))) :
     IPAddress::fromLongHBO(host->l3a_ip_addr);
   cache->vrfIp2Host_[make_pair(host->l3a_vrf, ip)] = *host;
-  VLOG(1) << "Adding egress id: " << host->l3a_intf << " to " << ip
-          << " mapping";
+  XLOG(DBG1) << "Adding egress id: " << host->l3a_intf << " to " << ip
+             << " mapping";
   return 0;
 }
 
@@ -484,32 +505,32 @@ int BcmWarmBootCache::egressTraversalCallback(
   if (egressIdItr != cache->egressIdsFromBcmHostInWarmBootFile_.cend()) {
     // May be: Add information to figure out how many host or route entry
     // reference it.
-    VLOG(1) << "Adding bcm egress entry for: " << *egressIdItr
-            << " which is referenced by at least one host or route entry.";
+    XLOG(DBG1) << "Adding bcm egress entry for: " << *egressIdItr
+               << " which is referenced by at least one host or route entry.";
     cache->egressId2Egress_[egressId] = *egress;
   } else {
     // found egress ID that is not used by any host entry, we shall
     // only have two of them. One is for drop and the other one is for TO CPU.
     if ((egress->flags & OPENNSL_L3_DST_DISCARD)) {
       if (cache->dropEgressId_ != BcmEgressBase::INVALID) {
-        LOG(FATAL) << "duplicated drop egress found in HW. " << egressId
-                   << " and " << cache->dropEgressId_;
+        XLOG(FATAL) << "duplicated drop egress found in HW. " << egressId
+                    << " and " << cache->dropEgressId_;
       }
-      VLOG(1) << "Found drop egress id " << egressId;
+      XLOG(DBG1) << "Found drop egress id " << egressId;
       cache->dropEgressId_ = egressId;
     } else if ((egress->flags &
                 (OPENNSL_L3_L2TOCPU | OPENNSL_L3_COPY_TO_CPU))) {
       if (cache->toCPUEgressId_ != BcmEgressBase::INVALID) {
-        LOG(FATAL) << "duplicated generic TO_CPU egress found in HW. "
-                   << egressId << " and " << cache->toCPUEgressId_;
+        XLOG(FATAL) << "duplicated generic TO_CPU egress found in HW. "
+                    << egressId << " and " << cache->toCPUEgressId_;
       }
-      VLOG(1) << "Found generic TO CPU egress id " << egressId;
+      XLOG(DBG1) << "Found generic TO CPU egress id " << egressId;
       cache->toCPUEgressId_ = egressId;
     } else {
-      LOG(FATAL) << "The egress: " << egressId
-                 << " is not referenced by any host entry. vlan: "
-                 << egress->vlan << " interface: " << egress->intf
-                 << " flags: " << std::hex << egress->flags << std::dec;
+      XLOG(FATAL) << "The egress: " << egressId
+                  << " is not referenced by any host entry. vlan: "
+                  << egress->vlan << " interface: " << egress->intf
+                  << " flags: " << std::hex << egress->flags << std::dec;
     }
   }
   return 0;
@@ -533,13 +554,13 @@ int BcmWarmBootCache::routeTraversalCallback(
        (!isIPv6 && mask == getFullMaskIPv4Address()))) {
     // This is a host route.
     cache->vrfAndIP2Route_[make_pair(route->l3a_vrf, ip)] = *route;
-    VLOG(3) << "Adding host route found in route table. vrf: "
-            << route->l3a_vrf << " ip: " << ip << " mask: " << mask;
+    XLOG(DBG3) << "Adding host route found in route table. vrf: "
+               << route->l3a_vrf << " ip: " << ip << " mask: " << mask;
   } else {
     // Other routes that cannot be put into host table / CAM.
     cache->vrfPrefix2Route_[make_tuple(route->l3a_vrf, ip, mask)] = *route;
-    VLOG(3) << "In vrf : " << route->l3a_vrf << " adding route for : " << ip
-            << " mask: " << mask;
+    XLOG(DBG3) << "In vrf : " << route->l3a_vrf << " adding route for : " << ip
+               << " mask: " << mask;
   }
   return 0;
 }
@@ -577,8 +598,8 @@ int BcmWarmBootCache::ecmpEgressTraversalCallback(
   }
   EgressIds egressIdsInHw;
   egressIdsInHw = cache->toEgressIds(intfArray, intfCount);
-  VLOG(1) << "ignoring paths for ecmp egress " << ecmp->ecmp_intf
-          << " gotten from hardware: " << toEgressIdsStr(egressIdsInHw);
+  XLOG(DBG1) << "ignoring paths for ecmp egress " << ecmp->ecmp_intf
+             << " gotten from hardware: " << toEgressIdsStr(egressIdsInHw);
 
   CHECK(egressIds.size() > 0)
       << "There must be at least one egress pointed to by the ecmp egress id: "
@@ -587,26 +608,26 @@ int BcmWarmBootCache::ecmpEgressTraversalCallback(
       << "Got a duplicated call for ecmp id: " << ecmp->ecmp_intf
       << " referencing: " << toEgressIdsStr(egressIds);
   cache->egressIds2Ecmp_[egressIds] = *ecmp;
-  VLOG(1) << "Added ecmp egress id : " << ecmp->ecmp_intf
-          << " pointing to : " << toEgressIdsStr(egressIds) << " egress ids";
+  XLOG(DBG1) << "Added ecmp egress id : " << ecmp->ecmp_intf
+             << " pointing to : " << toEgressIdsStr(egressIds) << " egress ids";
   return 0;
 }
 
 std::string BcmWarmBootCache::toEgressIdsStr(const EgressIds& egressIds) {
-  string egressStr;
+  std::stringstream ss;
   int i = 0;
-  for (auto egressId : egressIds) {
-    egressStr += folly::to<string>(egressId);
-    egressStr += ++i < egressIds.size() ?  ", " : "";
+  for (const auto& egressId : egressIds) {
+    ss << egressId;
+    ss << (++i < egressIds.size() ?  ", " : "");
   }
-  return egressStr;
+  return ss.str();
 }
 
 void BcmWarmBootCache::clear() {
   // Get rid of all unclaimed entries. The order is important here
   // since we want to delete entries only after there are no more
   // references to them.
-  VLOG(1) << "Warm boot: removing unreferenced entries";
+  XLOG(DBG1) << "Warm boot: removing unreferenced entries";
   dumpedSwSwitchState_.reset();
   hwSwitchEcmp2EgressIds_.clear();
   // First delete routes (fully qualified and others).
@@ -614,10 +635,10 @@ void BcmWarmBootCache::clear() {
   // Nothing references routes, but routes reference ecmp egress and egress
   // entries which are deleted later
   for (auto vrfPfxAndRoute : vrfPrefix2Route_) {
-    VLOG(1) << "Deleting unreferenced route in vrf:" <<
-        std::get<0>(vrfPfxAndRoute.first) << " for prefix : " <<
-        std::get<1>(vrfPfxAndRoute.first) << "/" <<
-        std::get<2>(vrfPfxAndRoute.first);
+    XLOG(DBG1) << "Deleting unreferenced route in vrf:"
+               << std::get<0>(vrfPfxAndRoute.first)
+               << " for prefix : " << std::get<1>(vrfPfxAndRoute.first) << "/"
+               << std::get<2>(vrfPfxAndRoute.first);
     auto rv = opennsl_l3_route_delete(hw_->getUnit(), &(vrfPfxAndRoute.second));
     bcmLogFatal(rv, hw_, "failed to delete unreferenced route in vrf:",
         std::get<0>(vrfPfxAndRoute.first) , " for prefix : " ,
@@ -626,9 +647,9 @@ void BcmWarmBootCache::clear() {
   }
   vrfPrefix2Route_.clear();
   for (auto vrfIPAndRoute: vrfAndIP2Route_) {
-    VLOG(1) << "Deleting fully qualified unreferenced route in vrf: "
-            << vrfIPAndRoute.first.first
-            << " prefix: " << vrfIPAndRoute.first.second;
+    XLOG(DBG1) << "Deleting fully qualified unreferenced route in vrf: "
+               << vrfIPAndRoute.first.first
+               << " prefix: " << vrfIPAndRoute.first.second;
     auto rv = opennsl_l3_route_delete(hw_->getUnit(), &(vrfIPAndRoute.second));
     bcmLogFatal(rv,
                 hw_,
@@ -642,8 +663,8 @@ void BcmWarmBootCache::clear() {
   // Delete bcm host entries. Nobody references bcm hosts, but
   // hosts reference egress objects
   for (auto vrfIpAndHost : vrfIp2Host_) {
-    VLOG(1) << "Deleting host entry in vrf: " <<
-        vrfIpAndHost.first.first << " for : " << vrfIpAndHost.first.second;
+    XLOG(DBG1) << "Deleting host entry in vrf: " << vrfIpAndHost.first.first
+               << " for : " << vrfIpAndHost.first.second;
     auto rv = opennsl_l3_host_delete(hw_->getUnit(), &vrfIpAndHost.second);
     bcmLogFatal(rv, hw_, "failed to delete host entry in vrf: ",
         vrfIpAndHost.first.first, " for : ", vrfIpAndHost.first.second);
@@ -655,8 +676,8 @@ void BcmWarmBootCache::clear() {
   // objects which we delete later
   for (auto idsAndEcmp : egressIds2Ecmp_) {
     auto& ecmp = idsAndEcmp.second;
-    VLOG(1) << "Deleting ecmp egress object  " << ecmp.ecmp_intf
-      << " pointing to : " << toEgressIdsStr(idsAndEcmp.first);
+    XLOG(DBG1) << "Deleting ecmp egress object  " << ecmp.ecmp_intf
+               << " pointing to : " << toEgressIdsStr(idsAndEcmp.first);
     auto rv = opennsl_l3_egress_ecmp_destroy(hw_->getUnit(), &ecmp);
     bcmLogFatal(rv, hw_, "failed to destroy ecmp egress object :",
         ecmp.ecmp_intf, " referring to ",
@@ -669,7 +690,7 @@ void BcmWarmBootCache::clear() {
   // my point to a interface which we delete later
   for (auto egressIdAndEgress : egressId2Egress_) {
     // This is not used yet
-    VLOG(1) << "Deleting egress object: " << egressIdAndEgress.first;
+    XLOG(DBG1) << "Deleting egress object: " << egressIdAndEgress.first;
     auto rv = opennsl_l3_egress_destroy(hw_->getUnit(),
                                         egressIdAndEgress.first);
       bcmLogFatal(rv,
@@ -681,8 +702,9 @@ void BcmWarmBootCache::clear() {
 
   // Delete interfaces
   for (auto vlanMacAndIntf : vlanAndMac2Intf_) {
-    VLOG(1) <<"Deleting l3 interface for vlan: " << vlanMacAndIntf.first.first
-      <<" and mac : " << vlanMacAndIntf.first.second;
+    XLOG(DBG1) << "Deleting l3 interface for vlan: "
+               << vlanMacAndIntf.first.first
+               << " and mac : " << vlanMacAndIntf.first.second;
     auto rv = opennsl_l3_intf_delete(hw_->getUnit(), &vlanMacAndIntf.second);
     bcmLogFatal(rv, hw_, "failed to delete l3 interface for vlan: ",
         vlanMacAndIntf.first.first, " and mac : ", vlanMacAndIntf.first.second);
@@ -690,7 +712,7 @@ void BcmWarmBootCache::clear() {
   vlanAndMac2Intf_.clear();
   // Delete stations
   for (auto vlanAndStation : vlan2Station_) {
-    VLOG(1) << "Deleting station for vlan : " << vlanAndStation.first;
+    XLOG(DBG1) << "Deleting station for vlan : " << vlanAndStation.first;
     auto rv = opennsl_l2_station_delete(hw_->getUnit(), vlanAndStation.first);
     bcmLogFatal(rv, hw_, "failed to delete station for vlan : ",
         vlanAndStation.first);
@@ -706,7 +728,7 @@ void BcmWarmBootCache::clear() {
       ++vlanItr;
       continue; // Can't delete the default vlan
     }
-    VLOG(1) << "Deleting vlan : " << vlanItr->first;
+    XLOG(DBG1) << "Deleting vlan : " << vlanItr->first;
     auto rv = opennsl_vlan_destroy(hw_->getUnit(), vlanItr->first);
     bcmLogFatal(rv, hw_, "failed to destroy vlan: ", vlanItr->first);
     vlanItr = vlan2VlanInfo_.erase(vlanItr);
@@ -715,22 +737,104 @@ void BcmWarmBootCache::clear() {
   egressIdsFromBcmHostInWarmBootFile_.clear();
   vrfIp2EgressFromBcmHostInWarmBootFile_.clear();
 
+  // Detach the unclaimed bcm acl stats
+  flat_set<BcmAclStatHandle> statsUsed;
+  for (auto aclStatItr = aclEntry2AclStat_.begin();
+       aclStatItr != aclEntry2AclStat_.end(); ++aclStatItr) {
+    auto& aclStatStatus = aclStatItr->second;
+    if (!aclStatStatus.claimed) {
+      XLOG(DBG1) << "Detaching unclaimed acl_stat=" << aclStatStatus.stat <<
+        "from acl=" << aclStatItr->first;
+      detachBcmAclStat(aclStatItr->first, aclStatStatus.stat);
+    } else {
+      statsUsed.insert(aclStatStatus.stat);
+    }
+  }
+
+  // Delete the unclaimed bcm acl stats
+  for (auto statItr : aclEntry2AclStat_) {
+    auto statHandle = statItr.second.stat;
+    if (statsUsed.find(statHandle) == statsUsed.end()) {
+      XLOG(DBG1) << "Deleting unclaimed acl_stat=" << statHandle;
+      removeBcmAclStat(statHandle);
+      // add the stat to the set to prevent this loop from attempting to
+      // delete the same stat twice
+      statsUsed.insert(statHandle);
+    }
+  }
+  aclEntry2AclStat_.clear();
+
   // Delete acls and acl ranges, since acl(field process) doesn't support
   // opennsl, we call BcmAclTable to remove the unclaimed acls
-  VLOG(1) << "Unclaimed acl count=" << priority2BcmAclEntryHandle_.size();
+  XLOG(DBG1) << "Unclaimed acl count=" << priority2BcmAclEntryHandle_.size();
   for (auto aclItr: priority2BcmAclEntryHandle_) {
-    VLOG(1) << "Deleting unclaimed acl: prio=" << aclItr.first
-            << ", handle=" << aclItr.second;
+    XLOG(DBG1) << "Deleting unclaimed acl: prio=" << aclItr.first
+               << ", handle=" << aclItr.second;
     removeBcmAcl(aclItr.second);
   }
   priority2BcmAclEntryHandle_.clear();
-  VLOG(1) << "Unclaimed acl range count=" << aclRange2BcmAclRangeHandle_.size();
+  XLOG(DBG1) << "Unclaimed acl range count="
+             << aclRange2BcmAclRangeHandle_.size();
   for (auto aclRangeItr: aclRange2BcmAclRangeHandle_) {
-    VLOG(1) << "Deleting unclaimed acl range=" << aclRangeItr.first.str()
-            << ", handle=" << aclRangeItr.second.first;
+    XLOG(DBG1) << "Deleting unclaimed acl range=" << aclRangeItr.first.str()
+               << ", handle=" << aclRangeItr.second.first;
     removeBcmAclRange(aclRangeItr.second.first);
   }
   aclRange2BcmAclRangeHandle_.clear();
+}
+
+void BcmWarmBootCache::populateRtag7State() {
+  auto unit = hw_->getUnit();
+
+  moduleAState_ = BcmRtag7Module::retrieveRtag7ModuleState(
+      unit, BcmRtag7Module::kModuleAControl());
+  moduleBState_ = BcmRtag7Module::retrieveRtag7ModuleState(
+      unit, BcmRtag7Module::kModuleBControl());
+}
+
+bool BcmWarmBootCache::unitControlMatches(
+    char module,
+    opennsl_switch_control_t switchControl,
+    int arg) const {
+  const BcmRtag7Module::ModuleState* state = nullptr;
+
+  switch (module) {
+    case 'A':
+      state = &moduleAState_;
+      break;
+    case 'B':
+      state = &moduleBState_;
+      break;
+    default:
+      throw FbossError("Invalid module identifier ", module);
+  }
+
+  CHECK(state);
+  auto it = state->find(switchControl);
+
+  return it != state->end() && it->second == arg;
+}
+
+void BcmWarmBootCache::programmed(
+    char module,
+    opennsl_switch_control_t switchControl) {
+  BcmRtag7Module::ModuleState* state = nullptr;
+
+  switch (module) {
+    case 'A':
+      state = &moduleAState_;
+      break;
+    case 'B':
+      state = &moduleBState_;
+      break;
+    default:
+      throw FbossError("Invalid module identifier ", module);
+  }
+
+  CHECK(state);
+  auto numErased = state->erase(switchControl);
+
+  CHECK_EQ(numErased, 1);
 }
 
 }}

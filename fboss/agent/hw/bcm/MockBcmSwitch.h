@@ -3,6 +3,7 @@
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmUnit.h"
 #include "fboss/agent/hw/bcm/BcmTxPacket.h"
+#include "fboss/agent/hw/bcm/gen-cpp2/packettrace_types.h"
 
 #include <gmock/gmock.h>
 
@@ -14,6 +15,8 @@ class MockBcmSwitch : public BcmSwitchIf {
   MockBcmSwitch() {}
 
   MOCK_METHOD0(releaseUnit, std::unique_ptr<BcmUnit>());
+  MOCK_METHOD0(resetTables, void());
+  MOCK_METHOD1(initTables, void(const folly::dynamic&));
   MOCK_CONST_METHOD0(getPlatform, BcmPlatform*());
   MOCK_METHOD1(init, HwInitResult(Callback* callback));
   MOCK_METHOD0(unregisterCallbacks, void());
@@ -46,6 +49,7 @@ class MockBcmSwitch : public BcmSwitchIf {
   MOCK_CONST_METHOD0(getIntfTable, const BcmIntfTable*());
   MOCK_CONST_METHOD0(getHostTable, const BcmHostTable*());
   MOCK_CONST_METHOD0(getAclTable, const BcmAclTable*());
+  MOCK_CONST_METHOD0(getStatUpdater, BcmStatUpdater*());
   MOCK_CONST_METHOD0(getTrunkTable, const BcmTrunkTable*());
   MOCK_CONST_METHOD1(isPortUp, bool(PortID port));
   MOCK_CONST_METHOD0(getDropEgressId, opennsl_if_t());
@@ -66,6 +70,7 @@ class MockBcmSwitch : public BcmSwitchIf {
   MOCK_CONST_METHOD0(getCosMgr, BcmCosManager*());
   MOCK_METHOD1(fetchL2Table, void(std::vector<L2EntryThrift>* l2Table));
   MOCK_CONST_METHOD0(writableHostTable, BcmHostTable*());
+  MOCK_CONST_METHOD0(writableAclTable, BcmAclTable*());
   MOCK_CONST_METHOD0(getWarmBootCache, BcmWarmBootCache*());
   MOCK_CONST_METHOD0(dumpState, void());
   MOCK_CONST_METHOD0(exitFatal, void());

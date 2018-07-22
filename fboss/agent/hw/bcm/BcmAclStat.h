@@ -1,0 +1,45 @@
+/*
+ *  Copyright (c) 2004-present, Facebook, Inc.
+ *  All rights reserved.
+ *
+ *  This source code is licensed under the BSD-style license found in the
+ *  LICENSE file in the root directory of this source tree. An additional grant
+ *  of patent rights can be found in the PATENTS file in the same directory.
+ *
+ */
+#pragma once
+
+#include "fboss/agent/FbossError.h"
+#include "fboss/agent/hw/bcm/types.h"
+
+namespace facebook { namespace fboss {
+
+class BcmSwitch;
+
+/**
+ *  BcmAclStat is the class to abstract a stat's resource and functions
+ */
+class BcmAclStat {
+ public:
+  BcmAclStat(BcmSwitch* hw, int gid);
+  BcmAclStat(BcmSwitch* hw, BcmAclStatHandle statHandle)
+    : hw_(hw), handle_(statHandle) {}
+  ~BcmAclStat();
+
+  BcmAclStatHandle getHandle() const {
+    return handle_;
+  }
+
+  /**
+   * Check whether the acl details of handle in h/w matches the s/w acl and
+   * ranges
+   */
+  static bool isStateSame(BcmSwitch* hw, BcmAclStatHandle statHandle,
+    cfg::PacketCounterMatchAction& action);
+
+ private:
+  BcmSwitch* hw_;
+  BcmAclStatHandle handle_;
+};
+
+}} // facebook::fboss

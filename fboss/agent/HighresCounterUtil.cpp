@@ -11,6 +11,7 @@
 
 #include <sys/stat.h>
 
+#include <folly/logging/xlog.h>
 #include <sstream>
 
 DEFINE_bool(print_rates,
@@ -22,13 +23,13 @@ namespace facebook { namespace fboss {
 DumbCounterSampler::DumbCounterSampler(
     const std::set<CounterRequest>& counters) {
   for (const auto& c: counters) {
-    if (c.counterName.compare(kDumbCounterName) == 0) {
+    if (c.counterName == kDumbCounterName) {
       // If there are duplicate requests, overwrite
       req_ = c;
       numCounters_ = 1;
     } else {
-      LOG(WARNING) << "Requested counter " << c.counterName
-                   << " does not exist";
+      XLOG(WARNING) << "Requested counter " << c.counterName
+                    << " does not exist";
     }
   }
 }
@@ -41,14 +42,14 @@ InterfaceRateSampler::InterfaceRateSampler(
     const std::set<CounterRequest>& counters) {
   struct stat buffer;
   if (stat("/proc/net/dev", &buffer) != 0) {
-    LOG(ERROR) << "/proc/net/dev does not exist."
-               << " Ignoring any InterfaceRateSamplers";
+    XLOG(ERR) << "/proc/net/dev does not exist."
+              << " Ignoring any InterfaceRateSamplers";
     return;
   }
 
   for (const auto& c : counters) {
-    if (c.counterName.compare(kTxBytesCounterName) == 0 ||
-        c.counterName.compare(kRxBytesCounterName) == 0) {
+    if (c.counterName == kTxBytesCounterName ||
+        c.counterName == kRxBytesCounterName) {
       counters_.insert(c);
     }
   }
@@ -84,9 +85,9 @@ void InterfaceRateSampler::sample(CounterPublication* pub) {
   }
 
   for (const auto& c : counters_) {
-    if (c.counterName.compare(kTxBytesCounterName) == 0) {
+    if (c.counterName == kTxBytesCounterName) {
       pub->counterValues[c].push_back(sout);
-    } else if (c.counterName.compare(kRxBytesCounterName) == 0) {
+    } else if (c.counterName == kRxBytesCounterName) {
       pub->counterValues[c].push_back(sin);
     }
   }

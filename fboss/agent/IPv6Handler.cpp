@@ -9,34 +9,35 @@
  */
 #include "fboss/agent/IPv6Handler.h"
 
-#include <folly/MacAddress.h>
 #include <folly/Format.h>
-#include "fboss/agent/FbossError.h"
-#include "fboss/agent/RxPacket.h"
-#include "fboss/agent/SwitchStats.h"
-#include "fboss/agent/SwSwitch.h"
-#include "fboss/agent/NeighborUpdater.h"
-#include "fboss/agent/TxPacket.h"
-#include "fboss/agent/Platform.h"
+#include <folly/MacAddress.h>
+#include <folly/logging/xlog.h>
 #include "fboss/agent/DHCPv6Handler.h"
-#include "fboss/agent/packet/IPv6Hdr.h"
+#include "fboss/agent/FbossError.h"
+#include "fboss/agent/NeighborUpdater.h"
+#include "fboss/agent/Platform.h"
+#include "fboss/agent/RxPacket.h"
+#include "fboss/agent/SwSwitch.h"
+#include "fboss/agent/SwitchStats.h"
+#include "fboss/agent/TxPacket.h"
+#include "fboss/agent/UDPHeader.h"
+#include "fboss/agent/Utils.h"
 #include "fboss/agent/packet/ICMPHdr.h"
-#include "fboss/agent/packet/PktUtil.h"
+#include "fboss/agent/packet/IPv6Hdr.h"
 #include "fboss/agent/packet/NDP.h"
+#include "fboss/agent/packet/PktUtil.h"
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/InterfaceMap.h"
-#include "fboss/agent/state/NdpTable.h"
 #include "fboss/agent/state/NdpResponseTable.h"
+#include "fboss/agent/state/NdpTable.h"
+#include "fboss/agent/state/Route.h"
+#include "fboss/agent/state/RouteTable.h"
+#include "fboss/agent/state/RouteTableMap.h"
+#include "fboss/agent/state/RouteTableRib.h"
 #include "fboss/agent/state/StateDelta.h"
 #include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/state/Vlan.h"
 #include "fboss/agent/state/VlanMap.h"
-#include "fboss/agent/state/RouteTableMap.h"
-#include "fboss/agent/state/RouteTable.h"
-#include "fboss/agent/state/RouteTableRib.h"
-#include "fboss/agent/state/Route.h"
-#include "fboss/agent/Utils.h"
-#include "fboss/agent/UDPHeader.h"
 
 using folly::IPAddressV6;
 using folly::MacAddress;
@@ -130,14 +131,13 @@ void IPv6Handler::handlePacket(unique_ptr<RxPacket> pkt,
                                Cursor cursor) {
   const uint32_t l3Len = pkt->getLength() - (cursor - Cursor(pkt->buf()));
   IPv6Hdr ipv6(cursor);  // note: advances our cursor object
-  VLOG(4) << "IPv6 (" << l3Len << " bytes)"
-    " port: " << pkt->getSrcPort() <<
-    " vlan: " << pkt->getSrcVlan() <<
-    " src: " << ipv6.srcAddr.str() <<
-    " (" << src << ")" <<
-    " dst: " << ipv6.dstAddr.str() <<
-    " (" << dst << ")" <<
-    " nextHeader: " << static_cast<int>(ipv6.nextHeader);
+  XLOG(DBG4) << "IPv6 (" << l3Len
+             << " bytes)"
+                " port: "
+             << pkt->getSrcPort() << " vlan: " << pkt->getSrcVlan()
+             << " src: " << ipv6.srcAddr.str() << " (" << src << ")"
+             << " dst: " << ipv6.dstAddr.str() << " (" << dst << ")"
+             << " nextHeader: " << static_cast<int>(ipv6.nextHeader);
 
   // retrieve the current switch state
   auto state = sw_->getState();
@@ -149,8 +149,8 @@ void IPv6Handler::handlePacket(unique_ptr<RxPacket> pkt,
     UDPHeader udpHdr;
     Cursor udpCursor(cursor);
     udpHdr.parse(sw_, port, &udpCursor);
-    VLOG(4) << "DHCP UDP packet, source port :" << udpHdr.srcPort
-        << " destination port: " << udpHdr.dstPort;
+    XLOG(DBG4) << "DHCP UDP packet, source port :" << udpHdr.srcPort
+               << " destination port: " << udpHdr.dstPort;
     if (DHCPv6Handler::isForDHCPv6RelayOrServer(udpHdr)) {
       DHCPv6Handler::handlePacket(sw_, std::move(pkt), src, dst, ipv6,
           udpHdr, udpCursor);
@@ -188,7 +188,7 @@ void IPv6Handler::handlePacket(unique_ptr<RxPacket> pkt,
   // this packet so the hop limit should be at least 1
   auto minHopLimit = intf ? 0 : 1;
   if (ipv6.hopLimit <= minHopLimit) {
-    VLOG(4) << "Rx IPv6 Packet with hop limit exceeded";
+    XLOG(DBG4) << "Rx IPv6 Packet with hop limit exceeded";
     sw_->portStats(port)->pktDropped();
     sw_->portStats(port)->ipv6HopExceeded();
     // Look up cpu mac from platform
@@ -197,28 +197,26 @@ void IPv6Handler::handlePacket(unique_ptr<RxPacket> pkt,
     return;
   }
 
-  // TODO: We need to clean up this code to do a proper job of determining
-  // if the packet is for us or if it needs to be routed.
-  // For now, we simply assume ICMPv6 packets are for us, and that other
-  // packets need their MAC resolved.
-  //
-  // In the future, we need to fix this to look up the IP in our routing table.
-  // If it's for us, or a multicast address we are subscribed to, we should
-  // process it.  Otherwise, we need to route it.  If we don't have L2
-  // forwarding info, then we need to resolve the next hop MAC.
-  if (ipv6.nextHeader == IP_PROTO_IPV6_ICMP) {
-    pkt = handleICMPv6Packet(std::move(pkt), dst, src, ipv6, cursor);
-    if (pkt == nullptr) {
-      // packet has been handled
-      return;
-    }
-  }
-
   if (intf) {
     // packets destined for us
     // Anything not handled by the controller, we will forward it to the host,
     // i.e. ping, ssh, bgp...
     PortID portID = pkt->getSrcPort();
+    if (ipv6.payloadLength > intf->getMtu()) {
+      // Generate PTB as interface to dst intf has MTU smaller than payload
+      sendICMPv6PacketTooBig(
+          portID, pkt->getSrcVlan(), src, dst, ipv6, intf->getMtu(), cursor);
+      sw_->portStats(portID)->pktDropped();
+      return;
+    }
+    if (ipv6.nextHeader == IP_PROTO_IPV6_ICMP) {
+      pkt = handleICMPv6Packet(std::move(pkt), dst, src, ipv6, cursor);
+      if (pkt == nullptr) {
+        // packet has been handled
+        return;
+      }
+    }
+
     if (sw_->sendPacketToHost(intf->getID(), std::move(pkt))) {
       sw_->portStats(portID)->pktToHost(l3Len);
     } else {
@@ -227,12 +225,14 @@ void IPv6Handler::handlePacket(unique_ptr<RxPacket> pkt,
     return;
   }
 
-  // For now, assume we need to resolve the IP for this packet.
-  // TODO: Add rate limiting so we don't generate too many requests for the
-  // same IP.  Following the rules in RFC 4861 should be sufficient.
-  sendNeighborSolicitations(pkt->getSrcPort(), ipv6.dstAddr);
-  // We drop the packet while waiting on a response.
-  sw_->portStats(pkt)->pktDropped();
+  // Don't send solicitations for multicast or broadcast addresses.
+  if (!ipv6.dstAddr.isMulticast() && !ipv6.dstAddr.isLinkLocalBroadcast()) {
+    // If IP is not multicast or linklocal broadcast, we need to resolve the IP
+    // for this packet.
+    // TODO: Add rate limiting so we don't generate too many requests for the
+    // same IP.  Following the rules in RFC 4861 should be sufficient.
+    resolveDestAndHandlePacket(ipv6, std::move(pkt), dst, src, cursor);
+  }
 }
 
 unique_ptr<RxPacket> IPv6Handler::handleICMPv6Packet(
@@ -245,7 +245,7 @@ unique_ptr<RxPacket> IPv6Handler::handleICMPv6Packet(
 
   // Validate the checksum, and drop the packet if it is not valid
   if (!icmp6.validateChecksum(ipv6, cursor)) {
-    VLOG(3) << "bad ICMPv6 checksum";
+    XLOG(DBG3) << "bad ICMPv6 checksum";
     sw_->portStats(pkt)->pktDropped();
     return nullptr;
   }
@@ -306,9 +306,9 @@ void IPv6Handler::handleRouterSolicitation(unique_ptr<RxPacket> pkt,
     if (optionType == NDPOptionType::SRC_LL_ADDRESS) {
       // target mac address
       if (optionLength != NDPOptionLength::SRC_LL_ADDRESS_IEEE802) {
-        VLOG(3) << "bad option length " <<
-          static_cast<unsigned int>(optionLength) <<
-          " for source MAC address in IPv6 router solicitation";
+        XLOG(DBG3) << "bad option length "
+                   << static_cast<unsigned int>(optionLength)
+                   << " for source MAC address in IPv6 router solicitation";
         sw_->portStats(pkt)->pktDropped();
         return;
       }
@@ -325,8 +325,8 @@ void IPv6Handler::handleRouterSolicitation(unique_ptr<RxPacket> pkt,
     dstIP = IPAddressV6("ff01::1");
   }
 
-  VLOG(4) << "sending router advertisement in response to solicitation from "
-    << dstIP.str() << " (" << dstMac << ")";
+  XLOG(DBG4) << "sending router advertisement in response to solicitation from "
+             << dstIP.str() << " (" << dstMac << ")";
 
   uint32_t pktLen = IPv6RouteAdvertiser::getPacketSize(intf.get());
   auto resp = sw_->allocatePacket(pktLen);
@@ -346,13 +346,14 @@ void IPv6Handler::handleRouterAdvertisement(
   }
 
   if (!hdr.ipv6->srcAddr.isLinkLocal()) {
-    VLOG(6) << "bad IPv6 router advertisement: source address must be "
-      "link-local: " << hdr.ipv6->srcAddr;
+    XLOG(DBG6) << "bad IPv6 router advertisement: source address must be "
+                  "link-local: "
+               << hdr.ipv6->srcAddr;
     sw_->portStats(pkt)->ipv6NdpBad();
     return;
   }
 
-  VLOG(3) << "dropping IPv6 router advertisement from " << hdr.ipv6->srcAddr;
+  XLOG(DBG3) << "dropping IPv6 router advertisement from " << hdr.ipv6->srcAddr;
   sw_->portStats(pkt)->pktDropped();
 }
 
@@ -367,12 +368,13 @@ void IPv6Handler::handleNeighborSolicitation(unique_ptr<RxPacket> pkt,
   cursor.skip(4); // 4 reserved bytes
   IPAddressV6 targetIP = PktUtil::readIPv6(&cursor);
   if (targetIP.isMulticast()) {
-    VLOG(6) << "bad IPv6 neighbor solicitation request: target is "
-      "multicast: " << targetIP;
+    XLOG(DBG6) << "bad IPv6 neighbor solicitation request: target is "
+                  "multicast: "
+               << targetIP;
     sw_->portStats(pkt)->ipv6NdpBad();
     return;
   }
-  VLOG(4) << "got neighbor solicitation for " << targetIP.str();
+  XLOG(DBG4) << "got neighbor solicitation for " << targetIP.str();
 
   auto state = sw_->getState();
   auto vlan = state->getVlans()->getVlanIf(pkt->getSrcVlan());
@@ -428,9 +430,9 @@ void IPv6Handler::handleNeighborAdvertisement(unique_ptr<RxPacket> pkt,
     if (optionType == NDPOptionType::TARGET_LL_ADDRESS) {
       // target mac address
       if (optionLength != NDPOptionLength::TARGET_LL_ADDRESS_IEEE802) {
-        VLOG(3) << "bad option length " <<
-          static_cast<unsigned int>(optionLength) <<
-          " for target MAC address in IPv6 neighbor advertisement";
+        XLOG(DBG3) << "bad option length "
+                   << static_cast<unsigned int>(optionLength)
+                   << " for target MAC address in IPv6 neighbor advertisement";
         sw_->portStats(pkt)->pktDropped();
         return;
       }
@@ -442,8 +444,8 @@ void IPv6Handler::handleNeighborAdvertisement(unique_ptr<RxPacket> pkt,
   }
 
   if (targetMac.isMulticast() || targetMac.isBroadcast()) {
-    VLOG(3) << "ignoring IPv6 neighbor advertisement for " << targetIP <<
-      "with multicast MAC " << targetMac;
+    XLOG(DBG3) << "ignoring IPv6 neighbor advertisement for " << targetIP
+               << "with multicast MAC " << targetMac;
     sw_->portStats(pkt)->pktDropped();
     return;
   }
@@ -457,8 +459,8 @@ void IPv6Handler::handleNeighborAdvertisement(unique_ptr<RxPacket> pkt,
     return;
   }
 
-  VLOG(4) << "got neighbor advertisement for " << targetIP <<
-    " (" << targetMac << ")";
+  XLOG(DBG4) << "got neighbor advertisement for " << targetIP << " ("
+             << targetMac << ")";
 
   auto updater = sw_->getNeighborUpdater();
   auto type = ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT;
@@ -507,28 +509,70 @@ void IPv6Handler::sendICMPv6TimeExceeded(VlanID srcVlan,
                              ICMPV6_TYPE_TIME_EXCEEDED,
                              ICMPV6_CODE_TIME_EXCEEDED_HOPLIMIT_EXCEEDED,
                              bodyLength, serializeBody);
-  VLOG(4) << "sending ICMPv6 Time Exceeded with srcMac  " << src
+  XLOG(DBG4) << "sending ICMPv6 Time Exceeded with srcMac  " << src
+             << " dstMac: " << dst << " vlan: " << srcVlan
+             << " dstIp: " << v6Hdr.srcAddr.str() << " srcIP: " << srcIp.str()
+             << " bodyLength: " << bodyLength;
+  sw_->sendPacketSwitched(std::move(icmpPkt));
+}
+
+void IPv6Handler::sendICMPv6PacketTooBig(
+    PortID srcPort,
+    VlanID srcVlan,
+    folly::MacAddress dst,
+    folly::MacAddress src,
+    IPv6Hdr& v6Hdr,
+    int expectedMtu,
+    folly::io::Cursor cursor) {
+  auto state = sw_->getState();
+
+  // payload serialization function
+  // 4 bytes expected MTU + ipv6 header + as much payload as possible to fit MTU
+  // this is upper limit of bodyLength
+  uint32_t bodyLengthLimit = IPV6_MIN_MTU - ICMPHdr::computeTotalLengthV6(0);
+  // this is when we add the whole input L3 packet
+  uint32_t fullPacketLength = ICMPHdr::ICMPV6_MTU_LEN + IPv6Hdr::SIZE
+                              + cursor.totalLength();
+  auto bodyLength = std::min(bodyLengthLimit, fullPacketLength);
+
+  auto serializeBody = [&](RWPrivateCursor* sendCursor) {
+    sendCursor->writeBE<uint32_t>(expectedMtu);
+    v6Hdr.serialize(sendCursor);
+    auto remainingLength = bodyLength - IPv6Hdr::SIZE -
+                           ICMPHdr::ICMPV6_UNUSED_LEN;
+    sendCursor->push(cursor, remainingLength);
+  };
+
+  IPAddressV6 srcIp = getSwitchVlanIPv6(state, srcVlan);
+  auto icmpPkt = createICMPv6Pkt(sw_, dst, src, srcVlan,
+                             v6Hdr.srcAddr, srcIp,
+                             ICMPV6_TYPE_PACKET_TOO_BIG,
+                             ICMPV6_CODE_PACKET_TOO_BIG,
+                             bodyLength, serializeBody);
+
+  XLOG(DBG4) << "sending ICMPv6 Packet Too Big with srcMac  " << src
           << " dstMac: " << dst
           << " vlan: " << srcVlan
           << " dstIp: " << v6Hdr.srcAddr.str()
           << " srcIP: " << srcIp.str()
           << " bodyLength: " << bodyLength;
   sw_->sendPacketSwitched(std::move(icmpPkt));
+  sw_->portStats(srcPort)->pktTooBig();
 }
 
 bool IPv6Handler::checkNdpPacket(const ICMPHeaders& hdr,
                                  const RxPacket* pkt) const {
   // Validation common for all NDP packets
   if (hdr.ipv6->hopLimit != 255) {
-    VLOG(3) << "bad IPv6 NDP request (" << hdr.icmp6->type <<
-      "): hop limit should be 255, received value is " <<
-      static_cast<int>(hdr.ipv6->hopLimit);
+    XLOG(DBG3) << "bad IPv6 NDP request (" << hdr.icmp6->type
+               << "): hop limit should be 255, received value is "
+               << static_cast<int>(hdr.ipv6->hopLimit);
     sw_->portStats(pkt)->ipv6NdpBad();
     return false;
   }
   if (hdr.icmp6->code != 0) {
-    VLOG(3) << "bad IPv6 NDP request (" << hdr.icmp6->type <<
-      "): code should be 0, received value is " << hdr.icmp6->code;
+    XLOG(DBG3) << "bad IPv6 NDP request (" << hdr.icmp6->type
+               << "): code should be 0, received value is " << hdr.icmp6->code;
     sw_->portStats(pkt)->ipv6NdpBad();
     return false;
   }
@@ -560,8 +604,8 @@ void IPv6Handler::sendNeighborSolicitation(SwSwitch* sw,
                              ICMPV6_CODE_NDP_MESSAGE_CODE,
                              bodyLength, serializeBody);
 
-  VLOG(4) << "sending neighbor solicitation for " << targetIP <<
-    " on vlan " << vlanID;
+  XLOG(DBG4) << "sending neighbor solicitation for " << targetIP << " on vlan "
+             << vlanID;
   sw->sendPacketSwitched(std::move(pkt));
 }
 
@@ -572,18 +616,96 @@ void IPv6Handler::sendNeighborSolicitation(SwSwitch* sw,
   auto intfID = vlan->getInterfaceID();
 
   if (!Interface::isIpAttached(targetIP, intfID, state)) {
-    VLOG(0) << "Cannot reach " << targetIP << " on interface " << intfID;
+    XLOG(DBG0) << "Cannot reach " << targetIP << " on interface " << intfID;
     return;
   }
 
   auto intf = state->getInterfaces()->getInterfaceIf(intfID);
   if (!intf) {
-    VLOG(0) << "Cannot find interface " << intfID;
+    XLOG(DBG0) << "Cannot find interface " << intfID;
     return;
   }
 
   sendNeighborSolicitation(sw, targetIP, intf->getMac(), vlan->getID());
 }
+
+void IPv6Handler::resolveDestAndHandlePacket(
+    IPv6Hdr hdr,
+    unique_ptr<RxPacket> pkt,
+    MacAddress dst,
+    MacAddress src,
+    Cursor cursor) {
+  // Right now this either responds with PTB or generate neighbor soliciations
+  auto ingressPort = pkt->getSrcPort();
+  auto targetIP = hdr.dstAddr;
+  auto state = sw_->getState();
+
+  // resolve the destination.
+  // TODO: assume vrf 0 now
+  auto routeTable = state->getRouteTables()->getRouteTableIf(RouterID(0));
+  if (!routeTable) {
+    return;
+  }
+
+  auto route = routeTable->getRibV6()->longestMatch(targetIP);
+  if (!route || !route->isResolved()) {
+    sw_->portStats(ingressPort)->ipv6DstLookupFailure();
+    // No way to reach targetIP
+    return;
+  }
+
+  auto interfaces = state->getInterfaces();
+  auto nexthops = route->getForwardInfo().getNextHopSet();
+
+  for (auto nexthop : nexthops) {
+    // get interface needed to reach next hop
+    auto intf = interfaces->getInterfaceIf(nexthop.intf());
+    if (intf) {
+      // what should be source & destination of packet
+      auto source = intf->getAddressToReach(nexthop.addr())->first.asV6();
+      auto target = route->isConnected() ? targetIP : nexthop.addr().asV6();
+
+      if (source == target) {
+        // This packet is for us.  Don't generate PTB or NDP request.
+        continue;
+      }
+
+      if (hdr.payloadLength > intf->getMtu()) {
+        // Generate PTB as interface to next hop has MTU smaller than payload
+        sendICMPv6PacketTooBig(
+            ingressPort,
+            pkt->getSrcVlan(),
+            src,
+            dst,
+            hdr,
+            intf->getMtu(),
+            cursor);
+        sw_->portStats(ingressPort)->pktDropped();
+        return;
+      } else {
+        // Check if destination is unknown, in which case trigger NDP
+        auto vlanID = intf->getVlanID();
+        auto vlan = state->getVlans()->getVlanIf(vlanID);
+        if (vlan) {
+          auto entry = vlan->getNdpTable()->getEntryIf(target);
+          if (nullptr == entry) {
+            // No entry in NDP table, create a neighbor solicitation packet
+            sendNeighborSolicitation(
+                sw_, target, intf->getMac(), vlan->getID());
+            // Notify the updater that we sent a solicitation out
+            sw_->getNeighborUpdater()->sentNeighborSolicitation(vlanID, target);
+          } else {
+            XLOG(DBG5) << "not sending neighbor solicitation for "
+                       << target.str() << ", "
+                       << ((entry->isPending()) ? "pending" : "")
+                       << " entry already exists";
+          }
+        }
+      }
+    }
+  }
+  sw_->portStats(pkt)->pktDropped();
+} // namespace fboss
 
 void IPv6Handler::sendNeighborSolicitations(
     PortID ingressPort, const folly::IPAddressV6& targetIP) {
@@ -630,10 +752,9 @@ void IPv6Handler::sendNeighborSolicitations(
           // Notify the updater that we sent a solicitation out
           sw_->getNeighborUpdater()->sentNeighborSolicitation(vlanID, target);
         } else {
-          VLOG(5) << "not sending neighbor solicitation for " << target.str()
-                  << ", " << ((entry->isPending()) ? "pending" : "")
-                  << " entry already exists";
-
+          XLOG(DBG5) << "not sending neighbor solicitation for " << target.str()
+                     << ", " << ((entry->isPending()) ? "pending" : "")
+                     << " entry already exists";
         }
       }
     }
@@ -657,8 +778,8 @@ void IPv6Handler::sendNeighborAdvertisement(VlanID vlan,
                                             IPAddressV6 srcIP,
                                             MacAddress dstMac,
                                             IPAddressV6 dstIP) {
-  VLOG(4) << "sending neighbor advertisement to " << dstIP.str()
-    << " (" << dstMac << "): for " <<  srcIP << " (" << srcMac << ")";
+  XLOG(DBG4) << "sending neighbor advertisement to " << dstIP.str() << " ("
+             << dstMac << "): for " << srcIP << " (" << srcMac << ")";
 
   uint32_t flags = 0xa0000000; // router, override
   if (dstIP.isZero()) {

@@ -25,16 +25,15 @@ using std::string;
 LacpController::LacpController(
     PortID portID,
     folly::EventBase* evb,
-    LinkAggregationManager* lagMgr,
-    SwSwitch* sw)
+    LacpServicerIf* servicer)
     : portID_(portID),
-      tx_(*this, evb, sw),
+      tx_(*this, evb, servicer),
       rx_(*this, evb),
       periodicTx_(*this, evb),
-      mux_(*this, evb, sw),
+      mux_(*this, evb, servicer),
       selector_(*this),
       evb_(evb),
-      lagMgr_(lagMgr) {
+      servicer_(servicer) {
   actorState_ &= ~LacpState::AGGREGATABLE;
 }
 
@@ -48,19 +47,18 @@ LacpController::LacpController(
     uint16_t systemPriority,
     folly::MacAddress systemID,
     uint8_t minLinkCount,
-    LinkAggregationManager* lagMgr,
-    SwSwitch* sw)
+    LacpServicerIf* servicer)
     : aggPortID_(aggPortID),
       portID_(portID),
       portPriority_(portPriority),
       systemPriority_(systemPriority),
-      tx_(*this, evb, sw),
+      tx_(*this, evb, servicer),
       rx_(*this, evb),
       periodicTx_(*this, evb),
-      mux_(*this, evb, sw),
+      mux_(*this, evb, servicer),
       selector_(*this, minLinkCount),
       evb_(evb),
-      lagMgr_(lagMgr) {
+      servicer_(servicer) {
   std::memcpy(systemID_.begin(), systemID.bytes(), systemID_.size());
 
   actorState_ |= LacpState::AGGREGATABLE;
@@ -83,7 +81,7 @@ void LacpController::startMachines() {
 }
 
 void LacpController::stopMachines() {
-  evb()->runInEventBaseThread([self = shared_from_this()]() {
+  evb()->runInEventBaseThreadAndWait([self = shared_from_this()]() {
     self->mux_.stop();
     self->tx_.stop();
     self->periodicTx_.stop();
@@ -113,13 +111,7 @@ void LacpController::portDown() {
   });
 }
 
-void LacpController::receivedLACPDU(Cursor c) {
-  auto lacpdu = LACPDU::from(&c);
-
-  if (!lacpdu.isValid()) {
-    return;
-  }
-
+void LacpController::received(const LACPDU& lacpdu) {
   evb()->runInEventBaseThread(
       [self = shared_from_this(), lacpdu]() { self->rx_.rx(lacpdu); });
 }
@@ -199,6 +191,24 @@ void LacpController::startPeriodicTransmissionMachine() {
 
 void LacpController::select() {
   selector_.select();
+}
+
+void LacpController::selected(
+    folly::Range<std::vector<PortID>::const_iterator> ports) {
+  auto controllersToSignal = servicer_->getControllersFor(ports);
+
+  for (const auto& controller : controllersToSignal) {
+    controller->selected();
+  }
+}
+
+void LacpController::standby(
+    folly::Range<std::vector<PortID>::const_iterator> ports) {
+  auto controllersToSignal = servicer_->getControllersFor(ports);
+
+  for (const auto& controller : controllersToSignal) {
+    controller->standby();
+  }
 }
 
 } // namespace fboss

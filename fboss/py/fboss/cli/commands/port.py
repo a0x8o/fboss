@@ -247,7 +247,7 @@ class PortStatsCmd(cmds.FbossCmd):
 
 
 class PortStatusCmd(cmds.FbossCmd):
-    def run(self, detail, ports, verbose, internal):
+    def run(self, detail, ports, verbose, internal, all):
         self._client = self._create_agent_client()
         try:
             self._qsfp_client = self._create_qsfp_client()
@@ -259,6 +259,8 @@ class PortStatusCmd(cmds.FbossCmd):
             ).get_detail_status()
         elif internal:
             self.list_ports(ports, internal_port=True)
+        elif all:
+            self.list_ports(ports, all=True)
         else:
             self.list_ports(ports)
 
@@ -275,7 +277,7 @@ class PortStatusCmd(cmds.FbossCmd):
             print('-' * 59)
         return field_fmt
 
-    def list_ports(self, ports, internal_port=False):
+    def list_ports(self, ports, internal_port=False, all=False):
         field_fmt = self._get_field_format(internal_port)
         port_status_map = self._client.getPortStatus(ports)
         qsfp_info_map = utils.get_qsfp_info_map(
@@ -290,16 +292,15 @@ class PortStatusCmd(cmds.FbossCmd):
             if not status:
                 missing_port_status.append(port_id)
                 continue
-            # The transceiver id can be derived from port name
-            # e.g. port name eth1/4/1 -> transceiver_id is 4-1 = 3
-            # (-1 because we start counting transceivers at 0)
-            transceiver_id = utils.port_sort_fn(port_info)[2] - 1
-            qsfp_info = qsfp_info_map.get(transceiver_id)
-            qsfp_present = None
-            if self._qsfp_client:
-                # For non QSFP ports (think Fabric port) qsfp_client
-                # will not return any information.
+
+            qsfp_present = False
+            # For non QSFP ports (think Fabric port) qsfp_client
+            # will not return any information.
+            if status.transceiverIdx and self._qsfp_client:
+                qsfp_info = qsfp_info_map.get(
+                    status.transceiverIdx.transceiverId)
                 qsfp_present = qsfp_info.present if qsfp_info else False
+
             attrs = utils.get_status_strs(status, qsfp_present)
             if internal_port:
                 speed = attrs['speed']
@@ -313,6 +314,15 @@ class PortStatusCmd(cmds.FbossCmd):
                     attrs['link_status'],
                     attrs['present'],
                     speed))
+            elif all:
+                name = port_info.name if port_info.name else port_id
+                print(field_fmt.format(
+                    name,
+                    attrs['admin_status'],
+                    attrs['color_align'],
+                    attrs['link_status'],
+                    attrs['present'],
+                    attrs['speed']))
             elif status.enabled:
                 name = port_info.name if port_info.name else port_id
                 print(field_fmt.format(
@@ -707,3 +717,29 @@ class PortStatusDetailCmd(object):
 
         self._get_dummy_status()
         self._print_port_detail()
+
+
+class PortDescriptionCmd(cmds.FbossCmd):
+    def run(self, ports, show_down=True):
+        try:
+            self._client = self._create_agent_client()
+            resp = self._client.getAllPortInfo()
+
+        except FbossBaseError as e:
+            raise SystemExit('Fboss Error: ' + str(e))
+        except Exception as e:
+            raise Exception('Error: ' + str(e))
+
+        def use_port(port):
+            return (show_down or port.operState == 1) and \
+                   (not ports or port.portId in ports or port.name in ports)
+
+        port_description = {k: v for k, v in resp.items() if use_port(v)}
+
+        if not port_description:
+            print("No ports found")
+
+        tmpl = "{:18} {}"
+        print(tmpl.format("Port", "Description"))
+        for port in sorted(port_description.values(), key=utils.port_sort_fn):
+            print(tmpl.format(port.name.strip(), port.description))

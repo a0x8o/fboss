@@ -15,8 +15,7 @@ namespace facebook { namespace fboss {
 BcmAclEntry::BcmAclEntry(
     BcmSwitch* /*hw*/,
     int /*gid*/,
-    const std::shared_ptr<AclEntry>& /*acl*/,
-    const BcmAclRanges& /*ranges*/) {}
+    const std::shared_ptr<AclEntry>& /*acl*/) {}
 BcmAclEntry::~BcmAclEntry() {}
 
 }} // facebook::fboss

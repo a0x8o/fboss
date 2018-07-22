@@ -15,6 +15,7 @@ sys.path.insert(1, '../../')
 sys.path.insert(2, '../../../agent/if/gen-py')
 
 import click
+import ipaddress
 
 from fboss.cli.commands import arp
 from fboss.cli.commands import aggregate_port
@@ -29,6 +30,7 @@ from fboss.cli.commands import ndp
 from fboss.cli.commands import nic
 from fboss.cli.commands import port
 from fboss.cli.commands import route
+from fboss.cli.commands.commands import FlushType
 from fboss.cli.utils.utils import AGENT_KEYWORD
 from thrift.Thrift import TApplicationException
 from thrift.transport.TTransport import TTransportException
@@ -93,19 +95,23 @@ class ArpCli(object):
     @click.argument('ip')
     @click.pass_obj
     def _flush(cli_opts, ip, vlan):
-        ''' Flush an ARP entry by [IP]'''
-        cmds.NeighborFlushCmd(cli_opts).run(ip, vlan)
+        ''' Flush an ARP entry by [IP] or [subnet] or flush [all]'''
+        if ip == 'all':
+            ip = '0.0.0.0/0'
+        cmds.NeighborFlushSubnetCmd(cli_opts).run(FlushType.arp,
+                ipaddress.IPv4Network(ip), vlan)
 
 
 class AggregatePortCli(object):
     ''' Aggregate Port sub-commands '''
     @click.command()
+    @click.argument('port', required=False, default="")
     @click.pass_obj
-    def aggregate_port(cli_opts):
+    def aggregate_port(cli_opts, port):
         ''' Show aggregate port information; Outputs a list of
             aggregate port and the subports that are part of the
-            aggregate port. '''
-        aggregate_port.AggregatePortCmd(cli_opts).run()
+            aggregate port.'''
+        aggregate_port.AggregatePortCmd(cli_opts).run(port)
 
 
 class NicCli(object):
@@ -159,13 +165,29 @@ class IpCli(object):
 
 class InterfaceCli(object):
     ''' Interface sub-commands '''
+
+    def __init__(self):
+        self.interface.add_command(self._show, name='show')
+        self.interface.add_command(self._summary, name='summary')
+
+    @click.group(cls=AliasedGroup)
+    def interface():
+        ''' Show Interface Information '''
+        pass
+
     @click.command()
     @click.argument('interfaces', type=int, nargs=-1)
     @click.pass_obj
-    def interface(cli_opts, interfaces):
+    def _show(cli_opts, interfaces):
         ''' Show interface information for Interface(s); Outputs a list of
             interfaces on host if no interfaces are specified '''
-        interface.InterfaceCmd(cli_opts).run(interfaces)
+        interface.InterfaceShowCmd(cli_opts).run(interfaces)
+
+    @click.command()
+    @click.pass_obj
+    def _summary(cli_opts):
+        ''' Show interface summary '''
+        interface.InterfaceSummaryCmd(cli_opts).run()
 
 
 class L2Cli(object):
@@ -234,8 +256,12 @@ class NdpCli(object):
     @click.argument('ip')
     @click.pass_obj
     def _flush(cli_opts, ip, vlan):
-        ''' Flush an NDP entry '''
-        cmds.NeighborFlushCmd(cli_opts).run(ip, vlan)
+        ''' Flush an NDP entry by [IP] or [subnet] or flush [all]'''
+        if ip == 'all':
+            ip = '::/0'
+        cmds.NeighborFlushSubnetCmd(cli_opts).run(FlushType.ndp,
+                ipaddress.IPv6Network(ip), vlan)
+
 
 class PortType(click.ParamType):
     port_info_map = None
@@ -266,6 +292,8 @@ class PortCli(object):
         self.port.add_command(self._enable, name='enable')
         self.port.add_command(self._disable, name='disable')
         self.port.add_command(self._stats, name='stats')
+        self.port.add_command(self._description, name='description')
+        self.port.add_command(self._stats, name='all')
 
     @click.group(cls=AliasedGroup)
     def port():
@@ -303,14 +331,15 @@ class PortCli(object):
     @click.command()
     @click.argument('ports', nargs=-1, type=PortType())
     @click.option('--detail', is_flag=True, help='Display detailed port status')
+    @click.option('--all', is_flag=True, help='Display Disabled ports')
     @click.option('--internal', is_flag=True,
                   help='Display all ports info with internal ID')
     @click.option('-v', '--verbose', is_flag=True,
                     help='Show flags and thresholds as well as details')
     @click.pass_obj
-    def _status(cli_opts, detail, ports, verbose, internal):
+    def _status(cli_opts, detail, ports, verbose, internal, all):
         ''' Show port status '''
-        port.PortStatusCmd(cli_opts).run(detail, ports, verbose, internal)
+        port.PortStatusCmd(cli_opts).run(detail, ports, verbose, internal, all)
 
     @click.command()
     @click.argument('ports', nargs=-1, type=PortType())
@@ -321,6 +350,13 @@ class PortCli(object):
     def _stats(cli_opts, detail, ports):
         ''' Show port statistics '''
         port.PortStatsCmd(cli_opts).run(detail, ports)
+
+    @click.command()
+    @click.argument('ports', nargs=-1, type=PortType())
+    @click.pass_obj
+    def _description(cli_opts, ports):
+        ''' Show port description for given [port(s)] '''
+        port.PortDescriptionCmd(cli_opts).run(ports)
 
 
 class ProductInfoCli(object):

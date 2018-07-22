@@ -29,6 +29,7 @@
 #include "fboss/agent/state/SwitchState-defs.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
 
+#include <folly/logging/xlog.h>
 #include <gtest/gtest.h>
 
 using namespace facebook::fboss;
@@ -116,11 +117,13 @@ std::shared_ptr<SwitchState> applyInitConfig() {
   auto tablesV0 = stateV0->getRouteTables();
 
   cfg::SwitchConfig config;
-  config.vlans.resize(2);
+  config.vlans.resize(4);
   config.vlans[0].id = 1;
   config.vlans[1].id = 2;
+  config.vlans[2].id = 3;
+  config.vlans[3].id = 4;
 
-  config.interfaces.resize(2);
+  config.interfaces.resize(4);
   config.interfaces[0].intfID = 1;
   config.interfaces[0].vlanID = 1;
   config.interfaces[0].routerID = 0;
@@ -129,6 +132,7 @@ std::shared_ptr<SwitchState> applyInitConfig() {
   config.interfaces[0].ipAddresses.resize(2);
   config.interfaces[0].ipAddresses[0] = "1.1.1.1/24";
   config.interfaces[0].ipAddresses[1] = "1::1/48";
+
   config.interfaces[1].intfID = 2;
   config.interfaces[1].vlanID = 2;
   config.interfaces[1].routerID = 0;
@@ -137,6 +141,24 @@ std::shared_ptr<SwitchState> applyInitConfig() {
   config.interfaces[1].ipAddresses.resize(2);
   config.interfaces[1].ipAddresses[0] = "2.2.2.2/24";
   config.interfaces[1].ipAddresses[1] = "2::1/48";
+
+  config.interfaces[2].intfID = 3;
+  config.interfaces[2].vlanID = 3;
+  config.interfaces[2].routerID = 0;
+  config.interfaces[2].__isset.mac = true;
+  config.interfaces[2].mac = "00:00:00:00:00:33";
+  config.interfaces[2].ipAddresses.resize(2);
+  config.interfaces[2].ipAddresses[0] = "3.3.3.3/24";
+  config.interfaces[2].ipAddresses[1] = "3::1/48";
+
+  config.interfaces[3].intfID = 4;
+  config.interfaces[3].vlanID = 4;
+  config.interfaces[3].routerID = 0;
+  config.interfaces[3].__isset.mac = true;
+  config.interfaces[3].mac = "00:00:00:00:00:44";
+  config.interfaces[3].ipAddresses.resize(2);
+  config.interfaces[3].ipAddresses[0] = "4.4.4.4/24";
+  config.interfaces[3].ipAddresses[1] = "4::1/48";
 
   auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
   stateV1->publish();
@@ -150,8 +172,8 @@ TEST(RouteUpdater, dedup) {
 
   auto rid = RouterID(0);
   // 2 different nexthops
-  RouteNextHops nhop1 = makeNextHops({"1.1.1.10"}); // resolved by intf 1
-  RouteNextHops nhop2 = makeNextHops({"2.2.2.10"}); // resolved by intf 2
+  RouteNextHopSet nhop1 = makeNextHops({"1.1.1.10"}); // resolved by intf 1
+  RouteNextHopSet nhop2 = makeNextHops({"2.2.2.10"}); // resolved by intf 2
   // 4 prefixes
   RouteV4::Prefix r1{IPAddressV4("10.1.1.0"), 24};
   RouteV4::Prefix r2{IPAddressV4("20.1.1.0"), 24};
@@ -230,15 +252,16 @@ TEST(Route, resolve) {
   // recursive lookup
   {
     RouteUpdater u1(stateV1->getRouteTables());
-    RouteNextHops nexthops1 = makeNextHops({"1.1.1.10"}); // resolved by intf 1
+    RouteNextHopSet nexthops1 =
+        makeNextHops({"1.1.1.10"}); // resolved by intf 1
     u1.addRoute(
         rid,
         IPAddress("1.1.3.0"),
         24,
         CLIENT_A,
         RouteNextHopEntry(nexthops1, DISTANCE));
-    RouteNextHops nexthops2 = makeNextHops({"1.1.3.10"}); // rslvd. by
-                                                          // '1.1.3/24'
+    RouteNextHopSet nexthops2 = makeNextHops({"1.1.3.10"}); // rslvd. by
+                                                            // '1.1.3/24'
     u1.addRoute(
         rid,
         IPAddress("8.8.8.0"),
@@ -263,7 +286,7 @@ TEST(Route, resolve) {
     // check the forwarding info
     RouteNextHopSet expFwd2;
     expFwd2.emplace(
-        RouteNextHop::createForward(IPAddress("1.1.1.10"), InterfaceID(1)));
+        ResolvedNextHop(IPAddress("1.1.1.10"), InterfaceID(1), ECMP_WEIGHT));
     EXPECT_EQ(expFwd2, r21->getForwardInfo().getNextHopSet());
     EXPECT_EQ(expFwd2, r22->getForwardInfo().getNextHopSet());
   }
@@ -314,7 +337,7 @@ TEST(Route, resolve) {
   // recursive lookup across 2 updates
   {
     RouteUpdater u1(stateV1->getRouteTables());
-    RouteNextHops nexthops1 = makeNextHops({"50.0.0.1"});
+    RouteNextHopSet nexthops1 = makeNextHops({"50.0.0.1"});
     u1.addRoute(
         rid,
         IPAddress("40.0.0.0"),
@@ -470,11 +493,11 @@ TEST(Route, addDel) {
 
   auto rid = RouterID(0);
 
-  RouteNextHops nexthops = makeNextHops({"1.1.1.10", // intf 1
-                                         "2::2", // intf 2
-                                         "1.1.2.10"}); // un-resolvable
-  RouteNextHops nexthops2 = makeNextHops({"1.1.3.10", // un-resolvable
-                                          "11:11::1"}); // un-resolvable
+  RouteNextHopSet nexthops = makeNextHops({"1.1.1.10", // intf 1
+                                           "2::2", // intf 2
+                                           "1.1.2.10"}); // un-resolvable
+  RouteNextHopSet nexthops2 = makeNextHops({"1.1.3.10", // un-resolvable
+                                            "11:11::1"}); // un-resolvable
 
   RouteUpdater u1(stateV1->getRouteTables());
   u1.addRoute(
@@ -515,9 +538,9 @@ TEST(Route, addDel) {
   EXPECT_EQ(2, fwd2v6.size());
   RouteNextHopSet expFwd2;
   expFwd2.emplace(
-      RouteNextHop::createForward(IPAddress("1.1.1.10"), InterfaceID(1)));
+      ResolvedNextHop(IPAddress("1.1.1.10"), InterfaceID(1), ECMP_WEIGHT));
   expFwd2.emplace(
-      RouteNextHop::createForward(IPAddress("2::2"), InterfaceID(2)));
+      ResolvedNextHop(IPAddress("2::2"), InterfaceID(2), ECMP_WEIGHT));
   EXPECT_EQ(expFwd2, fwd2);
   EXPECT_EQ(expFwd2, fwd2v6);
 
@@ -1077,7 +1100,7 @@ TEST(Route, changedRoutesPostUpdate) {
   ASSERT_NE(nullptr, stateV1);
   stateV1->publish();
   auto rid = RouterID(0);
-  RouteNextHops nexthops = makeNextHops({"1.1.1.10", // resolved by intf 1
+  RouteNextHopSet nexthops = makeNextHops({"1.1.1.10", // resolved by intf 1
                                          "2::2"}); // resolved by intf 2
 
   auto numChangedRoutes = [=](const RTMapDelta& delta) {
@@ -1388,11 +1411,11 @@ TEST(Route, PruneChangedRoutes) {
 // Utility function for creating a nexthops list of size n,
 // starting with the prefix.  For prefix "1.1.1.", first
 // IP in the list will be 1.1.1.10
-RouteNextHops newNextHops(int n, std::string prefix) {
-  RouteNextHops h;
+RouteNextHopSet newNextHops(int n, std::string prefix) {
+  RouteNextHopSet h;
   for (int i = 0; i < n; i++) {
     auto ipStr = prefix + std::to_string(i + 10);
-    h.emplace(RouteNextHop::createNextHop(IPAddress(ipStr)));
+    h.emplace(UnresolvedNextHop(IPAddress(ipStr), UCMP_DEFAULT_WEIGHT));
   }
   return h;
 }
@@ -1408,9 +1431,9 @@ TEST(Route, modRoutes) {
   RouteV4::Prefix prefix10{IPAddressV4("10.10.10.10"), 32};
   RouteV4::Prefix prefix99{IPAddressV4("99.99.99.99"), 32};
 
-  RouteNextHops nexthops1 = newNextHops(3, "1.1.1.");
-  RouteNextHops nexthops2 = newNextHops(3, "2.2.2.");
-  RouteNextHops nexthops3 = newNextHops(3, "3.3.3.");
+  RouteNextHopSet nexthops1 = newNextHops(3, "1.1.1.");
+  RouteNextHopSet nexthops2 = newNextHops(3, "2.2.2.");
+  RouteNextHopSet nexthops3 = newNextHops(3, "3.3.3.");
 
   u1.addRoute(
       rid,
@@ -1574,10 +1597,13 @@ TEST(Route, equality) {
   // Now replace obj1's CLIENT_B list with the original list.
   // But construct the list in opposite order.
   // Objects should still be equal, despite the order of construction.
-  RouteNextHops nextHopsRev;
-  nextHopsRev.emplace(RouteNextHop::createNextHop(IPAddress("2.2.2.12")));
-  nextHopsRev.emplace(RouteNextHop::createNextHop(IPAddress("2.2.2.11")));
-  nextHopsRev.emplace(RouteNextHop::createNextHop(IPAddress("2.2.2.10")));
+  RouteNextHopSet nextHopsRev;
+  nextHopsRev.emplace(
+      UnresolvedNextHop(IPAddress("2.2.2.12"), UCMP_DEFAULT_WEIGHT));
+  nextHopsRev.emplace(
+      UnresolvedNextHop(IPAddress("2.2.2.11"), UCMP_DEFAULT_WEIGHT));
+  nextHopsRev.emplace(
+      UnresolvedNextHop(IPAddress("2.2.2.10"), UCMP_DEFAULT_WEIGHT));
   nhm1.update(CLIENT_B, RouteNextHopEntry(nextHopsRev, DISTANCE));
   EXPECT_TRUE(nhm1 == nhm2);
 }
@@ -1613,7 +1639,7 @@ TEST(Route, serializeRouteNextHopsMulti) {
   // This function tests [de]serialization of:
   // RouteNextHopsMulti
   // RouteNextHopEntry
-  // RouteNextHop
+  // NextHop
 
   // test for new format to new format
   RouteNextHopsMulti nhm1;
@@ -1768,8 +1794,8 @@ TEST(Route, fwdInfoRanking) {
       16,
       StdClientIds2ClientID(StdClientIds::INTERFACE_ROUTE),
       RouteNextHopEntry(
-          RouteNextHop::createInterfaceNextHop(
-              IPAddress("10.10.0.1"), InterfaceID(9)),
+          ResolvedNextHop(
+              IPAddress("10.10.0.1"), InterfaceID(9), UCMP_DEFAULT_WEIGHT),
           AdminDistance::DIRECTLY_CONNECTED));
   u1.addRoute(
       rid,
@@ -1856,14 +1882,14 @@ TEST(Route, dropRoutes) {
       CLIENT_A,
       RouteNextHopEntry(DROP, DISTANCE));
   // Check recursive resolution for drop routes
-  RouteNextHops v4nexthops = makeNextHops({"10.10.10.10"});
+  RouteNextHopSet v4nexthops = makeNextHops({"10.10.10.10"});
   u1.addRoute(
       rid,
       IPAddress("20.20.20.0"),
       24,
       CLIENT_A,
       RouteNextHopEntry(v4nexthops, DISTANCE));
-  RouteNextHops v6nexthops = makeNextHops({"2001::0"});
+  RouteNextHopSet v6nexthops = makeNextHops({"2001::0"});
   u1.addRoute(
       rid,
       IPAddress("2001:1::"),
@@ -1919,14 +1945,14 @@ TEST(Route, toCPURoutes) {
       CLIENT_A,
       RouteNextHopEntry(TO_CPU, DISTANCE));
   // Check recursive resolution for to_cpu routes
-  RouteNextHops v4nexthops = makeNextHops({"10.10.10.10"});
+  RouteNextHopSet v4nexthops = makeNextHops({"10.10.10.10"});
   u1.addRoute(
       rid,
       IPAddress("20.20.20.0"),
       24,
       CLIENT_A,
       RouteNextHopEntry(v4nexthops, DISTANCE));
-  RouteNextHops v6nexthops = makeNextHops({"2001::0"});
+  RouteNextHopSet v6nexthops = makeNextHops({"2001::0"});
   u1.addRoute(
       rid,
       IPAddress("2001:1::"),
@@ -1988,8 +2014,8 @@ TEST(Route, serializeRouteTable) {
 
   auto rid = RouterID(0);
   // 2 different nexthops
-  RouteNextHops nhop1 = makeNextHops({"1.1.1.10"}); // resolved by intf 1
-  RouteNextHops nhop2 = makeNextHops({"2.2.2.10"}); // resolved by intf 2
+  RouteNextHopSet nhop1 = makeNextHops({"1.1.1.10"}); // resolved by intf 1
+  RouteNextHopSet nhop2 = makeNextHops({"2.2.2.10"}); // resolved by intf 2
   // 4 prefixes
   RouteV4::Prefix r1{IPAddressV4("10.1.1.0"), 24};
   RouteV4::Prefix r2{IPAddressV4("20.1.1.0"), 24};
@@ -2026,31 +2052,33 @@ TEST(Route, serializeRouteTable) {
   EXPECT_ROUTETABLERIB_MATCH(origRt->getRibV6(), desRt->getRibV6());
 }
 
-// Test utility functions for converting RouteNextHops to thrift and back
+// Test utility functions for converting RouteNextHopSet to thrift and back
 TEST(RouteTypes, toFromRouteNextHops) {
-  RouteNextHops nhs;
-
+  RouteNextHopSet nhs;
   // Non v4 link-local address without interface scoping
   nhs.emplace(
-      RouteNextHop::createNextHop(folly::IPAddress("10.0.0.1"), folly::none));
+      UnresolvedNextHop(folly::IPAddress("10.0.0.1"), UCMP_DEFAULT_WEIGHT));
 
-  // v4 link-local address with/without interface scoping
-  nhs.emplace(RouteNextHop::createNextHop(
-      folly::IPAddress("169.254.0.1"), folly::none));
-  nhs.emplace(RouteNextHop::createNextHop(
-      folly::IPAddress("169.254.0.2"), InterfaceID(2)));
+  // v4 link-local address without interface scoping
+  nhs.emplace(
+      UnresolvedNextHop(folly::IPAddress("169.254.0.1"), UCMP_DEFAULT_WEIGHT));
 
   // Non v6 link-local address without interface scoping
-  nhs.emplace(RouteNextHop::createNextHop(
-      folly::IPAddress("face:b00c::1"), folly::none));
+  nhs.emplace(
+      UnresolvedNextHop(folly::IPAddress("face:b00c::1"), UCMP_DEFAULT_WEIGHT));
 
   // v6 link-local address with interface scoping
-  nhs.emplace(
-      RouteNextHop::createNextHop(folly::IPAddress("fe80::1"), InterfaceID(4)));
+  nhs.emplace(ResolvedNextHop(
+      folly::IPAddress("fe80::1"), InterfaceID(4), UCMP_DEFAULT_WEIGHT));
 
-  // Conver to thrift object
-  auto nhAddrs = util::fromRouteNextHops(nhs);
-  ASSERT_EQ(5, nhAddrs.size());
+  // v6 link-local address without interface scoping
+  EXPECT_THROW(
+      nhs.emplace(UnresolvedNextHop(folly::IPAddress("fe80::1"), 42)),
+      FbossError);
+
+  // Convert to thrift object
+  auto nhts = util::fromRouteNextHopSet(nhs);
+  ASSERT_EQ(4, nhts.size());
 
   auto verify = [&](const std::string& ipaddr,
                     folly::Optional<InterfaceID> intf) {
@@ -2060,28 +2088,27 @@ TEST(RouteTypes, toFromRouteNextHops) {
       bAddr.ifName = util::createTunIntfName(intf.value());
     }
     bool found = false;
-    for (const auto& entry : nhAddrs) {
-      if (entry == bAddr) {
+    for (const auto& entry : nhts) {
+      if (entry.address == bAddr) {
         if (intf.hasValue()) {
-          EXPECT_TRUE(entry.__isset.ifName);
-          EXPECT_EQ(bAddr.ifName, entry.ifName);
+          EXPECT_TRUE(entry.address.__isset.ifName);
+          EXPECT_EQ(bAddr.ifName, entry.address.ifName);
         }
         found = true;
         break;
       }
     }
-    LOG(INFO) << "**** " << ipaddr;
+    XLOG(INFO) << "**** " << ipaddr;
     EXPECT_TRUE(found);
   };
 
   verify("10.0.0.1", folly::none);
   verify("169.254.0.1", folly::none);
-  verify("169.254.0.2", folly::none); // interface scoping is ignored for v4
   verify("face:b00c::1", folly::none);
   verify("fe80::1", InterfaceID(4));
 
-  // Convert back to RouteNextHops
-  auto newNhs = util::toRouteNextHops(nhAddrs);
+  // Convert back to RouteNextHopSet
+  auto newNhs = util::toRouteNextHopSet(nhts);
   EXPECT_EQ(nhs, newNhs);
 
   //
@@ -2093,20 +2120,53 @@ TEST(RouteTypes, toFromRouteNextHops) {
   addr = facebook::network::toBinaryAddress(folly::IPAddress("10.0.0.1"));
   addr.__isset.ifName = true;
   addr.ifName = "fboss10";
+  NextHopThrift nht;
+  nht.address = addr;
   {
-    auto routeNexthop = RouteNextHop::fromThrift(addr);
-    EXPECT_EQ(folly::IPAddress("10.0.0.1"), routeNexthop.addr());
-    EXPECT_EQ(folly::none, routeNexthop.intfID());
+    NextHop nh = util::fromThrift(nht);
+    EXPECT_EQ(folly::IPAddress("10.0.0.1"), nh.addr());
+    EXPECT_EQ(folly::none, nh.intfID());
   }
 
   addr = facebook::network::toBinaryAddress(folly::IPAddress("face::1"));
   addr.__isset.ifName = true;
   addr.ifName = "fboss10";
+  nht.address = addr;
   {
-    auto routeNexthop = RouteNextHop::fromThrift(addr);
-    EXPECT_EQ(folly::IPAddress("face::1"), routeNexthop.addr());
-    EXPECT_EQ(folly::none, routeNexthop.intfID());
+    NextHop nh = util::fromThrift(nht);
+    EXPECT_EQ(folly::IPAddress("face::1"), nh.addr());
+    EXPECT_EQ(folly::none, nh.intfID());
   }
+
+  addr = facebook::network::toBinaryAddress(folly::IPAddress("fe80::1"));
+  addr.__isset.ifName = true;
+  addr.ifName = "fboss10";
+  nht.address = addr;
+  {
+    NextHop nh = util::fromThrift(nht);
+    EXPECT_EQ(folly::IPAddress("fe80::1"), nh.addr());
+    EXPECT_EQ(InterfaceID(10), nh.intfID());
+  }
+}
+
+TEST(Route, nextHopTest) {
+  folly::IPAddress addr("1.1.1.1");
+  NextHop unh = UnresolvedNextHop(addr, 0);
+  NextHop rnh = ResolvedNextHop(addr, InterfaceID(1), 0);
+  EXPECT_FALSE(unh.isResolved());
+  EXPECT_TRUE(rnh.isResolved());
+  EXPECT_EQ(unh.addr(), addr);
+  EXPECT_EQ(rnh.addr(), addr);
+  EXPECT_THROW(unh.intf(), folly::OptionalEmptyException);
+  EXPECT_EQ(rnh.intf(), InterfaceID(1));
+  EXPECT_NE(unh, rnh);
+  auto unh2 = unh;
+  EXPECT_EQ(unh, unh2);
+  auto rnh2 = rnh;
+  EXPECT_EQ(rnh, rnh2);
+  EXPECT_FALSE(rnh < unh && unh < rnh);
+  EXPECT_TRUE(rnh < unh || unh < rnh);
+  EXPECT_TRUE(unh < rnh && rnh > unh);
 }
 
 TEST(Route, nodeMapMatchesRadixTree) {
@@ -2115,9 +2175,9 @@ TEST(Route, nodeMapMatchesRadixTree) {
   auto tables1 = stateV1->getRouteTables();
 
   auto rid = RouterID(0);
-  RouteNextHops nhop1 = makeNextHops({"1.1.1.10"}); // resolved by intf 1
-  RouteNextHops nhop2 = makeNextHops({"2.2.2.10"}); // resolved by intf 2
-  RouteNextHops nonResolvedHops = makeNextHops({"1.1.3.10"}); // Non-resolved
+  RouteNextHopSet nhop1 = makeNextHops({"1.1.1.10"}); // resolved by intf 1
+  RouteNextHopSet nhop2 = makeNextHops({"2.2.2.10"}); // resolved by intf 2
+  RouteNextHopSet nonResolvedHops = makeNextHops({"1.1.3.10"}); // Non-resolved
 
   RouteV4::Prefix r1{IPAddressV4("10.1.1.0"), 24};
   RouteV4::Prefix r2{IPAddressV4("20.1.1.0"), 24};
@@ -2169,4 +2229,274 @@ TEST(Route, nodeMapMatchesRadixTree) {
   // both r5 and r6 should be unpublished now
   ASSERT_FALSE(GET_ROUTE_V4(tables4, rid, r5)->isPublished());
   ASSERT_FALSE(GET_ROUTE_V4(tables4, rid, r6)->isPublished());
+}
+
+/*
+ * Class that makes it easy to run tests with the following
+ * configurable entities:
+ * Four interfaces: I1, I2, I3, I4
+ * Three routes which require resolution: R1, R2, R3
+ */
+class UcmpTest : public ::testing::Test {
+ public:
+  void SetUp() override {
+    stateV1_ = applyInitConfig();
+    ASSERT_NE(nullptr, stateV1_);
+    rid_ = RouterID(0);
+  }
+  void resolveRoutes(std::vector<std::pair<folly::IPAddress, RouteNextHopSet>>
+                         networkAndNextHops) {
+    RouteUpdater ru(stateV1_->getRouteTables());
+    for (const auto& nnhs : networkAndNextHops) {
+      folly::IPAddress net = nnhs.first;
+      RouteNextHopSet nhs = nnhs.second;
+      ru.addRoute(rid_, net, mask, CLIENT_A, RouteNextHopEntry(nhs, DISTANCE));
+    }
+    auto tables = ru.updateDone();
+    ASSERT_NE(nullptr, tables);
+    EXPECT_NODEMAP_MATCH(tables);
+    tables->publish();
+    for (const auto& nnhs : networkAndNextHops) {
+      folly::IPAddress net = nnhs.first;
+      auto pfx = folly::sformat("{}/{}", net.str(), mask);
+      auto r = GET_ROUTE_V4(tables, rid_, pfx);
+      EXPECT_RESOLVED(r);
+      EXPECT_FALSE(r->isConnected());
+      resolvedRoutes.push_back(r);
+    }
+  }
+
+  void runRecursiveTest(
+      const std::vector<RouteNextHopSet>& routeUnresolvedNextHops,
+      const std::vector<NextHopWeight>& resolvedWeights) {
+    std::vector<std::pair<folly::IPAddress, RouteNextHopSet>>
+        networkAndNextHops;
+    auto netsIter = nets.begin();
+    for (const auto& nhs : routeUnresolvedNextHops) {
+      networkAndNextHops.push_back({*netsIter, nhs});
+      netsIter++;
+    }
+    resolveRoutes(networkAndNextHops);
+
+    RouteNextHopSet expFwd1;
+    uint8_t i = 0;
+    for (const auto& w : resolvedWeights) {
+      expFwd1.emplace(ResolvedNextHop(intfIps[i], InterfaceID(i+1), w));
+      ++i;
+    }
+    EXPECT_EQ(expFwd1, resolvedRoutes[0]->getForwardInfo().getNextHopSet());
+  }
+
+  void runTwoDeepRecursiveTest(
+      const std::vector<std::vector<NextHopWeight>>& unresolvedWeights,
+      const std::vector<NextHopWeight>& resolvedWeights) {
+    std::vector<RouteNextHopSet> routeUnresolvedNextHops;
+    auto rsIter = rnhs.begin();
+    for (const auto& ws : unresolvedWeights) {
+      auto nhIter = rsIter->begin();
+      RouteNextHopSet nexthops;
+      for (const auto& w : ws) {
+        nexthops.insert(UnresolvedNextHop(*nhIter, w));
+        nhIter++;
+      }
+      routeUnresolvedNextHops.push_back(nexthops);
+      rsIter++;
+    }
+    runRecursiveTest(routeUnresolvedNextHops, resolvedWeights);
+  }
+
+  void runVaryFromHundredTest(
+      NextHopWeight w,
+      const std::vector<NextHopWeight>& resolvedWeights) {
+    runRecursiveTest(
+        {{UnresolvedNextHop(intfIp1, 100),
+          UnresolvedNextHop(intfIp2, 100),
+          UnresolvedNextHop(intfIp3, 100),
+          UnresolvedNextHop(intfIp4, w)}},
+        resolvedWeights);
+  }
+
+  std::vector<std::shared_ptr<Route<folly::IPAddressV4>>> resolvedRoutes;
+  const folly::IPAddress intfIp1{"1.1.1.10"};
+  const folly::IPAddress intfIp2{"2.2.2.20"};
+  const folly::IPAddress intfIp3{"3.3.3.30"};
+  const folly::IPAddress intfIp4{"4.4.4.40"};
+  const std::array<folly::IPAddress, 4> intfIps{{intfIp1,
+                                                intfIp2,
+                                                intfIp3,
+                                                intfIp4}};
+  const folly::IPAddress r2Nh{"42.42.42.42"};
+  const folly::IPAddress r3Nh{"43.43.43.43"};
+  std::array<folly::IPAddress, 2> r1Nhs{{r2Nh, r3Nh}};
+  std::array<folly::IPAddress, 2> r2Nhs{{intfIp1, intfIp2}};
+  std::array<folly::IPAddress, 2> r3Nhs{{intfIp3, intfIp4}};
+  const std::array<std::array<folly::IPAddress, 2>, 3> rnhs{{r1Nhs,
+                                                            r2Nhs,
+                                                            r3Nhs}};
+  const folly::IPAddress r1Net{"41.41.41.0"};
+  const folly::IPAddress r2Net{"42.42.42.0"};
+  const folly::IPAddress r3Net{"43.43.43.0"};
+  const std::array<folly::IPAddress, 3> nets{{r1Net, r2Net, r3Net}};
+  const uint8_t mask{24};
+ private:
+  RouterID rid_;
+  std::shared_ptr<SwitchState> stateV1_;
+};
+
+/*
+ * Four interfaces: I1, I2, I3, I4
+ * Three routes which require resolution: R1, R2, R3
+ * R1 has R2 and R3 as next hops with weights 3 and 2
+ * R2 has I1 and I2 as next hops with weights 5 and 4
+ * R3 has I3 and I4 as next hops with weights 3 and 2
+ * expect R1 to resolve to I1:25, I2:20, I3:18, I4:12
+ */
+TEST_F(UcmpTest, recursiveUcmp) {
+  runTwoDeepRecursiveTest({{3, 2}, {5, 4}, {3, 2}}, {25, 20, 18, 12});
+}
+
+/*
+ * Two interfaces: I1, I2
+ * Three routes which require resolution: R1, R2, R3
+ * R1 has R2 and R3 as next hops with weights 2 and 1
+ * R2 has I1 and I2 as next hops with weights 1 and 1
+ * R3 has I1 as next hop with weight 1
+ * expect R1 to resolve to I1:2, I2:1
+ */
+TEST_F(UcmpTest, recursiveUcmpDuplicateIntf) {
+  runRecursiveTest(
+      {{UnresolvedNextHop(r2Nh, 2), UnresolvedNextHop(r3Nh, 1)},
+       {UnresolvedNextHop(intfIp1, 1), UnresolvedNextHop(intfIp2, 1)},
+       {UnresolvedNextHop(intfIp1, 1)}},
+      {2, 1});
+}
+
+/*
+ * Two interfaces: I1, I2
+ * Three routes which require resolution: R1, R2, R3
+ * R1 has R2 and R3 as next hops with ECMP
+ * R2 has I1 and I2 as next hops with ECMP
+ * R3 has I1 as next hop with weight 1
+ * expect R1 to resolve to ECMP
+ */
+TEST_F(UcmpTest, recursiveEcmpDuplicateIntf) {
+  runRecursiveTest(
+      {{UnresolvedNextHop(r2Nh, ECMP_WEIGHT),
+        UnresolvedNextHop(r3Nh, ECMP_WEIGHT)},
+       {UnresolvedNextHop(intfIp1, ECMP_WEIGHT),
+        UnresolvedNextHop(intfIp2, ECMP_WEIGHT)},
+       {UnresolvedNextHop(intfIp1, 1)}},
+      {ECMP_WEIGHT, ECMP_WEIGHT});
+}
+
+/*
+ * Two interfaces: I1, I2
+ * One route which requires resolution: R1
+ * R1 has I1 and I2 as next hops with weights 0 (ECMP) and 1
+ * expect R1 to resolve to ECMP between I1, I2
+ */
+TEST_F(UcmpTest, mixedUcmpVsEcmp_EcmpWins) {
+  runRecursiveTest(
+      {{UnresolvedNextHop(intfIp1, ECMP_WEIGHT),
+        UnresolvedNextHop(intfIp2, 1)}},
+      {ECMP_WEIGHT, ECMP_WEIGHT});
+}
+
+/*
+ * Four interfaces: I1, I2, I3, I4
+ * Three routes which require resolution: R1, R2, R3
+ * R1 has R2 and R3 as next hops with weights 3 and 2
+ * R2 has I1 and I2 as next hops with weights 5 and 4
+ * R3 has I3 and I4 as next hops with ECMP
+ * expect R1 to resolve to ECMP between I1, I2, I3, I4
+ */
+TEST_F(UcmpTest, recursiveEcmpPropagatesUp) {
+  runTwoDeepRecursiveTest({{3, 2}, {5, 4}, {0, 0}}, {0, 0, 0, 0});
+}
+
+/*
+ * Four interfaces: I1, I2, I3, I4
+ * Three routes which require resolution: R1, R2, R3
+ * R1 has R2 and R3 as next hops with weights 3 and 2
+ * R2 has I1 and I2 as next hops with weights 5 and 4
+ * R3 has I3 and I4 as next hops with weights 0 (ECMP) and 1
+ * expect R1 to resolve to ECMP between I1, I2, I3, I4
+ */
+TEST_F(UcmpTest, recursiveMixedEcmpPropagatesUp) {
+  runTwoDeepRecursiveTest({{3, 2}, {5, 4}, {0, 1}}, {0, 0, 0, 0});
+}
+
+/*
+ * Four interfaces: I1, I2, I3, I4
+ * Three routes which require resolution: R1, R2, R3
+ * R1 has R2 and R3 as next hops with ECMP
+ * R2 has I1 and I2 as next hops with weights 5 and 4
+ * R3 has I3 and I4 as next hops with weights 3 and 2
+ * expect R1 to resolve to ECMP between I1, I2, I3, I4
+ */
+TEST_F(UcmpTest, recursiveEcmpPropagatesDown) {
+  runTwoDeepRecursiveTest({{0, 0}, {5, 4}, {3, 2}}, {0, 0, 0, 0});
+}
+
+/*
+ * Two interfaces: I1, I2
+ * Two routes which require resolution: R1, R2
+ * R1 has I1 and I2 as next hops with ECMP
+ * R2 has I1 and I2 as next hops with weights 2 and 1
+ * expect R1 to resolve to ECMP between I1, I2
+ * expect R2 to resolve to I1:2, I2: 1
+ */
+TEST_F(UcmpTest, separateEcmpUcmp) {
+  runRecursiveTest(
+      {{UnresolvedNextHop(intfIp1, ECMP_WEIGHT),
+        UnresolvedNextHop(intfIp2, ECMP_WEIGHT)},
+       {UnresolvedNextHop(intfIp1, 2), UnresolvedNextHop(intfIp2, 1)}},
+      {ECMP_WEIGHT, ECMP_WEIGHT});
+  RouteNextHopSet route2ExpFwd;
+  route2ExpFwd.emplace(ResolvedNextHop(IPAddress("1.1.1.10"), InterfaceID(1), 2));
+  route2ExpFwd.emplace(ResolvedNextHop(IPAddress("2.2.2.20"), InterfaceID(2), 1));
+  EXPECT_EQ(route2ExpFwd, resolvedRoutes[1]->getForwardInfo().getNextHopSet());
+}
+
+// The following set of tests will start with 4 next hops all weight 100
+// then vary one next hop by 10 weight increments to 90, 80, ... , 10
+
+TEST_F(UcmpTest, Hundred) {
+  runVaryFromHundredTest(100, {1, 1, 1, 1});
+}
+
+TEST_F(UcmpTest, Ninety) {
+  runVaryFromHundredTest(90, {10, 10, 10, 9});
+}
+
+TEST_F(UcmpTest, Eighty) {
+  runVaryFromHundredTest(80, {5, 5, 5, 4});
+}
+
+TEST_F(UcmpTest, Seventy) {
+  runVaryFromHundredTest(70, {10, 10, 10, 7});
+}
+
+TEST_F(UcmpTest, Sixty) {
+  runVaryFromHundredTest(60, {5, 5, 5, 3});
+}
+
+TEST_F(UcmpTest, Fifty) {
+  runVaryFromHundredTest(50, {2, 2, 2, 1});
+}
+
+TEST_F(UcmpTest, Forty) {
+  runVaryFromHundredTest(40, {5, 5, 5, 2});
+}
+
+TEST_F(UcmpTest, Thirty) {
+  runVaryFromHundredTest(30, {10, 10, 10, 3});
+}
+
+TEST_F(UcmpTest, Twenty) {
+  runVaryFromHundredTest(20, {5, 5, 5, 1});
+}
+
+TEST_F(UcmpTest, Ten) {
+  runVaryFromHundredTest(10, {10, 10, 10, 1});
 }

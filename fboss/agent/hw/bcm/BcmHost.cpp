@@ -11,14 +11,15 @@
 #include <string>
 #include <iostream>
 
+#include <folly/logging/xlog.h>
 #include "fboss/agent/Constants.h"
-#include "fboss/agent/state/Interface.h"
-#include "fboss/agent/hw/bcm/BcmError.h"
-#include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmEgress.h"
+#include "fboss/agent/hw/bcm/BcmError.h"
 #include "fboss/agent/hw/bcm/BcmIntf.h"
 #include "fboss/agent/hw/bcm/BcmPort.h"
+#include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmWarmBootCache.h"
+#include "fboss/agent/state/Interface.h"
 
 namespace {
 constexpr auto kIntf = "intf";
@@ -64,9 +65,8 @@ void BcmHost::setEgressId(opennsl_if_t eid) {
     hw_->writableHostTable()->derefEgress(egressId_);
   }
   hw_->writableHostTable()->incEgressReference(eid);
-  VLOG(3) << "set host object for " << key_.str()
-          << " to @egress " << eid
-          << " from @egress " << egressId_;
+  XLOG(DBG3) << "set host object for " << key_.str() << " to @egress " << eid
+             << " from @egress " << egressId_;
   egressId_ = eid;
 }
 
@@ -120,20 +120,20 @@ void BcmHost::addToBcmHostTable(bool isMultipath, bool replace) {
         existingHost.l3a_intf == newHost.l3a_intf;
     };
     if (!equivalent(host, vrfIp2HostCitr->second)) {
-      LOG(FATAL) << "Host entries should never change, addr: " << addr
-        <<" existing: " << hostStr(vrfIp2HostCitr->second)
-        <<" new: " << hostStr(host);
+      XLOG(FATAL) << "Host entries should never change, addr: " << addr
+                  << " existing: " << hostStr(vrfIp2HostCitr->second)
+                  << " new: " << hostStr(host);
     } else {
-      VLOG(1) << "Host entry for " << addr << " already exists";
+      XLOG(DBG1) << "Host entry for " << addr << " already exists";
     }
     warmBootCache->programmed(vrfIp2HostCitr);
   } else {
-    VLOG(3) << "Adding host entry for : " << addr;
+    XLOG(DBG3) << "Adding host entry for : " << addr;
     auto rc = opennsl_l3_host_add(hw_->getUnit(), &host);
     bcmCheckError(rc, "failed to program L3 host object for ", key_.str(),
       " @egress ", getEgressId());
-    VLOG(3) << "created L3 host object for " << key_.str() << " @egress "
-            << getEgressId();
+    XLOG(DBG3) << "created L3 host object for " << key_.str() << " @egress "
+               << getEgressId();
   }
   addedInHW_ = true;
 }
@@ -146,8 +146,8 @@ void BcmHost::program(opennsl_if_t intf, const MacAddress* mac,
   const auto vrf = key_.getVrf();
   // get the egress object and then update it with the new MAC
   if (egressId_ == BcmEgressBase::INVALID) {
-    VLOG(3) << "Host entry for " << key_.str()
-            << " does not have an egress, create one.";
+    XLOG(DBG3) << "Host entry for " << key_.str()
+               << " does not have an egress, create one.";
     createdEgress = std::make_unique<BcmEgress>(hw_);
     egressPtr = createdEgress.get();
   } else {
@@ -174,10 +174,9 @@ void BcmHost::program(opennsl_if_t intf, const MacAddress* mac,
     addToBcmHostTable();
   }
 
-  VLOG(1) << "Updating egress " << egressPtr->getID() << " from "
-          << (isTrunk() ? "trunk port " : "physical port ")
-          << (isTrunk() ? trunk_ :  port_)
-          << " to physical port " << port;
+  XLOG(DBG1) << "Updating egress " << egressPtr->getID() << " from "
+             << (isTrunk() ? "trunk port " : "physical port ")
+             << (isTrunk() ? trunk_ : port_) << " to physical port " << port;
 
   // TODO(samank): port_ or trunk_ being set is used as a proxy for whether
   // egressId_ is in the set of resolved egresses. We should instead simply
@@ -266,10 +265,9 @@ void BcmHost::programToTrunk(opennsl_if_t intf,
     addToBcmHostTable();
   }
 
-  VLOG(1) << "Updating egress " << egress->getID() << " from "
-          << (isTrunk() ? "trunk port " : "physical port ")
-          << (isTrunk() ? trunk_ :  port_)
-          << " to trunk port " << trunk;
+  XLOG(DBG1) << "Updating egress " << egress->getID() << " from "
+             << (isTrunk() ? "trunk port " : "physical port ")
+             << (isTrunk() ? trunk_ : port_) << " to trunk port " << trunk;
 
   hw_->writableHostTable()->resolved(egressId_);
 
@@ -293,10 +291,10 @@ BcmHost::~BcmHost() {
     initHostCommon(&host);
     auto rc = opennsl_l3_host_delete(hw_->getUnit(), &host);
     bcmLogFatal(rc, hw_, "failed to delete L3 host object for ", key_.str());
-    VLOG(3) << "deleted L3 host object for " << key_.str();
+    XLOG(DBG3) << "deleted L3 host object for " << key_.str();
   } else {
-    VLOG(3) << "No need to delete L3 host object for " << key_.str()
-            << " as it was not added to the HW before";
+    XLOG(DBG3) << "No need to delete L3 host object for " << key_.str()
+               << " as it was not added to the HW before";
   }
   if (egressId_ == BcmEgressBase::INVALID) {
     return;
@@ -321,7 +319,7 @@ BcmEcmpHost::BcmEcmpHost(const BcmSwitchIf *hw,
   CHECK_GT(fwd.size(), 0);
   BcmHostTable *table = hw_->writableHostTable();
   BcmEcmpEgress::Paths paths;
-  std::vector<const RouteNextHop *> prog;
+  std::vector<const NextHop *> prog;
   SCOPE_FAIL {
     for (auto nhopPtr : prog) {
       table->derefBcmHost(BcmHostKey(vrf_, *nhopPtr));
@@ -341,14 +339,15 @@ BcmEcmpHost::BcmEcmpHost(const BcmSwitchIf *hw,
       const auto intf = hw->getIntfTable()->getBcmIntf(nhop.intf());
       host->programToCPU(intf->getBcmIfId());
     }
-    paths.insert(host->getEgressId());
+    for (int i=0; i<nhop.weight(); ++i) {
+      paths.insert(host->getEgressId());
+    }
   }
   if (paths.size() == 1) {
     // just one path. No BcmEcmpEgress object this case.
     egressId_ = *paths.begin();
   } else {
     auto ecmp = std::make_unique<BcmEcmpEgress>(hw, std::move(paths));
-    //ecmp->program(paths, fwd.size());
     egressId_ = ecmp->getID();
     ecmpEgressId_ = egressId_;
     hw_->writableHostTable()->insertBcmEgress(std::move(ecmp));
@@ -359,7 +358,7 @@ BcmEcmpHost::BcmEcmpHost(const BcmSwitchIf *hw,
 BcmEcmpHost::~BcmEcmpHost() {
   // Deref ECMP egress first since the ECMP egress entry holds references
   // to egress entries.
-  VLOG(3) << "Decremented reference for egress object for " << fwd_;
+  XLOG(DBG3) << "Decremented reference for egress object for " << fwd_;
   hw_->writableHostTable()->derefEgress(ecmpEgressId_);
   BcmHostTable *table = hw_->writableHostTable();
   for (const auto& nhop : fwd_) {
@@ -384,8 +383,8 @@ HostT* BcmHostTable::incRefOrCreateBcmHostImpl(
   if (iter != map->cend()) {
     // there was an entry already there
     iter->second.second++;  // increase the reference counter
-    VLOG(3) << "referenced " << key
-            << ". new ref count: " << iter->second.second;
+    XLOG(DBG3) << "referenced " << key
+               << ". new ref count: " << iter->second.second;
     return iter->second.first.get();
   }
   auto newHost = std::make_unique<HostT>(hw_, key);
@@ -393,8 +392,8 @@ HostT* BcmHostTable::incRefOrCreateBcmHostImpl(
   auto ret = map->emplace(key, std::make_pair(std::move(newHost), 1));
   CHECK_EQ(ret.second, true)
     << "must insert BcmHost/BcmEcmpHost as a new entry in this case";
-  VLOG(3) << "created " << key
-          << ". new ref count: " << ret.first->second.second;
+  XLOG(DBG3) << "created " << key
+             << ". new ref count: " << ret.first->second.second;
   return hostPtr;
 }
 
@@ -405,6 +404,27 @@ BcmHost* BcmHostTable::incRefOrCreateBcmHost(const BcmHostKey& hostKey) {
 BcmEcmpHost* BcmHostTable::incRefOrCreateBcmEcmpHost(
     const BcmEcmpHostKey& key) {
   return incRefOrCreateBcmHostImpl(&ecmpHosts_, key);
+}
+
+uint32_t BcmHostTable::getReferenceCount(const BcmEcmpHostKey& key)
+    const noexcept {
+  return getReferenceCountImpl(&ecmpHosts_, key);
+}
+
+uint32_t BcmHostTable::getReferenceCount(const BcmHostKey& key)
+    const noexcept {
+  return getReferenceCountImpl(&hosts_, key);
+}
+
+template<typename KeyT, typename HostT>
+uint32_t BcmHostTable::getReferenceCountImpl(
+    const HostMap<KeyT, HostT>* map,
+    const KeyT& key) const noexcept {
+  auto iter = map->find(key);
+  if (iter == map->cend()) {
+    return 0;
+  }
+  return iter->second.second;
 }
 
 template<typename KeyT, typename HostT>
@@ -458,11 +478,12 @@ HostT* BcmHostTable::derefBcmHostImpl(
   auto& entry = iter->second;
   CHECK_GT(entry.second, 0);
   if (--entry.second == 0) {
-    VLOG(3) << "erase host " << key << " from host map";
+    XLOG(DBG3) << "erase host " << key << " from host map";
     map->erase(iter);
     return nullptr;
   }
-  VLOG(3) << "dereferenced host " << key << ". new ref count: " << entry.second;
+  XLOG(DBG3) << "dereferenced host " << key
+             << ". new ref count: " << entry.second;
   return entry.first.get();
 }
 
@@ -484,8 +505,8 @@ BcmEgressBase* BcmHostTable::incEgressReference(opennsl_if_t egressId) {
   auto it = egressMap_.find(egressId);
   CHECK(it != egressMap_.end());
   it->second.second++;
-  VLOG(3) << "referenced egress " << egressId
-          << ". new ref count: " << it->second.second;
+  XLOG(DBG3) << "referenced egress " << egressId
+             << ". new ref count: " << it->second.second;
   return it->second.first.get();
 }
 
@@ -502,12 +523,12 @@ BcmEgressBase* BcmHostTable::derefEgress(opennsl_if_t egressId) {
       CHECK(numEcmpEgressProgrammed_ > 0);
       numEcmpEgressProgrammed_--;
     }
-    VLOG(3) << "erase egress " << egressId << " from egress map";
+    XLOG(DBG3) << "erase egress " << egressId << " from egress map";
     egressMap_.erase(egressId);
     return nullptr;
   }
-  VLOG(3) << "dereferenced egress " << egressId
-          << ". new ref count: " << it->second.second;
+  XLOG(DBG3) << "dereferenced egress " << egressId
+             << ". new ref count: " << it->second.second;
   return it->second.first.get();
 }
 
@@ -537,7 +558,7 @@ void BcmHostTable::updatePortToEgressMapping(
       existingCloned->addEgressId(egressId);
       newMapping->updatePortAndEgressIds(existingCloned);
     } else {
-      PortAndEgressIdsFields::EgressIds egressIds;
+      PortAndEgressIdsFields::EgressIdSet egressIds;
       egressIds.insert(egressId);
       auto toAdd = std::make_shared<PortAndEgressIds>(newGPort, egressIds);
       newMapping->addPortAndEgressIds(toAdd);
@@ -571,7 +592,7 @@ BcmEgressBase* BcmHostTable::getEgressObjectIf(opennsl_if_t egress) {
 void BcmHostTable::insertBcmEgress(
     std::unique_ptr<BcmEgressBase> egress) {
   auto id = egress->getID();
-  VLOG(3) << "insert egress " << id << " into egress map";
+  XLOG(DBG3) << "insert egress " << id << " into egress map";
   if (egress->isEcmp()) {
     numEcmpEgressProgrammed_++;
   }
@@ -586,8 +607,8 @@ void BcmHostTable::warmBootHostEntriesSynced() {
   // Ideally we should call this only for ports which were
   // down when we went down, but since we don't record that
   // signal up for all up ports.
-  VLOG(1) << "Warm boot host entries synced, signalling link "
-    "up for all up ports";
+  XLOG(DBG1) << "Warm boot host entries synced, signalling link "
+                "up for all up ports";
   opennsl_port_t idx;
   OPENNSL_PBMP_ITER(pcfg.port, idx) {
     // Some ports might have come up or gone down during
@@ -677,28 +698,35 @@ void BcmHostTable::linkStateChangedMaybeLocked(
 int BcmHostTable::removeAllEgressesFromEcmpCallback(
     int unit,
     opennsl_l3_egress_ecmp_t* ecmp,
-    int /*intfCount*/,
-    opennsl_if_t* /*intfArray*/,
+    int intfCount,
+    opennsl_if_t* intfArray,
     void* userData) {
-  Paths* paths = static_cast<Paths*>(userData);
-  for (const auto& egrId : *paths) {
-    BcmEcmpEgress::removeEgressIdHwNotLocked(unit, ecmp->ecmp_intf, egrId);
+  // loop over the egresses present in the ecmp group. For each that is
+  // in the passed in list of egresses to remove (userData),
+  // remove it from the ecmp group.
+  EgressIdSet* egressesToRemove = static_cast<EgressIdSet*>(userData);
+  for (int i = 0; i < intfCount; ++i) {
+    opennsl_if_t egressInHw = intfArray[i];
+    if (egressesToRemove->find(egressInHw) != egressesToRemove->end()) {
+      BcmEcmpEgress::removeEgressIdHwNotLocked(
+          unit, ecmp->ecmp_intf, egressInHw);
+    }
   }
   return 0;
 }
 
 void BcmHostTable::egressResolutionChangedHwNotLocked(
     int unit,
-    const Paths& affectedPaths,
+    const EgressIdSet& affectedEgressIds,
     bool up) {
   CHECK(!up);
-  Paths tmpPaths(affectedPaths);
+  EgressIdSet tmpEgressIds(affectedEgressIds);
   opennsl_l3_egress_ecmp_traverse(
-      unit, removeAllEgressesFromEcmpCallback, &tmpPaths);
+      unit, removeAllEgressesFromEcmpCallback, &tmpEgressIds);
 }
 
 void BcmHostTable::egressResolutionChangedHwLocked(
-    const Paths& affectedPaths,
+    const EgressIdSet& affectedEgressIds,
     BcmEcmpEgress::Action action) {
   if (action == BcmEcmpEgress::Action::SKIP) {
     return;
@@ -715,18 +743,18 @@ void BcmHostTable::egressResolutionChangedHwLocked(
     // our map should be pointing to valid Ecmp egress object for
     // a ecmp egress Id anyways
     CHECK(ecmpEgress);
-    for (auto path : affectedPaths) {
+    for (auto egrId : affectedEgressIds) {
       switch (action) {
         case BcmEcmpEgress::Action::EXPAND:
-          ecmpEgress->pathReachableHwLocked(path);
+          ecmpEgress->pathReachableHwLocked(egrId);
           break;
         case BcmEcmpEgress::Action::SHRINK:
-          ecmpEgress->pathUnreachableHwLocked(path);
+          ecmpEgress->pathUnreachableHwLocked(egrId);
           break;
         case BcmEcmpEgress::Action::SKIP:
           break;
         default:
-          LOG(FATAL) << "BcmEcmpEgress::Action matching not exhaustive";
+          XLOG(FATAL) << "BcmEcmpEgress::Action matching not exhaustive";
           break;
       }
     }
@@ -739,9 +767,10 @@ void BcmHostTable::egressResolutionChangedHwLocked(
    * Conversely post a FIB sync we won't have any ecmp egress IDs
    * in the warm boot cache
    */
+
   for (const auto& ecmpAndEgressIds :
        hw_->getWarmBootCache()->ecmp2EgressIds()) {
-    for (auto path : affectedPaths) {
+    for (auto path : affectedEgressIds) {
       switch (action) {
         case BcmEcmpEgress::Action::EXPAND:
           BcmEcmpEgress::addEgressIdHwLocked(
@@ -757,7 +786,7 @@ void BcmHostTable::egressResolutionChangedHwLocked(
         case BcmEcmpEgress::Action::SKIP:
           break;
         default:
-          LOG(FATAL) << "BcmEcmpEgress::Action matching not exhaustive";
+          XLOG(FATAL) << "BcmEcmpEgress::Action matching not exhaustive";
           break;
       }
     }

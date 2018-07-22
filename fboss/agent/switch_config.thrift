@@ -2,6 +2,7 @@
 # Copyright 2004-present Facebook. All Rights Reserved.
 #
 namespace py neteng.fboss.switch_config
+namespace py3 neteng.fboss
 namespace py.asyncio neteng.fboss.asyncio.switch_config
 namespace cpp2 facebook.fboss.cfg
 
@@ -53,6 +54,7 @@ enum PortSpeed {
   FORTYG = 40000;               // 40G
   FIFTYG = 50000;               // 50G
   HUNDREDG = 100000;            // 100G
+  FOURHUNDREDG = 400000;        // 400G
 }
 
 /**
@@ -94,6 +96,18 @@ struct L4PortRange {
 struct PktLenRange {
   1: i16 min
   2: i16 max
+}
+
+enum IpType {
+  ANY = 0,
+  IP = 1,
+  IP4 = 2,
+  IP6 = 3,
+}
+
+struct Ttl {
+  1: i16 value
+  2: i16 mask = 0xFF
 }
 
 enum IpFragMatch {
@@ -186,6 +200,12 @@ struct AclEntry {
 
   19: optional string dstMac
 
+  /* Match TTL if IPv4 and HopLimit if IPv6 */
+  20: optional Ttl ttl
+
+  /* IP type (IPv4, IPv6, ARP, MPLS... */
+  21: optional IpType ipType
+
 }
 
 /*
@@ -200,8 +220,13 @@ struct QueueMatchAction {
   1: i16 queueId
 }
 
+struct PacketCounterMatchAction {
+  1: string counterName
+}
+
 struct MatchAction {
   1: optional QueueMatchAction sendToQueue
+  2: optional PacketCounterMatchAction packetCounter
 }
 
 struct MatchToAction {
@@ -264,12 +289,10 @@ union QueueCongestionDetection {
 // earlyDrop true; ecn false: Early drops for all packets
 // earlyDrop false; ecn true: Tail drops for ECN-disabled, ECN for ECN-enabled
 // earlyDrop true; ecn true: Early drops for ECN-disabled, ECN for ECN-enabled
-struct QueueCongestionBehavior {
-  // Drop packets before congested queues are totally full using an algorithm
-  // like WRED
-  1: bool earlyDrop
-  // Mark congestion enabled packets with Congestion Experienced
-  2: bool ecn
+enum QueueCongestionBehavior {
+  EARLY_DROP = 0 // Drop packets before congested queues are totally full using
+                 // an algorithm like WRED
+  ECN        = 1 // Mark congestion enabled packets with Congestion Experienced
 }
 
 // Configuration for Active Queue Management of a PortQueue.
@@ -297,10 +320,11 @@ struct PortQueue {
   5: optional MMUScalingFactor scalingFactor
   6: required QueueScheduling scheduling
   7: optional string name
-  8: optional i32 length
+  // 8: optional i32 length (deprecated)
   9: optional i32 packetsPerSec
   10: optional i32 sharedBytes
-  11: optional ActiveQueueManagement aqm;
+  // Only Unicast queue supports aqms
+  11: optional list<ActiveQueueManagement> aqms;
 }
 
 struct TrafficPolicyConfig {
@@ -377,11 +401,6 @@ struct Port {
    * An optional configurable string describing the port.
    */
   10: optional string description
-
-  /**
-   * If this is undefined, the global TrafficPolicyConfig will be used
-   */
-  11: optional TrafficPolicyConfig egressTrafficPolicy
 
   /**
    * There are multiple queues per port
@@ -637,6 +656,46 @@ struct SflowCollector {
   2: i16 port
 }
 
+enum LoadBalancerID {
+  ECMP = 1,
+  AGGREGATE_PORT = 2,
+}
+
+enum IPv4Field {
+  SOURCE_ADDRESS      = 1,
+  DESTINATION_ADDRESS = 2
+}
+
+enum IPv6Field {
+  SOURCE_ADDRESS      = 1,
+  DESTINATION_ADDRESS = 2,
+  FLOW_LABEL          = 3
+}
+
+enum TransportField {
+  SOURCE_PORT      = 1,
+  DESTINATION_PORT = 2
+}
+
+struct Fields {
+  1: set<IPv4Field> ipv4Fields
+  2: set<IPv6Field> ipv6Fields
+  3: set<TransportField> transportFields
+}
+
+enum HashingAlgorithm {
+  CRC16_CCITT = 1
+}
+
+struct LoadBalancer {
+  1: LoadBalancerID id
+  2: Fields fieldSelection
+  3: HashingAlgorithm algorithm
+  // If not set, the seed will be chosen so as to remain constant across process
+  // restarts
+  4: optional i32 seed
+}
+
 /**
  * The configuration for a switch.
  *
@@ -716,6 +775,7 @@ struct SwitchConfig {
   25: optional string config_version
   26: list<SflowCollector> sFlowCollectors = []
   27: optional Lacp lacp
-  28: optional list<PortQueue> cpuQueues
+  28: list<PortQueue> cpuQueues = []
   29: optional CPUTrafficPolicyConfig cpuTrafficPolicy
+  30: list<LoadBalancer> loadBalancers = []
 }

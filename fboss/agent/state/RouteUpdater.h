@@ -87,14 +87,8 @@ class RouteUpdater {
   void addLinkLocalRoutes(RouterID id);
   void delLinkLocalRoutes(RouterID id);
 
-  void updateStaticRoutes(const cfg::SwitchConfig& curCfg,
-      const cfg::SwitchConfig& prevCfg);
-
  private:
   template<typename StaticRouteType>
-  void staticRouteDelHelper(const std::vector<StaticRouteType>& oldRoutes,
-      const boost::container::flat_map<RouterID,
-      boost::container::flat_set<folly::CIDRNetwork>>& newRoutes);
   // Forbidden copy constructor and assignment operator
   RouteUpdater(RouteUpdater const &) = delete;
   RouteUpdater& operator=(RouteUpdater const &) = delete;
@@ -135,9 +129,14 @@ class RouteUpdater {
   void resolve();
   template<typename RouteT>
   void resolveOne(RouteT* route, ClonedRib* clonedRib);
-  template<typename RtRibT, typename AddrT>
-  void getFwdInfoFromNhop(RtRibT* nRib, ClonedRib* ribCloned,
-      const AddrT& nh, bool* hasToCpu, bool* hasDrop, RouteNextHopSet* fwd);
+  template <typename RtRibT, typename AddrT>
+  void getFwdInfoFromNhop(
+      RtRibT* nRib,
+      ClonedRib* ribCloned,
+      const AddrT& nh,
+      bool* hasToCpu,
+      bool* hasDrop,
+      RouteNextHopSet& fwd);
   // Functions to deduplicate routing tables during sync mode
   template<typename RibT>
   bool dedupRoutes(const RibT* origRib, RibT* newRib);

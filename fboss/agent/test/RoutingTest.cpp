@@ -14,9 +14,10 @@
 #include <folly/IPAddressV4.h>
 #include <folly/IPAddressV6.h>
 #include <folly/MacAddress.h>
+#include <folly/MoveWrapper.h>
 #include <folly/String.h>
 #include <folly/io/IOBuf.h>
-#include <folly/MoveWrapper.h>
+#include <folly/logging/xlog.h>
 
 #include "fboss/agent/AddressUtil.h"
 #include "fboss/agent/FbossError.h"
@@ -160,7 +161,7 @@ const IOBuf createV4UnicastPacket(
   rwCursor.write<uint32_t>(srcAddr.toLong());
   rwCursor.write<uint32_t>(dstAddr.toLong());
 
-  VLOG(2) << "\n" << folly::hexDump(pkt.data(), pkt.length());
+  XLOG(DBG2) << "\n" << folly::hexDump(pkt.data(), pkt.length());
 
   return pkt;
 }
@@ -186,7 +187,7 @@ const IOBuf createV6UnicastPacket(
   rwCursor.push(srcAddr.bytes(), IPAddressV6::byteCount());
   rwCursor.push(dstAddr.bytes(), IPAddressV6::byteCount());
 
-  VLOG(2) << "\n" << folly::hexDump(pkt.data(), pkt.length());
+  XLOG(DBG2) << "\n" << folly::hexDump(pkt.data(), pkt.length());
 
   return pkt;
 }
@@ -211,7 +212,7 @@ const IOBuf createV6MulticastPacket(
  */
 RxMatchFn matchRxPacket(const IOBuf& expBuf) {
   return [expBuf](const RxPacket* rcvdPkt) {
-    if (!folly::IOBufEqual()(expBuf, *rcvdPkt->buf())) {
+    if (!folly::IOBufEqualTo()(expBuf, *rcvdPkt->buf())) {
       throw FbossError("Expected rx-packet is not same as received packet");
     }
 
@@ -237,12 +238,13 @@ TxMatchFn matchTxPacket(
   auto wrappedExpBuf = folly::makeMoveWrapper(std::move(expBuf));
   return [wrappedExpBuf](const TxPacket* rcvdPkt) {
     auto buf = rcvdPkt->buf();
-    VLOG(2) << "-------------";
-    VLOG(2) << "\n" << folly::hexDump(buf->data(), buf->length());
-    VLOG(2) << "\n" << folly::hexDump(
-      wrappedExpBuf->get(), (*wrappedExpBuf)->length());
+    XLOG(DBG2) << "-------------";
+    XLOG(DBG2) << "\n" << folly::hexDump(buf->data(), buf->length());
+    XLOG(DBG2) << "\n"
+               << folly::hexDump(
+                      wrappedExpBuf->get(), (*wrappedExpBuf)->length());
 
-    if (!folly::IOBufEqual()(**wrappedExpBuf, *rcvdPkt->buf())) {
+    if (!folly::IOBufEqualTo()(**wrappedExpBuf, *rcvdPkt->buf())) {
       throw FbossError("Expected tx-packet is not same as received packet");
     }
 
@@ -263,7 +265,7 @@ std::unique_ptr<TxPacket> createTxPacket(SwSwitch* sw, const IOBuf& buf) {
     txBuf->writableData(),
     buf.data() + EthHdr::SIZE,
     buf.length() - EthHdr::SIZE);
-  VLOG(2) << "\n" << folly::hexDump(txBuf->data(), txBuf->length());
+  XLOG(DBG2) << "\n" << folly::hexDump(txBuf->data(), txBuf->length());
 
   return txPkt;
 }

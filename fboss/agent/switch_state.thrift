@@ -2,6 +2,7 @@
 # Copyright 2004-present Facebook. All Rights Reserved.
 #
 namespace py neteng.fboss.switch_state
+namespace py3 neteng.fboss
 namespace py.asyncio neteng.fboss.asyncio.switch_state
 namespace cpp2 facebook.fboss.state
 
@@ -22,7 +23,10 @@ struct PortQueueFields {
  5: string scheduling
  // TODO: replace with switch_config.StreamType?
  6: string streamType
- 7: optional switch_config.ActiveQueueManagement aqm;
+ 7: optional list<switch_config.ActiveQueueManagement> aqms
+ 8: optional string name
+ 10: optional i32 packetsPerSec
+ 11: optional i32 sharedBytes
 }
 
 // Port configuration and oper state fields

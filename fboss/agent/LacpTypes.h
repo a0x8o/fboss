@@ -35,7 +35,7 @@ class LACPError : public FbossError {
   ~LACPError() throw() override {}
 };
 
-enum LacpState {
+enum LacpState : int {
   NONE          = 0x00,
   ACTIVE        = 0x01,
   SHORT_TIMEOUT = 0x02,
@@ -89,6 +89,7 @@ struct ParticipantInfo {
 
   template <typename CursorType>
   static ParticipantInfo from(CursorType* cursor);
+  static ParticipantInfo defaultParticipantInfo();
 
   template <typename CursorType>
   void to(CursorType* cursor) const;

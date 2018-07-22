@@ -228,6 +228,10 @@ class SwitchStats : public boost::noncopyable {
     lacpHeartbeatDelay_.addValue(value);
   }
 
+  void neighborCacheHeartbeatDelay(int value) {
+    neighborCacheHeartbeatDelay_.addValue(value);
+  }
+
   void bgEventBacklog(int value) {
     bgEventBacklog_.addValue(value);
   }
@@ -242,6 +246,10 @@ class SwitchStats : public boost::noncopyable {
 
   void packetTxEventBacklog(int value) {
     packetTxEventBacklog_.addValue(value);
+  }
+
+  void neighborCacheEventBacklog(int value) {
+    neighborCacheEventBacklog_.addValue(value);
   }
 
   void linkStateChange() {
@@ -262,6 +270,10 @@ class SwitchStats : public boost::noncopyable {
 
   void updateStatsException(){
     updateStatsExceptions_.addValue(1);
+  }
+
+  void pktTooBig() {
+    trapPktTooBig_.addValue(1);
   }
 
  private:
@@ -397,6 +409,10 @@ class SwitchStats : public boost::noncopyable {
    * LACP thread heartbeat delay in milliseconds
    */
   TLHistogram lacpHeartbeatDelay_;
+  /**
+   * Arp Cache thread heartbeat delay in milliseconds
+   */
+  TLHistogram neighborCacheHeartbeatDelay_;
 
   /**
    * Number of events queued in background thread
@@ -413,6 +429,10 @@ class SwitchStats : public boost::noncopyable {
   TLHistogram packetTxEventBacklog_;
 
   TLHistogram lacpEventBacklog_;
+  /**
+   * Number of events queued in fboss Arp Cache thread
+   */
+  TLHistogram neighborCacheEventBacklog_;
 
   /**
    * Link state up/down change count
@@ -433,6 +453,9 @@ class SwitchStats : public boost::noncopyable {
 
   // Number of failed updateStats callbacks do to exceptions.
   TLTimeseries updateStatsExceptions_;
+
+  // Number of packet too big ICMPv6 triggered
+  TLTimeseries trapPktTooBig_;
 };
 
 }} // facebook::fboss

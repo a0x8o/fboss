@@ -22,107 +22,168 @@ using std::make_pair;
 using std::make_shared;
 using std::shared_ptr;
 
-TEST(PortQueue, serialization) {
-  int id = 5;
-  auto scheduling = cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN;
-  auto streamType = cfg::StreamType::UNICAST;
-  int weight = 5;
-  int reservedBytes = 1000;
-  auto scalingFactor = cfg::MMUScalingFactor::ONE;
-  cfg::ActiveQueueManagement aqm;
-  cfg::LinearQueueCongestionDetection lqcd;
-  lqcd.minimumLength = 42;
-  lqcd.maximumLength = 42;
-  aqm.detection.set_linear(lqcd);
-  aqm.behavior.earlyDrop = true;
-  aqm.behavior.ecn = true;
-
-  PortQueue pqObject(id);
-  pqObject.setScheduling(scheduling);
-  pqObject.setStreamType(streamType);
-  pqObject.setWeight(weight);
-  pqObject.setReservedBytes(reservedBytes);
-  pqObject.setScalingFactor(scalingFactor);
-  pqObject.setAqm(aqm);
-
-  LOG(INFO) << "to folly dynamic";
-  auto serialized = pqObject.toFollyDynamic();
-
-  LOG(INFO) << "from folly dynamic";
-  auto deserialized = PortQueue::fromFollyDynamic(serialized);
-
-  EXPECT_EQ(pqObject, *deserialized);
+namespace {
+cfg::ActiveQueueManagement getEarlyDropAqmConfig() {
+  cfg::ActiveQueueManagement earlyDropAQM;
+  cfg::LinearQueueCongestionDetection earlyDropLQCD;
+  earlyDropLQCD.minimumLength = 208;
+  earlyDropLQCD.maximumLength = 416;
+  earlyDropAQM.detection.set_linear(earlyDropLQCD);
+  earlyDropAQM.behavior = cfg::QueueCongestionBehavior::EARLY_DROP;
+  return earlyDropAQM;
 }
 
-TEST(PortQueue, serializationBadFrom) {
-  int id = 5;
-  auto scheduling = cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN;
-  auto streamType = cfg::StreamType::UNICAST;
-  int weight = 5;
-  int reservedBytes = 1000;
-  auto scalingFactor = cfg::MMUScalingFactor::ONE;
-  cfg::ActiveQueueManagement aqm;
-  cfg::LinearQueueCongestionDetection lqcd;
-  lqcd.minimumLength = 42;
-  lqcd.maximumLength = 42;
-  aqm.detection.set_linear(lqcd);
-  aqm.behavior.earlyDrop = true;
-  aqm.behavior.ecn = true;
-
-  PortQueue pqObject(id);
-  pqObject.setScheduling(scheduling);
-  pqObject.setStreamType(streamType);
-  pqObject.setWeight(weight);
-  pqObject.setReservedBytes(reservedBytes);
-  pqObject.setScalingFactor(scalingFactor);
-  pqObject.setAqm(aqm);
-
-  auto serialized = pqObject.toFollyDynamic();
-  LOG(INFO) << serialized;
-
-  auto noBehavior = serialized;
-  noBehavior["aqm"].erase("behavior");
-  EXPECT_THROW(PortQueue::fromFollyDynamic(noBehavior), std::exception);
-
-  auto noDetection = serialized;
-  noDetection["aqm"].erase("detection");
-  EXPECT_THROW(PortQueue::fromFollyDynamic(noDetection), std::exception);
-
-  auto noLinearMaximumThreshold = serialized;
-  noLinearMaximumThreshold["aqm"]["detection"]["linear"].erase("maximumLength");
-  EXPECT_THROW(
-      PortQueue::fromFollyDynamic(noLinearMaximumThreshold), std::exception);
-
-  auto noLinearMinimumThreshold = serialized;
-  noLinearMinimumThreshold["aqm"]["detection"]["linear"].erase("minimumLength");
-  EXPECT_THROW(
-      PortQueue::fromFollyDynamic(noLinearMinimumThreshold), std::exception);
+cfg::ActiveQueueManagement getECNAqmConfig() {
+  cfg::ActiveQueueManagement ecnAQM;
+  cfg::LinearQueueCongestionDetection ecnLQCD;
+  ecnLQCD.minimumLength = 624;
+  ecnLQCD.maximumLength = 624;
+  ecnAQM.detection.set_linear(ecnLQCD);
+  ecnAQM.behavior = cfg::QueueCongestionBehavior::ECN;
+  return ecnAQM;
 }
 
+cfg::SwitchConfig generateTestConfig() {
+  cfg::SwitchConfig config;
+  config.ports.resize(1);
+  config.ports[0].logicalID = 1;
+  config.ports[0].name = "port1";
+  config.ports[0].state = cfg::PortState::ENABLED;
+  // we just need to test the any queue and set every setting
+  cfg::PortQueue queue1;
+  queue1.id = 1;
+  queue1.name = "queue1";
+  queue1.streamType = cfg::StreamType::UNICAST;
+  queue1.scheduling = cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN;
+  queue1.weight = 9;
+  queue1.__isset.weight = true;
+  queue1.scalingFactor =  cfg::MMUScalingFactor::EIGHT;
+  queue1.__isset.scalingFactor = true;
+  queue1.reservedBytes = 19968;
+  queue1.__isset.reservedBytes = true;
+  queue1.sharedBytes = 19968;
+  queue1.__isset.sharedBytes = true;
+  queue1.packetsPerSec = 100;
+  queue1.__isset.packetsPerSec = true;
+  queue1.aqms.push_back(getEarlyDropAqmConfig());
+  queue1.aqms.push_back(getECNAqmConfig());
+  queue1.__isset.aqms = true;
 
+  config.ports[0].queues.push_back(queue1);
+  return config;
+}
 
-TEST(PortQueue, stateDelta) {
-  auto platform = createMockPlatform();
+PortQueue* generatePortQueue() {
+  PortQueue* pqObject = new PortQueue(5);
+  pqObject->setScheduling(cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN);
+  pqObject->setStreamType(cfg::StreamType::UNICAST);
+  pqObject->setWeight(5);
+  pqObject->setReservedBytes(1000);
+  pqObject->setScalingFactor(cfg::MMUScalingFactor::ONE);
+  pqObject->setName("queue0");
+  pqObject->setPacketsPerSec(200);
+  pqObject->setSharedBytes(10000);
+  std::vector<cfg::ActiveQueueManagement> aqms;
+  aqms.push_back(getEarlyDropAqmConfig());
+  aqms.push_back(getECNAqmConfig());
+  pqObject->resetAqms(aqms);
+  return pqObject;
+}
+
+PortQueue* generateProdPortQueue() {
+  PortQueue* pqObject = new PortQueue(0);
+  pqObject->setWeight(1);
+  pqObject->setStreamType(cfg::StreamType::UNICAST);
+  pqObject->setReservedBytes(3328);
+  pqObject->setScheduling(cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN);
+  pqObject->setScalingFactor(cfg::MMUScalingFactor::ONE);
+  return pqObject;
+}
+
+PortQueue* generateProdCPUPortQueue() {
+  PortQueue* pqObject = new PortQueue(1);
+  pqObject->setName("cpuQueue-default");
+  pqObject->setStreamType(cfg::StreamType::MULTICAST);
+  pqObject->setWeight(1);
+  pqObject->setScheduling(cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN);
+  pqObject->setPacketsPerSec(200);
+  pqObject->setReservedBytes(1000);
+  pqObject->setSharedBytes(10000);
+  return pqObject;
+}
+
+PortQueue* generateDefaultPortQueue() {
+  // Most of the queues in our system are using default values
+  PortQueue* pqObject = new PortQueue(1);
+  return pqObject;
+}
+
+constexpr int kStateTestDefaultNumPortQueues = 4;
+std::shared_ptr<SwitchState> applyInitConfig() {
   auto stateV0 = make_shared<SwitchState>();
   stateV0->registerPort(PortID(1), "port1");
   auto port0 = stateV0->getPort(PortID(1));
-  Port::QueueConfig initialQueues;
-  for (int i = 0; i < 4; i++) {
+  QueueConfig initialQueues;
+  for (int i = 0; i < kStateTestDefaultNumPortQueues; i++) {
     auto q = std::make_shared<PortQueue>(i);
     q->setScheduling(cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN);
     q->setWeight(1);
     initialQueues.push_back(q);
   }
   port0->resetPortQueues(initialQueues);
-  port0->publish();
+  stateV0->publish();
   EXPECT_TRUE(port0->isPublished());
+  return stateV0;
+}
+} // unnamed namespace
+
+TEST(PortQueue, serialization) {
+  std::vector<PortQueue*> queues = {
+    generatePortQueue(), generateProdPortQueue(), generateProdCPUPortQueue(),
+    generateDefaultPortQueue()};
+
+  for (const auto* pqObject: queues) {
+    auto serialized = pqObject->toFollyDynamic();
+    auto deserialized = PortQueue::fromFollyDynamic(serialized);
+    EXPECT_EQ(*pqObject, *deserialized);
+  }
+}
+
+TEST(PortQueue, serializationBadForm) {
+  auto pqObject = generatePortQueue();
+
+  auto serialized = pqObject->toFollyDynamic();
+
+  auto noBehavior = serialized;
+  noBehavior["aqms"][0].erase("behavior");
+  EXPECT_THROW(PortQueue::fromFollyDynamic(noBehavior), std::exception);
+
+  auto noDetection = serialized;
+  noDetection["aqms"][0].erase("detection");
+  EXPECT_THROW(PortQueue::fromFollyDynamic(noDetection), std::exception);
+
+  auto noLinearMaximumThreshold = serialized;
+  noLinearMaximumThreshold["aqms"][0]["detection"]["linear"].erase(
+    "maximumLength");
+  EXPECT_THROW(
+      PortQueue::fromFollyDynamic(noLinearMaximumThreshold), std::exception);
+
+  auto noLinearMinimumThreshold = serialized;
+  noLinearMinimumThreshold["aqms"][0]["detection"]["linear"].erase("minimumLength");
+  EXPECT_THROW(
+      PortQueue::fromFollyDynamic(noLinearMinimumThreshold), std::exception);
+}
+
+TEST(PortQueue, stateDelta) {
+  auto platform = createMockPlatform();
+  auto stateV0 = applyInitConfig();
 
   cfg::SwitchConfig config;
   config.ports.resize(1);
   config.ports[0].logicalID = 1;
   config.ports[0].name = "port1";
   config.ports[0].state = cfg::PortState::ENABLED;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < kStateTestDefaultNumPortQueues; i++) {
     cfg::PortQueue queue;
     queue.id = i;
     queue.weight = i;
@@ -133,20 +194,20 @@ TEST(PortQueue, stateDelta) {
   auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
   EXPECT_NE(nullptr, stateV1);
   auto queues1 = stateV1->getPort(PortID(1))->getPortQueues();
-  EXPECT_EQ(4, queues1.size());
+  EXPECT_EQ(kStateTestDefaultNumPortQueues, queues1.size());
 
   config.ports[0].queues[0].weight = 5;
 
   auto stateV2 = publishAndApplyConfig(stateV1, &config, platform.get());
   EXPECT_NE(nullptr, stateV2);
   auto queues2 = stateV2->getPort(PortID(1))->getPortQueues();
-  EXPECT_EQ(4, queues2.size());
+  EXPECT_EQ(kStateTestDefaultNumPortQueues, queues2.size());
   EXPECT_EQ(5, queues2.at(0)->getWeight());
 
   config.ports[0].queues.pop_back();
   auto stateV3 = publishAndApplyConfig(stateV2, &config, platform.get());
   auto queues3 = stateV3->getPort(PortID(1))->getPortQueues();
-  EXPECT_EQ(4, queues3.size());
+  EXPECT_EQ(kStateTestDefaultNumPortQueues, queues3.size());
   EXPECT_EQ(1, queues3.at(3)->getWeight());
 
   cfg::PortQueue queueExtra;
@@ -160,15 +221,7 @@ TEST(PortQueue, stateDelta) {
 
 TEST(PortQueue, aqmState) {
   auto platform = createMockPlatform();
-  auto stateV0 = make_shared<SwitchState>();
-  stateV0->registerPort(PortID(1), "port1");
-  auto port0 = stateV0->getPort(PortID(1));
-  auto q = std::make_shared<PortQueue>(0);
-  q->setScheduling(cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN);
-  q->setWeight(1);
-  port0->resetPortQueues({q});
-  port0->publish();
-  EXPECT_TRUE(port0->isPublished());
+  auto stateV0 = applyInitConfig();
 
   cfg::SwitchConfig config;
   config.ports.resize(1);
@@ -176,40 +229,25 @@ TEST(PortQueue, aqmState) {
   config.ports[0].name = "port1";
   config.ports[0].state = cfg::PortState::ENABLED;
   cfg::PortQueue queue;
-  cfg::ActiveQueueManagement aqm;
-  cfg::LinearQueueCongestionDetection lqcd;
-  lqcd.minimumLength = 42;
-  lqcd.maximumLength = 42;
-  aqm.detection.set_linear(lqcd);
-  aqm.behavior.earlyDrop = true;
-  aqm.behavior.ecn = true;
   queue.id = 0;
   queue.weight = 1;
-  queue.aqm = aqm;
-  queue.__isset.aqm = true;
+  queue.aqms.push_back(getEarlyDropAqmConfig());
+  queue.__isset.aqms = true;
   config.ports[0].queues.push_back(queue);
 
   auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
   EXPECT_NE(nullptr, stateV1);
   auto queues1 = stateV1->getPort(PortID(1))->getPortQueues();
-  EXPECT_EQ(1, queues1.size());
-  EXPECT_EQ(42, queues1.at(0)->getAqm()->detection.get_linear().minimumLength);
-  EXPECT_EQ(42, queues1.at(0)->getAqm()->detection.get_linear().maximumLength);
-  EXPECT_EQ(true, queues1.at(0)->getAqm()->behavior.ecn);
-  EXPECT_EQ(true, queues1.at(0)->getAqm()->behavior.earlyDrop);
+  // change one queue, won't affect the other queues
+  EXPECT_EQ(kStateTestDefaultNumPortQueues, queues1.size());
+  std::vector<cfg::ActiveQueueManagement> aqms;
+  aqms.push_back(getEarlyDropAqmConfig());
+  EXPECT_TRUE(comparePortQueueAQMs(queues1.at(0)->getAqms(), aqms));
 }
 
 TEST(PortQueue, aqmBadState) {
   auto platform = createMockPlatform();
-  auto stateV0 = make_shared<SwitchState>();
-  stateV0->registerPort(PortID(1), "port1");
-  auto port0 = stateV0->getPort(PortID(1));
-  auto q = std::make_shared<PortQueue>(0);
-  q->setScheduling(cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN);
-  q->setWeight(1);
-  port0->resetPortQueues({q});
-  port0->publish();
-  EXPECT_TRUE(port0->isPublished());
+  auto stateV0 = applyInitConfig();
 
   cfg::SwitchConfig config;
   config.ports.resize(1);
@@ -217,18 +255,64 @@ TEST(PortQueue, aqmBadState) {
   config.ports[0].name = "port1";
   config.ports[0].state = cfg::PortState::ENABLED;
   cfg::PortQueue queue;
-  cfg::ActiveQueueManagement aqm;
-  cfg::LinearQueueCongestionDetection lqcd;
-  lqcd.minimumLength = 42;
-  lqcd.maximumLength = 42;
-  aqm.behavior.earlyDrop = true;
-  aqm.behavior.ecn = true;
   queue.id = 0;
   queue.weight = 1;
-  queue.aqm = aqm;
-  queue.__isset.aqm = true;
+
+  // create bad ECN AQM state w/o specifying thresholds
+  cfg::ActiveQueueManagement ecnAQM;
+  ecnAQM.behavior = cfg::QueueCongestionBehavior::ECN;
+  queue.aqms.push_back(getEarlyDropAqmConfig());
+  queue.aqms.push_back(ecnAQM);
+  queue.__isset.aqms = true;
+
   config.ports[0].queues.push_back(queue);
 
   EXPECT_THROW(
       publishAndApplyConfig(stateV0, &config, platform.get()), FbossError);
+}
+
+TEST(PortQueue, resetPartOfConfigs) {
+  auto platform = createMockPlatform();
+  auto stateV0 = applyInitConfig();
+
+  {
+    auto config = generateTestConfig();
+    auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
+    EXPECT_NE(nullptr, stateV1);
+
+    // reset reservedBytes
+    config.ports[0].queues[0].__isset.reservedBytes = false;
+
+    auto stateV2 = publishAndApplyConfig(stateV1, &config, platform.get());
+    EXPECT_TRUE(stateV2 != nullptr);
+    auto queues2 = stateV2->getPort(PortID(1))->getPortQueues();
+    EXPECT_FALSE(queues2.at(0)->getReservedBytes().hasValue());
+  }
+  {
+    auto config = generateTestConfig();
+    auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
+    EXPECT_NE(nullptr, stateV1);
+
+    // reset scalingFactor
+    config.ports[0].queues[0].__isset.scalingFactor = false;
+
+    auto stateV2 = publishAndApplyConfig(stateV1, &config, platform.get());
+    EXPECT_TRUE(stateV2 != nullptr);
+    auto queues2 = stateV2->getPort(PortID(1))->getPortQueues();
+    EXPECT_FALSE(queues2.at(0)->getScalingFactor().hasValue());
+  }
+  {
+    auto config = generateTestConfig();
+    auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
+    EXPECT_NE(nullptr, stateV1);
+
+    // reset aqm
+    config.ports[0].queues[0].aqms.clear();
+    config.ports[0].queues[0].__isset.aqms = false;
+
+    auto stateV2 = publishAndApplyConfig(stateV1, &config, platform.get());
+    EXPECT_TRUE(stateV2 != nullptr);
+    auto queues2 = stateV2->getPort(PortID(1))->getPortQueues();
+    EXPECT_TRUE(queues2.at(0)->getAqms().empty());
+  }
 }

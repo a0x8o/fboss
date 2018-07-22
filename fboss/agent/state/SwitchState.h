@@ -16,23 +16,20 @@
 #include <folly/dynamic.h>
 #include <folly/Memory.h>
 
-#include "fboss/agent/types.h"
+#include "fboss/agent/state/AclMap.h"
+#include "fboss/agent/state/AggregatePortMap.h"
+#include "fboss/agent/state/InterfaceMap.h"
+#include "fboss/agent/state/LoadBalancerMap.h"
 #include "fboss/agent/state/NodeBase.h"
+#include "fboss/agent/state/PortMap.h"
+#include "fboss/agent/state/RouteTableMap.h"
+#include "fboss/agent/state/VlanMap.h"
+#include "fboss/agent/types.h"
 
 namespace facebook { namespace fboss {
 
-class AclEntry;
-class AclMap;
-class AggregatePortMap;
 class ControlPlane;
 class Interface;
-class InterfaceMap;
-class Port;
-class PortMap;
-class RouteTable;
-class RouteTableMap;
-class Vlan;
-class VlanMap;
 template <typename AddressT> class Route;
 class SflowCollector;
 class SflowCollectorMap;
@@ -48,6 +45,7 @@ struct SwitchStateFields {
     fn(interfaces.get());
     fn(routeTables.get());
     fn(acls.get());
+    fn(loadBalancers.get());
   }
   /*
    * Serialize to folly::dynamic
@@ -66,6 +64,7 @@ struct SwitchStateFields {
   std::shared_ptr<AclMap> acls;
   std::shared_ptr<SflowCollectorMap> sFlowCollectors;
   std::shared_ptr<ControlPlane> controlPlane;
+  std::shared_ptr<LoadBalancerMap> loadBalancers;
   VlanID defaultVlan{0};
 
 
@@ -269,6 +268,8 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
      writableFields()->dhcpV6ReplySrc = v6ReplySrc;
   }
 
+  const std::shared_ptr<LoadBalancerMap>& getLoadBalancers() const;
+
   /*
    * The following functions modify the static state.
    * The should only be called on newly created SwitchState objects that are
@@ -291,6 +292,7 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
   void resetSflowCollectors(
       const std::shared_ptr<SflowCollectorMap>& collectors);
   void resetControlPlane(std::shared_ptr<ControlPlane> cpu);
+  void resetLoadBalancers(std::shared_ptr<LoadBalancerMap> loadBalancers);
 
  private:
   // Inherit the constructor required for clone()

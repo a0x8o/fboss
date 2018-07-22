@@ -9,7 +9,15 @@
  */
 #include "fboss/agent/LinkAggregationManager.h"
 
+#include "fboss/agent/Platform.h"
+#include "fboss/agent/state/AggregatePortMap.h"
 #include "fboss/agent/LacpController.h"
+#include "fboss/agent/LacpTypes.h"
+#include "fboss/agent/LacpTypes-defs.h"
+#include "fboss/agent/state/Port.h"
+#include "fboss/agent/state/PortMap.h"
+#include "fboss/agent/TxPacket.h"
+#include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/SwSwitch.h"
 #include "fboss/agent/state/AggregatePort.h"
 #include "fboss/agent/state/DeltaFunctions.h"
@@ -17,6 +25,7 @@
 #include "fboss/agent/state/SwitchState.h"
 
 #include <folly/io/async/EventBase.h>
+#include <folly/logging/xlog.h>
 
 #include <algorithm>
 #include <iterator>
@@ -25,6 +34,50 @@
 
 namespace facebook {
 namespace fboss {
+
+namespace {
+class ProgramForwardingState {
+ public:
+  ProgramForwardingState(
+      PortID portID,
+      AggregatePortID aggPortID,
+      AggregatePort::Forwarding fwdState);
+  std::shared_ptr<SwitchState> operator()(
+      const std::shared_ptr<SwitchState>& state);
+
+ private:
+  PortID portID_;
+  AggregatePortID aggegatePortID_;
+  AggregatePort::Forwarding forwardingState_;
+};
+
+ProgramForwardingState::ProgramForwardingState(
+    PortID portID,
+    AggregatePortID aggPortID,
+    AggregatePort::Forwarding fwdState)
+    : portID_(portID), aggegatePortID_(aggPortID), forwardingState_(fwdState) {}
+
+std::shared_ptr<SwitchState> ProgramForwardingState::operator()(
+    const std::shared_ptr<SwitchState>& state) {
+  std::shared_ptr<SwitchState> nextState(state);
+  auto* aggPort =
+      nextState->getAggregatePorts()->getAggregatePortIf(aggegatePortID_).get();
+  if (!aggPort) {
+    return nullptr;
+  }
+
+  XLOG(DBG4) << "Updating AggregatePort " << aggPort->getID()
+             << ": ForwardingState[" << portID_ << "] --> "
+             << (forwardingState_ == AggregatePort::Forwarding::ENABLED
+                     ? "ENABLED"
+                     : "DISABLED");
+
+  aggPort = aggPort->modify(&nextState);
+  aggPort->setForwardingState(portID_, forwardingState_);
+
+  return nextState;
+}
+} // namespace
 
 // Needed for CHECK_* macros to work with PortIDToController::iterator
 std::ostream& operator<<(
@@ -47,34 +100,23 @@ void LinkAggregationManager::handlePacket(
 
   auto it = portToController_.find(ingressPort);
   if (it == portToController_.end()) {
-    LOG(ERROR) << "No LACP controller found for port " << ingressPort;
+    XLOG(ERR) << "No LACP controller found for port " << ingressPort;
     return;
   }
 
-  it->second->receivedLACPDU(c);
+  auto lacpdu = LACPDU::from(&c);
+  if (!lacpdu.isValid()) {
+    XLOG(ERR) << "Invalid LACP data unit";
+    return;
+  }
+
+  it->second->received(lacpdu);
 }
 
 void LinkAggregationManager::stateUpdated(const StateDelta& delta) {
   CHECK(sw_->getUpdateEvb()->inRunningEventBaseThread());
 
   folly::SharedMutexWritePriority::WriteHolder writeGuard(&controllersLock_);
-
-  if (!initialized_) {
-    bool inserted;
-    for (const auto& port : *(delta.newState()->getPorts())) {
-      // TODO(samank): use try_emplace once OSS build uses boost >1.63.0
-      std::tie(std::ignore, inserted) = portToController_.insert(std::make_pair(
-          port->getID(),
-          std::make_shared<LacpController>(
-              port->getID(), sw_->getLacpEvb(), this, sw_)));
-      CHECK(inserted);
-    }
-
-    for (const auto& portAndController : portToController_) {
-      portAndController.second->startMachines();
-    }
-    initialized_ = true;
-  }
 
   DeltaFunctions::forEachChanged(
       delta.getAggregatePortsDelta(),
@@ -93,23 +135,23 @@ void LinkAggregationManager::stateUpdated(const StateDelta& delta) {
 void LinkAggregationManager::aggregatePortAdded(
     const std::shared_ptr<AggregatePort>& aggPort) {
   PortIDToController::iterator it;
+  bool inserted;
 
   for (const auto& subport : aggPort->sortedSubports()) {
-    it = portToController_.find(subport.portID);
-    CHECK_NE(it, portToController_.end());
-    it->second->stopMachines();
-    it->second.reset(new LacpController(
+    std::tie(it, inserted) = portToController_.emplace(
         subport.portID,
-        sw_->getLacpEvb(),
-        subport.priority,
-        subport.rate,
-        subport.activity,
-        aggPort->getID(),
-        aggPort->getSystemPriority(),
-        aggPort->getSystemID(),
-        aggPort->getMinimumLinkCount(),
-        this,
-        sw_));
+        std::make_shared<LacpController>(
+            subport.portID,
+            sw_->getLacpEvb(),
+            subport.priority,
+            subport.rate,
+            subport.activity,
+            aggPort->getID(),
+            aggPort->getSystemPriority(),
+            aggPort->getSystemID(),
+            aggPort->getMinimumLinkCount(),
+            this));
+    CHECK(inserted);
     it->second->startMachines();
   }
 }
@@ -121,9 +163,7 @@ void LinkAggregationManager::aggregatePortRemoved(
     it = portToController_.find(subport.portID);
     CHECK_NE(it, portToController_.end());
     it->second->stopMachines();
-    it->second.reset(
-        new LacpController(subport.portID, sw_->getLacpEvb(), this, sw_));
-    it->second->startMachines();
+    portToController_.erase(it);
   }
 }
 
@@ -144,6 +184,7 @@ void LinkAggregationManager::aggregatePortChanged(
     return;
   }
 
+  aggregatePortRemoved(oldAggPort);
   aggregatePortAdded(newAggPort);
 }
 
@@ -156,7 +197,7 @@ void LinkAggregationManager::portChanged(
       newPort->getOperState() == Port::OperState::UP) {
     auto it = portToController_.find(portId);
     if (it == portToController_.end()) {
-      LOG(ERROR) << "Port " << portId << " not found";
+      XLOG(ERR) << "Port " << portId << " not found";
       return;
     }
     it->second->portUp();
@@ -165,7 +206,7 @@ void LinkAggregationManager::portChanged(
       newPort->getOperState() == Port::OperState::DOWN) {
     auto it = portToController_.find(portId);
     if (it == portToController_.end()) {
-      LOG(ERROR) << "Port " << portId << " not found";
+      XLOG(ERR) << "Port " << portId << " not found";
       return;
     }
     it->second->portDown();
@@ -212,6 +253,86 @@ void LinkAggregationManager::populatePartnerPairs(
     controller->actorInfo().populate(partnerPairs.back().localEndpoint);
     controller->partnerInfo().populate(partnerPairs.back().remoteEndpoint);
   }
+}
+
+bool LinkAggregationManager::transmit(LACPDU lacpdu, PortID portID) {
+  CHECK(sw_->getLacpEvb()->inRunningEventBaseThread());
+
+  auto pkt = sw_->allocatePacket(LACPDU::LENGTH);
+  if (!pkt) {
+    XLOG(DBG4) << "Failed to allocate tx packet for LACPDU transmission";
+    return false;
+  }
+
+  folly::io::RWPrivateCursor writer(pkt->buf());
+
+  folly::MacAddress cpuMac = sw_->getPlatform()->getLocalMac();
+
+  auto port = sw_->getState()->getPorts()->getPortIf(portID);
+  CHECK(port);
+
+  TxPacket::writeEthHeader(
+      &writer,
+      LACPDU::kSlowProtocolsDstMac(),
+      cpuMac,
+      port->getIngressVlan(),
+      LACPDU::EtherType::SLOW_PROTOCOLS);
+
+  writer.writeBE<uint8_t>(LACPDU::EtherSubtype::LACP);
+
+  lacpdu.to(&writer);
+
+  sw_->sendPacketOutOfPort(std::move(pkt), portID);
+
+  return true;
+}
+
+void LinkAggregationManager::enableForwarding(
+    PortID portID,
+    AggregatePortID aggPortID) {
+  CHECK(sw_->getLacpEvb()->inRunningEventBaseThread());
+
+  auto enableFwdStateFn = ProgramForwardingState(
+      portID, aggPortID, AggregatePort::Forwarding::ENABLED);
+
+  sw_->updateStateNoCoalescing(
+      "AggregatePort ForwardingState", std::move(enableFwdStateFn));
+}
+
+void LinkAggregationManager::disableForwarding(
+    PortID portID,
+    AggregatePortID aggPortID) {
+  CHECK(sw_->getLacpEvb()->inRunningEventBaseThread());
+
+  auto disableFwdStateFn = ProgramForwardingState(
+      portID, aggPortID, AggregatePort::Forwarding::DISABLED);
+
+  sw_->updateStateNoCoalescing(
+      "AggregatePort ForwardingState", std::move(disableFwdStateFn));
+}
+
+std::vector<std::shared_ptr<LacpController>>
+LinkAggregationManager::getControllersFor(
+    folly::Range<std::vector<PortID>::const_iterator> ports) {
+  // Although this method is thread-safe, it is only invoked from a Selector
+  // object, which should always be executing over the LACP EVB
+  CHECK(sw_->getLacpEvb()->inRunningEventBaseThread());
+
+  std::vector<std::shared_ptr<LacpController>> controllers(
+      std::distance(ports.begin(), ports.end()));
+
+  folly::SharedMutexWritePriority::ReadHolder g(&controllersLock_);
+
+  // TODO(samank): Rerwite as an O(N + M) algorithm
+  for (auto i = 0; i < controllers.size(); ++i) {
+    auto it = portToController_.find(ports[i]);
+    CHECK(it != portToController_.end());
+
+    controllers[i] = it->second;
+  }
+
+  // TODO(samank): does this move?
+  return controllers;
 }
 
 LinkAggregationManager::~LinkAggregationManager() {}

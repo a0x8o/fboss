@@ -3,6 +3,7 @@ namespace d neteng.fboss.ctrl
 namespace go neteng.fboss.ctrl
 namespace php fboss
 namespace py neteng.fboss.ctrl
+namespace py3 neteng.fboss
 namespace py.asyncio neteng.fboss.asyncio.ctrl
 
 include "fboss/agent/if/fboss.thrift"
@@ -33,10 +34,28 @@ struct IpPrefix {
   2: required i16 prefixLength,
 }
 
+struct NextHopThrift {
+  1: Address.BinaryAddress address,
+  // Default weight of 0 represents an ECMP route.
+  // This default is chosen for two reasons:
+  // 1) We rely on the arithmetic properties of 0 for ECMP vs UCMP route
+  //    resolution calculations. A 0 weight next hop being present at a variety
+  //    of layers in a route resolution tree will cause the entire route
+  //    resolution to use ECMP.
+  // 2) A client which does not set a value will result in
+  //    0 being populated even with strange behavior in the client language
+  //    which is consistent with C++
+  2: i32 weight = 0,
+}
+
 struct UnicastRoute {
   1: required IpPrefix dest,
-  2: required list<Address.BinaryAddress> nextHopAddrs,
+  // NOTE: nextHopAddrs was once required. While we work on
+  // fully deprecating it, we need to be extra careful and
+  // ensure we don't crash clients/servers that still see it as required.
+  2: list<Address.BinaryAddress> nextHopAddrs,
   3: optional AdminDistance adminDistance,
+  4: list<NextHopThrift> nextHops,
 }
 
 struct ClientAndNextHops {
@@ -209,9 +228,9 @@ struct QueueCongestionDetection {
   1: optional LinearQueueCongestionDetection linear
 }
 
-struct QueueCongestionBehavior {
-  1: bool earlyDrop
-  2: bool ecn
+enum QueueCongestionBehavior {
+  EARLY_DROP = 0,
+  ECN = 1,
 }
 
 struct ActiveQueueManagement {
@@ -226,7 +245,7 @@ struct PortQueueThrift {
   4: optional i32 weight,
   5: optional i32 reservedBytes,
   6: optional string scalingFactor,
-  7: optional ActiveQueueManagement aqm,
+  7: optional list<ActiveQueueManagement> aqms,
 }
 
 struct PortInfoThrift {
@@ -282,6 +301,23 @@ enum CaptureDirection {
   CAPTURE_TX_RX = 2
 }
 
+
+enum CpuCosQueueId {
+  LOPRI = 0,
+  DEFAULT = 1,
+  MIDPRI = 2,
+  HIPRI = 9
+}
+
+struct RxCaptureFilter {
+  1: list<CpuCosQueueId> cosQueues
+  # can put additional Rx filters here if need be
+}
+
+struct CaptureFilter {
+  1: RxCaptureFilter rxCaptureFilter;
+}
+
 struct CaptureInfo {
   // A name identifying the packet capture
   1: string name
@@ -295,6 +331,10 @@ struct CaptureInfo {
    */
   2: i32 maxPackets
   3: CaptureDirection direction = CAPTURE_TX_RX
+  /*
+   * set of criteria that packet must meet to be captured
+   */
+  4: CaptureFilter  filter
 }
 
 struct RouteUpdateLoggingInfo {
@@ -336,6 +376,7 @@ enum StdClientIds {
   INTERFACE_ROUTE = 2,
   LINKLOCAL_ROUTE = 3,
   NETLINK_LISTENER = 100,
+  STATIC_INTERNAL = 700,
   OPENR = 786,
 }
 

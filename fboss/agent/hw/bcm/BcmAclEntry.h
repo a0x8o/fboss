@@ -9,14 +9,11 @@
  */
 #pragma once
 
+#include "fboss/agent/hw/bcm/BcmAclStat.h"
 #include "fboss/agent/FbossError.h"
-#include "fboss/agent/types.h"
+#include "fboss/agent/hw/bcm/types.h"
 
 namespace facebook { namespace fboss {
-
-// We define the handle type for open source code
-// The handle types should match the types defined by the switch sdk
-using BcmAclEntryHandle = int;
 
 class BcmSwitch;
 class AclEntry;
@@ -28,16 +25,12 @@ class BcmAclRange;
  */
 class BcmAclEntry {
 public:
-
-  using BcmAclRanges = std::vector<BcmAclRange *>;
-
-  BcmAclEntry(BcmSwitch* hw, int gid,
-    const std::shared_ptr<AclEntry>& acl,
-    const BcmAclRanges& ranges);
+  BcmAclEntry(BcmSwitch* hw, int gid, const std::shared_ptr<AclEntry>& acl);
   ~BcmAclEntry();
   BcmAclEntryHandle getHandle() const {
     return handle_;
   }
+
   /**
    * Check whether the acl details of handle in h/w matches the s/w acl and
    * ranges
@@ -46,6 +39,13 @@ public:
                           const std::shared_ptr<AclEntry>& acl);
 
 private:
+  bool getAclEntryFromWarmBootCache();
+  void createNewAclEntry();
+  void createAclQualifiers();
+  void createAclActions();
+  void createAclStat();
+  void createAclRanges();
+
   BcmSwitch* hw_;
   int gid_;
   std::shared_ptr<AclEntry> acl_;

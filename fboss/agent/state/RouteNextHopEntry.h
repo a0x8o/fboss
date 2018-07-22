@@ -18,13 +18,10 @@
 
 namespace facebook { namespace fboss {
 
-/**
- * Multiple RouteNextHop for ECMP route.
- */
 class RouteNextHopEntry {
  public:
   using Action = RouteForwardAction;
-  using NextHopSet = boost::container::flat_set<RouteNextHop>;
+  using NextHopSet = boost::container::flat_set<NextHop>;
 
   RouteNextHopEntry(Action action, AdminDistance distance)
       : adminDistance_(distance), action_(action) {
@@ -33,7 +30,7 @@ class RouteNextHopEntry {
 
   RouteNextHopEntry(NextHopSet nhopSet, AdminDistance distance);
 
-  RouteNextHopEntry(RouteNextHop nhop, AdminDistance distance)
+  RouteNextHopEntry(NextHop nhop, AdminDistance distance)
       : adminDistance_(distance), action_(Action::NEXTHOPS) {
     nhopSet_.emplace(std::move(nhop));
   }
@@ -49,6 +46,9 @@ class RouteNextHopEntry {
   const NextHopSet& getNextHopSet() const {
     return nhopSet_;
   }
+
+  // Get the sum of the weights of all the nexthops in the entry
+  NextHopWeight getTotalWeight() const;
 
   std::string str() const;
 
@@ -97,9 +97,8 @@ std::ostream& operator<<(std::ostream& os, const RouteNextHopEntry& entry);
 void toAppend(const RouteNextHopEntry::NextHopSet& nhops, std::string *result);
 std::ostream& operator<<(
     std::ostream& os, const RouteNextHopEntry::NextHopSet& nhops);
+NextHopWeight totalWeight(const RouteNextHopEntry::NextHopSet& nhops);
 
-// TODO: replace all RouteNextHops with RouteNextHopSet
-using RouteNextHops = RouteNextHopEntry::NextHopSet;
 using RouteNextHopSet = RouteNextHopEntry::NextHopSet;
 
 namespace util {
@@ -107,15 +106,14 @@ namespace util {
 /**
  * Convert thrift representation of nexthops to RouteNextHops.
  */
-RouteNextHops
-toRouteNextHops(std::vector<network::thrift::BinaryAddress> const& nhAddrs);
+RouteNextHopSet
+toRouteNextHopSet(std::vector<NextHopThrift> const& nhts);
 
 /**
  * Convert RouteNextHops to thrift representaion of nexthops
  */
-std::vector<network::thrift::BinaryAddress>
-fromRouteNextHops(RouteNextHops const& nhs);
-
+std::vector<NextHopThrift>
+fromRouteNextHopSet(RouteNextHopSet const& nhs);
 }
 
 }}

@@ -375,18 +375,6 @@ TEST(Acl, AclGeneration) {
   config.acls[3].name = "acl4";
   config.acls[3].actionType = cfg::AclActionType::DENY;
 
-  config.ports[0].__isset.egressTrafficPolicy = true;
-  config.ports[0].egressTrafficPolicy = cfg::TrafficPolicyConfig();
-  config.ports[0].egressTrafficPolicy.matchToAction.resize(1,
-      cfg::MatchToAction());
-  config.ports[0].egressTrafficPolicy.matchToAction[0].matcher = "acl2";
-  config.ports[0].egressTrafficPolicy.matchToAction[0].action =
-    cfg::MatchAction();
-  config.ports[0].egressTrafficPolicy.matchToAction[0].action.sendToQueue =
-      cfg::QueueMatchAction();
-  config.ports[0].egressTrafficPolicy.matchToAction[0]
-      .action.sendToQueue.queueId = 5;
-
   config.__isset.globalEgressTrafficPolicy = true;
   config.globalEgressTrafficPolicy.matchToAction.resize(2,
       cfg::MatchToAction());
@@ -412,21 +400,13 @@ TEST(Acl, AclGeneration) {
   EXPECT_NE(acls->getEntryIf("acl1"), nullptr);
   EXPECT_NE(acls->getEntryIf("system:acl2"), nullptr);
   EXPECT_NE(acls->getEntryIf("system:acl3"), nullptr);
-  EXPECT_NE(acls->getEntryIf("system:port1:acl2"), nullptr);
 
   EXPECT_EQ(acls->getEntryIf("acl1")->getPriority(), kAclStartPriority);
   EXPECT_EQ(acls->getEntryIf("acl4")->getPriority(), kAclStartPriority + 1);
-  EXPECT_EQ(acls->getEntryIf("system:port1:acl2")->getPriority(),
-      kAclStartPriority + 2);
   EXPECT_EQ(acls->getEntryIf("system:acl2")->getPriority(),
-      kAclStartPriority + 3);
+      kAclStartPriority + 2);
   EXPECT_EQ(acls->getEntryIf("system:acl3")->getPriority(),
-      kAclStartPriority + 4);
-
-  config.acls[1].__isset.dstPort = true;
-  config.acls[1].dstPort = 5;
-  EXPECT_THROW(publishAndApplyConfig(stateV1, &config, platform.get()),
-      FbossError);
+      kAclStartPriority + 3);
 }
 
 TEST(Acl, SerializeAclEntry) {
@@ -461,4 +441,106 @@ TEST(Acl, SerializeAclEntry) {
   EXPECT_TRUE(aclAction.getSendToQueue());
   EXPECT_EQ(aclAction.getSendToQueue().value().second, true);
   EXPECT_EQ(aclAction.getSendToQueue().value().first.queueId, 3);
+
+  // Test PacketCounterAction
+  entry = std::make_unique<AclEntry>(0, "stat0");
+  action = MatchAction();
+  auto packetCounterAction = cfg::PacketCounterMatchAction();
+  packetCounterAction.counterName = "stat0.c";
+  action.setPacketCounter(packetCounterAction);
+  entry->setAclAction(action);
+
+  serialized = entry->toFollyDynamic();
+  entryBack = AclEntry::fromFollyDynamic(serialized);
+
+  EXPECT_TRUE(*entry == *entryBack);
+  EXPECT_TRUE(entryBack->getAclAction());
+  aclAction = entryBack->getAclAction().value();
+  EXPECT_TRUE(aclAction.getPacketCounter());
+  EXPECT_EQ(aclAction.getPacketCounter().value().counterName, "stat0.c");
+}
+
+TEST(Acl, Ttl) {
+  auto platform = createMockPlatform();
+  auto stateV0 = make_shared<SwitchState>();
+
+  cfg::SwitchConfig config;
+  config.acls.resize(1);
+  config.acls[0].name = "acl1";
+  config.acls[0].actionType = cfg::AclActionType::DENY;
+  // set ttl
+  config.acls[0].ttl.value = 42;
+  config.acls[0].ttl.mask = 0xff;
+  config.acls[0].__isset.ttl = true;
+
+  auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
+  EXPECT_NE(nullptr, stateV1);
+  auto aclV1 = stateV1->getAcl("acl1");
+  ASSERT_NE(nullptr, aclV1);
+  EXPECT_TRUE(aclV1->getTtl());
+  EXPECT_EQ(aclV1->getTtl().value().getValue(), 42);
+  EXPECT_EQ(aclV1->getTtl().value().getMask(), 0xff);
+
+  // check invalid configs
+  config.acls[0].ttl.value = 256;
+  EXPECT_THROW(publishAndApplyConfig(stateV1, &config, platform.get()),
+    FbossError);
+  config.acls[0].ttl.value = -1;
+  EXPECT_THROW(publishAndApplyConfig(stateV1, &config, platform.get()),
+    FbossError);
+  config.acls[0].ttl.value = 42;
+  config.acls[0].ttl.mask = 256;
+  EXPECT_THROW(publishAndApplyConfig(stateV1, &config, platform.get()),
+    FbossError);
+  config.acls[0].ttl.mask = -1;
+  EXPECT_THROW(publishAndApplyConfig(stateV1, &config, platform.get()),
+    FbossError);
+}
+
+TEST(Acl, TtlSerialization) {
+  auto entry = std::make_unique<AclEntry>(0, "stat0");
+  entry->setTtl(AclTtl(42, 0xff));
+  auto action = MatchAction();
+  auto packetCounterAction = cfg::PacketCounterMatchAction();
+  packetCounterAction.counterName = "stat0.c";
+  action.setPacketCounter(packetCounterAction);
+  entry->setAclAction(action);
+
+  auto serialized = entry->toFollyDynamic();
+  auto entryBack = AclEntry::fromFollyDynamic(serialized);
+
+  EXPECT_TRUE(*entry == *entryBack);
+  EXPECT_TRUE(entryBack->getTtl());
+  EXPECT_EQ(entryBack->getTtl().value().getValue(), 42);
+  EXPECT_EQ(entryBack->getTtl().value().getMask(), 0xff);
+
+  // check invalid configs
+  auto ttl = AclTtl(42, 0xff);
+  EXPECT_THROW(AclTtl(256, 0xff), FbossError);
+  EXPECT_THROW(AclTtl(42, 256), FbossError);
+  EXPECT_THROW(ttl.setValue(256), FbossError);
+  EXPECT_THROW(ttl.setValue(-1), FbossError);
+  EXPECT_THROW(ttl.setMask(256), FbossError);
+  EXPECT_THROW(ttl.setMask(-1), FbossError);
+}
+
+TEST(Acl, IpType) {
+  auto platform = createMockPlatform();
+  auto stateV0 = make_shared<SwitchState>();
+
+  cfg::SwitchConfig config;
+  config.acls.resize(1);
+  config.acls[0].name = "acl1";
+  config.acls[0].actionType = cfg::AclActionType::DENY;
+  // set IpType
+  auto ipType = cfg::IpType::IP6;
+  config.acls[0].__isset.ipType = true;
+  config.acls[0].ipType = ipType;
+
+  auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
+  EXPECT_NE(nullptr, stateV1);
+  auto aclV1 = stateV1->getAcl("acl1");
+  EXPECT_NE(nullptr, aclV1);
+  EXPECT_TRUE(aclV1->getIpType());
+  EXPECT_EQ(aclV1->getIpType().value(), ipType);
 }

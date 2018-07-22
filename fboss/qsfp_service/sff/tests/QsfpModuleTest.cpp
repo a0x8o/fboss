@@ -29,11 +29,22 @@ using namespace ::testing;
 class QsfpModuleTest : public ::testing::Test {
  public:
   void SetUp() override {
-    auto transceiverImpl = std::make_unique<NiceMock<MockTransceiverImpl> >();
+    // save some typing in most tests by creating the test qsfp
+    // expecting 4 ports. Tests that need a different number of ports
+    // can call setupQsfp() themselves.
+    setupQsfp(4);
+  }
+
+  void setupQsfp(unsigned int portsPerTransceiver) {
+    auto transceiverImpl = std::make_unique<NiceMock<MockTransceiverImpl>>();
     auto implPtr = transceiverImpl.get();
     // So we can check what happens during testing
     transImpl_ = transceiverImpl.get();
-    qsfp_ = std::make_unique<MockQsfpModule>(std::move(transceiverImpl));
+    qsfp_ = std::make_unique<MockQsfpModule>(
+        std::move(transceiverImpl), portsPerTransceiver);
+
+    gflags::SetCommandLineOptionWithMode(
+      "tx_enable_interval", "0", gflags::SET_FLAGS_DEFAULT);
 
     // We're explicitly setting the value of the dirty bit, so fudge this
     EXPECT_CALL(*qsfp_, cacheIsValid()).WillRepeatedly(Return(true));
@@ -254,6 +265,31 @@ TEST_F(QsfpModuleTest, portsChangedExtraPort) {
     }));
 }
 
+TEST_F(QsfpModuleTest, portsChangedOnePortPerModule) {
+  setupQsfp(1);
+  EXPECT_CALL(*qsfp_, setCdrIfSupported(_, _, _)).Times(1);
+  qsfp_->transceiverPortsChanged({
+      {1, portStatus(true, false)},
+  });
+}
+
+TEST_F(QsfpModuleTest, portsChangedMissingPortOnePortPerModule) {
+  setupQsfp(1);
+  EXPECT_CALL(*qsfp_, setCdrIfSupported(_, _, _)).Times(0);
+  qsfp_->transceiverPortsChanged({});
+}
+
+TEST_F(QsfpModuleTest, portsChangedExtraPortOnePortPerModule) {
+  setupQsfp(1);
+  EXPECT_ANY_THROW(
+    qsfp_->transceiverPortsChanged({
+      {1, portStatus(true, false)},
+      {2, portStatus(true, false)},
+      {3, portStatus(true, false)},
+      {4, portStatus(true, false)},
+    }));
+}
+
 TEST_F(QsfpModuleTest, portsChangedNonsensicalDisabledButUp) {
   // should not customize if any port is up or no ports are enabled
   EXPECT_CALL(*qsfp_, setCdrIfSupported(_, _, _)).Times(0);
@@ -363,6 +399,42 @@ TEST_F(QsfpModuleTest, updateQsfpDataFull) {
   EXPECT_CALL(*transImpl_, writeTransceiver(_, _, _, _)).Times(AtLeast(1));
 
   qsfp_->actualUpdateQsfpData(true);
+}
+
+TEST_F(QsfpModuleTest, skipCustomizingMissingPorts) {
+  // set present_ = false, dirty_ = true
+  EXPECT_CALL(*transImpl_, detectTransceiver()).WillRepeatedly(Return(false));
+  qsfp_->detectPresence();
+
+  EXPECT_CALL(*qsfp_, setCdrIfSupported(_, _, _)).Times(0);
+  qsfp_->transceiverPortsChanged({
+      {1, portStatus(true, false)},
+      {2, portStatus(true, false)},
+      {3, portStatus(true, false)},
+      {4, portStatus(true, false)},
+    });
+
+  // We should also not actually customize on subsequent refresh calls
+  qsfp_->refresh();
+  qsfp_->refresh();
+}
+
+TEST_F(QsfpModuleTest, skipCustomizingCopperPorts) {
+  // Should get detected as copper and skip all customization
+  EXPECT_CALL(*qsfp_, getQsfpTransmitterTechnology()).WillRepeatedly(
+    Return(TransmitterTechnology::COPPER));
+
+  EXPECT_CALL(*qsfp_, setCdrIfSupported(_, _, _)).Times(0);
+  qsfp_->transceiverPortsChanged({
+      {1, portStatus(true, false)},
+      {2, portStatus(true, false)},
+      {3, portStatus(true, false)},
+      {4, portStatus(true, false)},
+    });
+
+  // We should also not actually customize on subsequent refresh calls
+  qsfp_->refresh();
+  qsfp_->refresh();
 }
 
 }} // namespace facebook::fboss

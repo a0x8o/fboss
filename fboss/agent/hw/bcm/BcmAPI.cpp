@@ -10,11 +10,14 @@
 #include "fboss/agent/hw/bcm/BcmAPI.h"
 
 #include "fboss/agent/hw/bcm/BcmError.h"
+#include "fboss/agent/hw/bcm/BcmPlatform.h"
 #include "fboss/agent/hw/bcm/BcmUnit.h"
+#include "fboss/agent/hw/bcm/BcmWarmBootHelper.h"
 
 #include <folly/Memory.h>
 #include <folly/String.h>
 #include <folly/io/Cursor.h>
+#include <folly/logging/xlog.h>
 #include <glog/logging.h>
 
 #include <atomic>
@@ -31,14 +34,23 @@ extern std::atomic<BcmUnit*> bcmUnits[];
 
 std::unique_ptr<BcmAPI> BcmAPI::singleton_;
 
-std::unique_ptr<BcmUnit> BcmAPI::initUnit(int deviceIndex) {
-  auto unitObj = make_unique<BcmUnit>(deviceIndex);
+std::unique_ptr<BcmUnit> BcmAPI::initUnit(
+    int deviceIndex,
+    BcmPlatform* platform) {
+  auto unitObj = make_unique<BcmUnit>(deviceIndex, platform);
   int unit = unitObj->getNumber();
   BcmUnit* expectedUnit{nullptr};
   if (!bcmUnits[unit].compare_exchange_strong(expectedUnit, unitObj.get(),
                                               std::memory_order_acq_rel)) {
     throw FbossError("a BcmUnit already exists for unit number ", unit);
   }
+  platform->onUnitCreate(unit);
+  if (platform->getWarmBootHelper()->canWarmBoot()) {
+    unitObj->warmBootAttach();
+  } else {
+    unitObj->coldBootAttach();
+  }
+  platform->onUnitAttach(unit);
   return unitObj;
 }
 
@@ -53,14 +65,14 @@ void BcmAPI::init(const std::map<std::string, std::string>& config) {
 }
 
 
-std::unique_ptr<BcmUnit> BcmAPI::initOnlyUnit() {
+std::unique_ptr<BcmUnit> BcmAPI::initOnlyUnit(BcmPlatform* platform) {
   auto numDevices = BcmAPI::getNumSwitches();
   if (numDevices == 0) {
     throw FbossError("no Broadcom switching ASIC found");
   } else if (numDevices > 1) {
     throw FbossError("found more than 1 Broadcom switching ASIC");
   }
-  return initUnit(0);
+  return initUnit(0, platform);
 }
 
 void BcmAPI::unitDestroyed(BcmUnit* unit) {
@@ -68,9 +80,11 @@ void BcmAPI::unitDestroyed(BcmUnit* unit) {
   BcmUnit* expectedUnit{unit};
   if (!bcmUnits[num].compare_exchange_strong(expectedUnit, nullptr,
                                              std::memory_order_acq_rel)) {
-    LOG(FATAL) << "inconsistency in BCM unit array for unit " << num <<
-      ": expected " << (void*)unit << " but found " << (void*)expectedUnit;
+    XLOG(FATAL) << "inconsistency in BCM unit array for unit " << num
+                << ": expected " << (void*)unit << " but found "
+                << (void*)expectedUnit;
   }
+  bcmInitialized.store(false, std::memory_order_release);
 }
 
 BcmUnit* BcmAPI::getUnit(int unit) {

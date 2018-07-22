@@ -52,7 +52,6 @@ class RouteUpdateLogger;
 class StateObserver;
 class TunManager;
 class PortRemediator;
-class UnresolvedNhopsProber;
 
 enum SwitchFlags : int {
   DEFAULT = 0,
@@ -420,6 +419,13 @@ class SwSwitch : public HwSwitch::Callback {
    */
   folly::EventBase* getUpdateEvb() {
     return &updateEventBase_;
+  }
+
+  /*
+   * Get the EventBase for Arp/Ndp Cache
+   */
+  folly::EventBase* getNeighborCacheEvb() {
+    return &neighborCacheEventBase_;
   }
 
   /**
@@ -809,6 +815,13 @@ class SwSwitch : public HwSwitch::Callback {
   std::unique_ptr<ThreadHeartbeat> lacpThreadHeartbeat_;
 
   /*
+   * A thread dedicated to Arp and Ndp cache entry processing.
+   */
+  std::unique_ptr<std::thread> neighborCacheThread_;
+  folly::EventBase neighborCacheEventBase_;
+  std::unique_ptr<ThreadHeartbeat> neighborCacheThreadHeartbeat_;
+
+  /*
    * A callback for listening to neighbors coming and going.
    */
   std::mutex neighborListenerMutex_;
@@ -836,7 +849,6 @@ class SwSwitch : public HwSwitch::Callback {
   std::unique_ptr<NeighborUpdater> nUpdater_;
   std::unique_ptr<PktCaptureManager> pcapMgr_;
   std::unique_ptr<RouteUpdateLogger> routeUpdateLogger_;
-  std::unique_ptr<UnresolvedNhopsProber> unresolvedNhopsProber_;
   std::unique_ptr<LinkAggregationManager> lagManager_;
 
   BootType bootType_{BootType::UNINITIALIZED};

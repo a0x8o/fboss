@@ -26,9 +26,11 @@
 #include "fboss/agent/state/VlanMap.h"
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/Port.h"
+#include "fboss/agent/state/RouteNextHop.h"
 #include "fboss/agent/state/RouteUpdater.h"
 #include "fboss/agent/test/MockTunManager.h"
 
+#include <chrono>
 #include <folly/Memory.h>
 #include <folly/json.h>
 #include <folly/Optional.h>
@@ -305,6 +307,59 @@ cfg::SwitchConfig testConfigA() {
   return cfg;
 }
 
+shared_ptr<SwitchState> testState(cfg::SwitchConfig cfg) {
+  auto state = make_shared<SwitchState>();
+
+  for (auto cfgVlan : cfg.vlans) {
+    auto vlan = make_shared<Vlan>(VlanID(cfgVlan.id), cfgVlan.name);
+    state->addVlan(vlan);
+  }
+
+  for (auto cfgVlanPort : cfg.vlanPorts) {
+    state->registerPort(
+        PortID(cfgVlanPort.logicalPort),
+        folly::to<string>("port", cfgVlanPort.logicalPort));
+    auto vlan = state->getVlans()->getVlanIf(VlanID(cfgVlanPort.vlanID));
+    if (vlan) {
+      vlan->addPort(PortID(cfgVlanPort.logicalPort), false);
+    }
+  }
+
+  for (auto cfgInterface : cfg.interfaces) {
+    auto interface = make_shared<Interface>(
+        InterfaceID(cfgInterface.intfID),
+        RouterID(0), /* TODO - vrf is 0 */
+        VlanID(cfgInterface.vlanID),
+        cfgInterface.name,
+        folly::MacAddress(cfgInterface.mac),
+        cfgInterface.mtu,
+        false, /* is virtual */
+        false /* is state_sync disabled */
+    );
+
+    Interface::Addresses addrs;
+    for (auto cfgIpAddress : cfgInterface.ipAddresses) {
+      /** TODO - fill IPs **/
+      std::vector<std::string> splitVec;
+      folly::split("/", cfgIpAddress, splitVec);
+      addrs.emplace(IPAddress(splitVec[0]), folly::to<uint8_t>(splitVec[1]));
+    }
+    interface->setAddresses(addrs);
+
+    state->addIntf(interface);
+
+    auto vlan = state->getVlans()->getVlanIf(VlanID(cfgInterface.vlanID));
+    if (vlan) {
+      vlan->setInterfaceID(interface->getID());
+    }
+  }
+  RouteUpdater routeUpdater(state->getRouteTables());
+  routeUpdater.addInterfaceAndLinkLocalRoutes(state->getInterfaces());
+
+  state->resetRouteTables(routeUpdater.updateDone());
+  return state;
+}
+
 shared_ptr<SwitchState> testStateA() {
   // Setup a default state object
   auto state = make_shared<SwitchState>();
@@ -363,13 +418,16 @@ shared_ptr<SwitchState> testStateA() {
   RouteUpdater updater(state->getRouteTables());
   updater.addInterfaceAndLinkLocalRoutes(state->getInterfaces());
 
-  RouteNextHops nexthops;
+  RouteNextHopSet nexthops;
   // resolved by intf 1
-  nexthops.emplace(RouteNextHop::createNextHop(IPAddress("10.0.0.22")));
+  nexthops.emplace(
+      UnresolvedNextHop(IPAddress("10.0.0.22"), UCMP_DEFAULT_WEIGHT));
   // resolved by intf 1
-  nexthops.emplace(RouteNextHop::createNextHop(IPAddress("10.0.0.23")));
+  nexthops.emplace(
+      UnresolvedNextHop(IPAddress("10.0.0.23"), UCMP_DEFAULT_WEIGHT));
   // un-resolvable
-  nexthops.emplace(RouteNextHop::createNextHop(IPAddress("1.1.2.10")));
+  nexthops.emplace(
+      UnresolvedNextHop(IPAddress("1.1.2.10"), UCMP_DEFAULT_WEIGHT));
 
   updater.addRoute(
       RouterID(0),
@@ -537,10 +595,10 @@ void RxPacketMatcher::DescribeNegationTo(std::ostream* os) const {
   *os << "not " << name_;
 }
 
-RouteNextHops makeNextHops(std::vector<std::string> ipStrs) {
-  RouteNextHops nhops;
+RouteNextHopSet makeNextHops(std::vector<std::string> ipStrs) {
+  RouteNextHopSet nhops;
   for (const std::string & ip : ipStrs) {
-    nhops.emplace(RouteNextHop::createNextHop(IPAddress(ip)));
+    nhops.emplace(UnresolvedNextHop(IPAddress(ip), ECMP_WEIGHT));
   }
   return nhops;
 }
@@ -623,4 +681,24 @@ void EXPECT_NO_ROUTE(const std::shared_ptr<RouteTableMap>& tables,
   }
 }
 
-}} // namespace facebook::fboss
+WaitForSwitchState::WaitForSwitchState(
+    SwSwitch* sw,
+    SwitchStatePredicate predicate,
+    const std::string& name)
+    : AutoRegisterStateObserver(sw, name),
+      predicate_(std::move(predicate)),
+      name_(name) {}
+
+WaitForSwitchState::~WaitForSwitchState() {}
+
+void WaitForSwitchState::stateUpdated(const StateDelta& delta) {
+  if (predicate_(delta)) {
+    {
+      std::lock_guard<std::mutex> guard(mtx_);
+      done_ = true;
+    }
+    cv_.notify_all();
+  }
+}
+} // namespace fboss
+} // namespace facebook

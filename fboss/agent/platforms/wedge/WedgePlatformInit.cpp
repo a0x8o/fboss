@@ -29,7 +29,9 @@ std::unique_ptr<WedgePlatform> chooseWedgePlatform() {
   productInfo->initialize();
 
   auto mode = productInfo->getMode();
-  if (mode == WedgePlatformMode::WEDGE100) {
+  if (mode == WedgePlatformMode::WEDGE) {
+    return std::make_unique<Wedge40Platform>(std::move(productInfo));
+  } else if (mode == WedgePlatformMode::WEDGE100) {
     return std::make_unique<Wedge100Platform>(std::move(productInfo));
   } else if (mode == WedgePlatformMode::GALAXY_LC) {
     return std::make_unique<GalaxyLCPlatform>(std::move(productInfo));
@@ -37,7 +39,9 @@ std::unique_ptr<WedgePlatform> chooseWedgePlatform() {
     return std::make_unique<GalaxyFCPlatform>(std::move(productInfo));
   }
 
-  return std::make_unique<Wedge40Platform>(std::move(productInfo));
+  // mode is neither of the offical platforms above, consider it as a Facebook
+  // dev platform
+  return createFBWedgePlatform(std::move(productInfo));
 }
 
 std::unique_ptr<Platform> initWedgePlatform() {

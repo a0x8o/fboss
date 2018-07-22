@@ -9,8 +9,16 @@
  */
 #include "BcmSflowExporter.h"
 
-#include <fcntl.h>
+#include <fstream>
+#include <iostream>
+#include <vector>
 
+#include <fcntl.h>
+#include <ifaddrs.h>
+
+#include <folly/Optional.h>
+#include <folly/Range.h>
+#include <folly/logging/xlog.h>
 #include <glog/logging.h>
 
 #include <thrift/lib/cpp2/protocol/Serializer.h>
@@ -20,7 +28,83 @@
 
 using namespace std;
 
-namespace facebook { namespace fboss {
+namespace {
+  folly::Optional<folly::IPAddress> getLocalIPv6FromWhoAmI() {
+  const std::string whoAmIFn = "/etc/fbwhoami";
+  const std::string key = "DEVICE_PRIMARY_IPV6";
+
+  std::ifstream infile(whoAmIFn);
+  std::string line;
+
+  while (std::getline(infile, line)) {
+    std::vector<std::string> kv;
+    folly::split("=", line, kv);
+    if (kv.size() != 2) {
+      continue;
+    }
+    if (kv[0] == key) {
+      try {
+        return folly::IPAddress(kv[1]);
+      } catch (std::exception const& e)  {
+        XLOG(DBG2) << folly::exceptionStr(e);
+        return folly::none;
+      }
+    }
+  }
+  return folly::none;
+}
+
+folly::IPAddress getLocalIPv6() {
+  // We first try to get the local IPv6 in fbwhoami
+  auto ret = getLocalIPv6FromWhoAmI();
+  if (ret.hasValue()) {
+    XLOG(DBG2) << "Got local IPv6 address from fbwhoami";
+    return ret.value();
+  }
+
+  struct ifaddrs* ifaddr;
+  std::vector<char> host;
+  host.reserve(NI_MAXHOST);
+
+  if (getifaddrs(&ifaddr) == -1) {
+    XLOG(DBG2) << "getifaddrs failed. Returned default address ::";
+    return folly::IPAddress("::");
+  }
+
+  for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == nullptr) {
+      continue;
+    }
+    std::string ifname{ifa->ifa_name};
+    if (ifname != "eth0" or ifa->ifa_addr->sa_family != AF_INET6) {
+      continue;
+    }
+    int retno = getnameinfo(
+        ifa->ifa_addr,
+        sizeof(struct sockaddr_in6),
+        host.data(),
+        NI_MAXHOST,
+        nullptr,
+        0,
+        NI_NUMERICHOST);
+    if (retno != 0) {
+      XLOG(DBG2) << "getnameinfo() failed: " << gai_strerror(retno);
+      continue;
+    }
+    try {
+      return folly::IPAddress(host.data());
+    } catch (std::exception const& e) {
+      XLOG(DBG2) << folly::exceptionStr(e);
+      continue;
+    }
+  }
+  XLOG(DBG2) << "Failed to get loopback ipv6 address, returned default one ::";
+  return folly::IPAddress("::");
+}
+} // namespace
+
+namespace facebook {
+namespace fboss {
 
 BcmSflowExporter::BcmSflowExporter(const folly::SocketAddress& address)
     : address_(address) {
@@ -81,7 +165,7 @@ BcmSflowExporter::BcmSflowExporter(const folly::SocketAddress& address)
 }
 
 ssize_t BcmSflowExporter::sendUDPDatagram(iovec* vec, const size_t iovec_len) {
-  VLOG(4) << "Sending an sFlow packet to " << address_.describe();
+  XLOG(DBG4) << "Sending an sFlow packet to " << address_.describe();
 
   sockaddr_storage addrStorage;
   address_.getAddress(&addrStorage);
@@ -96,11 +180,11 @@ ssize_t BcmSflowExporter::sendUDPDatagram(iovec* vec, const size_t iovec_len) {
   msg.msg_flags = 0;
   auto ret = ::sendmsg(socket_, &msg, 0);
   if (ret < 0) {
-    VLOG(1) << "Failed sending sFlow packet to " << address_.describe()
-            << " reason: " << folly::errnoStr(errno);
+    XLOG(DBG1) << "Failed sending sFlow packet to " << address_.describe()
+               << " reason: " << folly::errnoStr(errno);
   }
-  VLOG(4) << "Sent " << ret << " bytes of sFlow packet to "
-          << address_.describe();
+  XLOG(DBG4) << "Sent " << ret << " bytes of sFlow packet to "
+             << address_.describe();
   return ret;
 }
 
@@ -125,24 +209,40 @@ void BcmSflowExporterTable::addExporter(const shared_ptr<SflowCollector>& c) {
     auto exporter = make_unique<BcmSflowExporter>(c->getAddress());
     map_.emplace(c->getID(), move(exporter));
   } catch (const fboss::thrift::FbossBaseError& ex) {
-    LOG(ERROR) << "Could not add exporter: "
-               << c->getAddress().getFullyQualified()
-               << " reason: " << folly::exceptionStr(ex);
+    XLOG(ERR) << "Could not add exporter: "
+              << c->getAddress().getFullyQualified()
+              << " reason: " << folly::exceptionStr(ex);
     return;
   }
 
-  LOG(INFO) << "Successfully added exporter for "
-            << c->getAddress().getFullyQualified();
+  XLOG(INFO) << "Successfully added exporter for "
+             << c->getAddress().getFullyQualified();
 }
 
 void BcmSflowExporterTable::removeExporter(const std::string& id) {
-  LOG(INFO) << "Removed sFlow exporter " << id;
+  XLOG(INFO) << "Removed sFlow exporter " << id;
   map_.erase(id);
+}
+
+void BcmSflowExporterTable::updateSamplingRates(
+    PortID id,
+    int64_t inRate,
+    int64_t outRate) {
+  std::pair<int64_t, int64_t> rates(inRate, outRate);
+  auto it = port2samplingRates_.find(id);
+  if (it != port2samplingRates_.end()) {
+    it->second = rates;
+  } else {
+    port2samplingRates_.insert(std::make_pair(id, rates));
+  }
+
+  // We piggyback the update of local IPv6
+  localIP_ = getLocalIPv6();
 }
 
 void BcmSflowExporterTable::sendToAll(const SflowPacketInfo& info) {
   if (map_.empty()) {
-    VLOG(1)
+    XLOG(DBG1)
         << "zero sFlow collectors with sflow enabled, skipping sample export";
     return;
   }
@@ -167,4 +267,5 @@ void BcmSflowExporterTable::sendToAll(const SflowPacketInfo& info) {
   }
 }
 
-}}
+} // namespace fboss
+} // namespace facebook

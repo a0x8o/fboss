@@ -21,24 +21,24 @@ namespace facebook { namespace fboss {
 
 namespace util {
 
-RouteNextHops
-toRouteNextHops(std::vector<network::thrift::BinaryAddress> const& nhAddrs) {
-  RouteNextHops nhs;
-  nhs.reserve(nhAddrs.size());
-  for (auto const& nhAddr : nhAddrs) {
-    nhs.emplace(RouteNextHop::fromThrift(nhAddr));
+RouteNextHopSet
+toRouteNextHopSet(std::vector<NextHopThrift> const& nhs) {
+  RouteNextHopSet rnhs;
+  rnhs.reserve(nhs.size());
+  for (auto const& nh : nhs) {
+    rnhs.emplace(fromThrift(nh));
   }
-  return nhs;
+  return rnhs;
 }
 
-std::vector<network::thrift::BinaryAddress>
-fromRouteNextHops(RouteNextHops const& nhs) {
-  std::vector<network::thrift::BinaryAddress> nhAddrs;
-  nhAddrs.reserve(nhs.size());
-  for (auto const& nh : nhs) {
-    nhAddrs.emplace_back(nh.toThrift());
+std::vector<NextHopThrift>
+fromRouteNextHopSet(RouteNextHopSet const& nhs) {
+  std::vector<NextHopThrift> nhts;
+  nhts.reserve(nhs.size());
+  for (const auto& nh : nhs) {
+    nhts.emplace_back(nh.toThrift());
   }
-  return nhAddrs;
+  return nhts;
 }
 
 } // namespace util
@@ -50,6 +50,10 @@ RouteNextHopEntry::RouteNextHopEntry(NextHopSet nhopSet, AdminDistance distance)
   if (nhopSet_.size() == 0) {
     throw FbossError("Empty nexthop set is passed to the RouteNextHopEntry");
   }
+}
+
+NextHopWeight RouteNextHopEntry::getTotalWeight() const {
+  return totalWeight(getNextHopSet());
 }
 
 std::string RouteNextHopEntry::str() const {
@@ -111,6 +115,14 @@ std::ostream& operator<<(std::ostream& os,
   return os;
 }
 
+NextHopWeight totalWeight(const RouteNextHopEntry::NextHopSet& nhops) {
+  uint32_t result = 0;
+  for (const auto& nh : nhops) {
+    result += nh.weight();
+  }
+  return result;
+}
+
 folly::dynamic RouteNextHopEntry::toFollyDynamic() const {
   folly::dynamic entry = folly::dynamic::object;
   entry[kAction] = forwardActionStr(action_);
@@ -133,7 +145,7 @@ RouteNextHopEntry::fromFollyDynamic(const folly::dynamic& entryJson) {
   RouteNextHopEntry entry(Action::DROP, adminDistance);
   entry.action_ = action;
   for (const auto& nhop : entryJson[kNexthops]) {
-    entry.nhopSet_.insert(RouteNextHop::fromFollyDynamic(nhop));
+    entry.nhopSet_.insert(util::nextHopFromFollyDynamic(nhop));
   }
   return entry;
 }

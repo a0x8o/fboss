@@ -10,10 +10,13 @@
 #pragma once
 
 #include <folly/Conv.h>
+#include <iosfwd>
 
 #include <boost/serialization/strong_typedef.hpp>
 #include <cstdint>
 #include <type_traits>
+
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 #define FBOSS_STRONG_TYPE(primitive, new_type) \
   namespace facebook { namespace fboss { \
@@ -53,4 +56,20 @@ FBOSS_STRONG_TYPE(uint32_t, ClientID)
  */
 FBOSS_STRONG_TYPE(uint64_t, NodeID)
 
-#undef FBOSS_STRONG_TYPE
+namespace facebook {
+namespace fboss {
+
+using LoadBalancerID = cfg::LoadBalancerID;
+
+} // namespace fboss
+} // namespace facebook
+
+namespace facebook {
+namespace fboss {
+namespace cfg {
+
+std::ostream& operator<<(std::ostream& out, LoadBalancerID id);
+
+} // namespace cfg
+} // namespace fboss
+} // namespace facebook

@@ -13,12 +13,15 @@
 #include <functional>
 #include <gmock/gmock.h>
 
+#include <folly/Function.h>
 #include <folly/MacAddress.h>
 #include <folly/Range.h>
 #include <folly/Optional.h>
+#include <folly/synchronization/Baton.h>
 
 #include "fboss/agent/hw/mock/MockHwSwitch.h"
 #include "fboss/agent/FbossError.h"
+#include "fboss/agent/StateObserver.h"
 #include "fboss/agent/SwSwitch.h"
 #include "fboss/agent/state/RouteNextHopEntry.h"
 
@@ -147,6 +150,11 @@ void checkField(const ExpectedType& expected, const ActualType& actual,
 std::shared_ptr<SwitchState> testStateA();
 
 /*
+ * Test may want to tweak default configuration
+ */
+std::shared_ptr<SwitchState> testState(cfg::SwitchConfig config);
+
+/*
  * The returned configuration object, if applied to a SwitchState with ports
  * 1-20, will yield the same SwitchState as that returned by testStateA().
  */
@@ -174,6 +182,9 @@ std::shared_ptr<SwitchState> testStateB();
 #define EXPECT_HW_CALL(sw, method) \
   EXPECT_CALL(*getMockHw(sw), method)
 
+#define EXPECT_MANY_HW_CALLS(sw, method) \
+  EXPECT_CALL(*getMockHw(sw), method).Times(testing::AtLeast(1))
+
 /*
  * Convenience macro that wraps EXPECT_CALL() on the underlying MockPlatform
  */
@@ -192,7 +203,7 @@ std::string fbossHexDump(folly::ByteRange buf);
 std::string fbossHexDump(folly::StringPiece buf);
 std::string fbossHexDump(const std::string& buf);
 
-RouteNextHops makeNextHops(std::vector<std::string> ipStrs);
+RouteNextHopSet makeNextHops(std::vector<std::string> ipStrs);
 
 RoutePrefixV4 makePrefixV4(std::string str);
 
@@ -239,6 +250,10 @@ void EXPECT_NO_ROUTE(const std::shared_ptr<RouteTableMap>& tables,
  */
 #define EXPECT_PKT(sw, name, matchFn) \
   EXPECT_HW_CALL(sw, sendPacketSwitched_( \
+                 TxPacketMatcher::createMatcher(name, matchFn)))
+
+#define EXPECT_MANY_PKTS(sw, name, matchFn) \
+  EXPECT_MANY_HW_CALLS(sw, sendPacketSwitched_( \
                  TxPacketMatcher::createMatcher(name, matchFn)))
 
 /**
@@ -323,4 +338,37 @@ class RxPacketMatcher : public ::testing::MatcherInterface<RxMatchFnArgs> {
   const RxMatchFn fn_;
 };
 
+using SwitchStatePredicate = folly::Function<bool(const StateDelta&)>;
+
+class WaitForSwitchState : public AutoRegisterStateObserver {
+ public:
+  explicit WaitForSwitchState(
+      SwSwitch* sw,
+      SwitchStatePredicate predicate,
+      const std::string& name);
+  ~WaitForSwitchState();
+
+  void stateUpdated(const StateDelta& delta) override;
+  template <class Rep = int64_t, class Period = std::ratio<1>>
+  bool wait(
+      const std::chrono::duration<Rep, Period>& timeout =
+          std::chrono::seconds(5)) {
+    std::unique_lock<std::mutex> lock(mtx_);
+    while (!done_) {
+      if (cv_.wait_for(lock, timeout) == std::cv_status::timeout) {
+        XLOG(ERR) << "timed out on " << name_;
+        return false;
+      }
+    }
+    done_ = false;
+    return true;
+  }
+
+ private:
+  SwitchStatePredicate predicate_;
+  std::mutex mtx_;
+  std::condition_variable cv_;
+  bool done_{false};
+  std::string name_;
+};
 }} // facebook::fboss

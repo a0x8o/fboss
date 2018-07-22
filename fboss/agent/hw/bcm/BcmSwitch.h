@@ -9,15 +9,12 @@
  */
 #pragma once
 
-#include "common/stats/MonotonicCounter.h"
 #include "fboss/agent/HwSwitch.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
-#include "fboss/agent/hw/bcm/BcmAclTable.h"
-#include "fboss/agent/hw/bcm/BcmCosManager.h"
-#include "fboss/agent/hw/bcm/BcmSwitchEventCallback.h"
-#include "fboss/agent/hw/bcm/gen-cpp2/packettrace_types.h"
 #include <folly/dynamic.h>
+
+#include <gtest/gtest_prod.h>
 
 #include <memory>
 #include <mutex>
@@ -35,7 +32,9 @@ namespace facebook { namespace fboss {
 class AclEntry;
 class AggregatePort;
 class ArpEntry;
+class BcmAclTable;
 class BcmControlPlane;
+class BcmCosManager;
 class BcmEgress;
 class BcmHostTable;
 class BcmIntfTable;
@@ -43,11 +42,17 @@ class BcmPlatform;
 class BcmPortTable;
 class BcmRouteTable;
 class BcmRxPacket;
+class BcmStatUpdater;
+class BcmSwitchEventCallback;
 class BcmTableStats;
 class BcmTrunkTable;
 class BcmUnit;
 class BcmWarmBootCache;
+class BcmWarmBootHelper;
+class BcmRtag7LoadBalancer;
 class BcmSflowExporterTable;
+class LoadBalancer;
+class PacketTraceInfo;
 class SflowCollector;
 class MockRxPacket;
 class Interface;
@@ -62,7 +67,19 @@ class BufferStatsLogger;
  */
 class BcmSwitchIf : public HwSwitch {
  public:
+  /*
+   * Flush internal tables and release ASIC/unit for destruction
+   */
   virtual std::unique_ptr<BcmUnit> releaseUnit() = 0;
+  /*
+   * Flush internal tables w/o but remain attached to ASIC/Unit
+   */
+  virtual void resetTables() = 0;
+  /*
+   * Set up tables as would be just after doing a init (w/o going through
+   * the whole init sequence of setting up the ASIC)
+   */
+  virtual void initTables(const folly::dynamic& warmBootState) = 0;
 
   virtual BcmPlatform* getPlatform() const = 0;
 
@@ -83,6 +100,8 @@ class BcmSwitchIf : public HwSwitch {
 
   virtual const BcmTrunkTable* getTrunkTable() const = 0;
 
+  virtual BcmStatUpdater* getStatUpdater() const = 0;
+
   virtual BcmControlPlane* getControlPlane() const = 0;
 
   virtual opennsl_if_t getDropEgressId() const = 0;
@@ -92,6 +111,8 @@ class BcmSwitchIf : public HwSwitch {
   virtual BcmCosManager* getCosMgr() const = 0;
 
   virtual BcmHostTable* writableHostTable() const = 0;
+
+  virtual BcmAclTable* writableAclTable() const = 0;
 
   virtual BcmWarmBootCache* getWarmBootCache() const = 0;
 
@@ -113,6 +134,10 @@ class BcmSwitch : public BcmSwitchIf {
     MMU_LOSSLESS,
     MMU_LOSSY
    };
+   enum FeaturesDesired : uint32_t {
+     PACKET_RX_DESIRED = 0x01,
+     LINKSCAN_DESIRED = 0x02
+   };
   /*
    * Construct a new BcmSwitch.
    *
@@ -120,40 +145,58 @@ class BcmSwitch : public BcmSwitchIf {
    * When init() is called, it will initialize the SDK, then find and
    * initialize the first switching ASIC.
    */
-  explicit BcmSwitch(BcmPlatform* platform, HashMode hashMode=FULL_HASH);
+   explicit BcmSwitch(
+       BcmPlatform* platform,
+       HashMode hashMode = FULL_HASH,
+       uint32_t featuresDesired = (PACKET_RX_DESIRED | LINKSCAN_DESIRED));
 
-  /*
-   * Construct a new BcmSwitch for an existing BCM unit.
-   *
-   * This version assumes the BCM SDK has already been initialized, and uses
-   * the specified BCM unit.  The BCM unit is not reset, but is used in its
-   * current state.  Note that BcmSwitch::init() must still be called.
-   */
-  BcmSwitch(BcmPlatform *platform, std::unique_ptr<BcmUnit> unit);
+   /*
+    * Construct a new BcmSwitch for an existing BCM unit.
+    *
+    * This version assumes the BCM SDK has already been initialized, and uses
+    * the specified BCM unit.  The BCM unit is not reset, but is used in its
+    * current state.  Note that BcmSwitch::init() must still be called.
+    */
+   BcmSwitch(
+       BcmPlatform* platform,
+       std::unique_ptr<BcmUnit> unit,
+       uint32_t featuresDesired);
 
-  ~BcmSwitch() override;
+   ~BcmSwitch() override;
 
-  /*
-   * Release the BcmUnit used by this BcmSwitch.
-   *
-   * This returns the BcmUnit used by this switch.  This can be used to
-   * destroy the BcmSwitch without also detaching the underlying BcmUnit.
-   * Once this method has called no other BcmSwitch methods should be accessed
-   * before destroying the BcmSwitch object.
-   */
-  std::unique_ptr<BcmUnit> releaseUnit() override;
+   /*
+    * Release the BcmUnit used by this BcmSwitch.
+    *
+    * This returns the BcmUnit used by this switch.  This can be used to
+    * destroy the BcmSwitch without also detaching the underlying BcmUnit.
+    * Once this method has called no other BcmSwitch methods should be accessed
+    * before destroying the BcmSwitch object.
+    */
+   std::unique_ptr<BcmUnit> releaseUnit() override;
+   /*
+    * Flush tables tracking ASIC state. Without releasing the ASIC/unit for
+    * destruction/detaching. Primarily used for testing, where we flush state
+    * and then try to recreate it by mimicking a warmboot sequence
+    */
+   void resetTables() override;
+   /*
+    * Init tables using warm boot state (represented by passed in
+    * folly::dynamic). This mimics the warm boot init sequence, without having
+    * the ASIC go through a warm boot.
+    */
+   void initTables(const folly::dynamic& warmBootState) override;
 
-  /*
-   * Initialize the BcmSwitch.
-   */
-  HwInitResult init(Callback* callback) override;
+   /*
+    * Initialize the BcmSwitch.
+    */
+   HwInitResult init(Callback* callback) override;
 
-  void runBcmScriptPreAsicInit() const;
+   void runBcmScriptPreAsicInit() const;
 
-  void unregisterCallbacks() override;
+   void unregisterCallbacks() override;
 
-  BcmPlatform* getPlatform() const override {
-    return platform_;
+   BcmPlatform* getPlatform() const override {
+     return platform_;
   }
   MmuState getMmuState() const { return mmuState_; }
   uint64_t getMMUCellBytes() const { return mmuCellBytes_; }
@@ -198,6 +241,9 @@ class BcmSwitch : public BcmSwitchIf {
   }
   const BcmAclTable* getAclTable() const override {
     return aclTable_.get();
+  }
+  BcmStatUpdater* getStatUpdater() const override {
+    return bcmStatUpdater_.get();
   }
   BufferStatsLogger* getBufferStatsLogger() {
     return bufferStatsLogger_.get();
@@ -292,6 +338,7 @@ class BcmSwitch : public BcmSwitchIf {
   void fetchL2Table(std::vector<L2EntryThrift> *l2Table) override;
 
   BcmHostTable* writableHostTable() const override { return hostTable_.get(); }
+  BcmAclTable* writableAclTable() const override { return aclTable_.get(); }
   BcmWarmBootCache* getWarmBootCache() const override {
     return warmBootCache_.get();
   }
@@ -331,8 +378,26 @@ class BcmSwitch : public BcmSwitchIf {
   }
 
   opennsl_gport_t getCpuGPort() const;
+  /*
+   * Calls linkStateChanged. Invoked by linkscan thread
+   * on BCM ASIC as well as explicitly by tests.
+   */
+  static void linkscanCallback(int unit,
+                               opennsl_port_t port,
+                               opennsl_port_info_t* info);
 
+  BootType getBootType() const {
+    return bootType_;
+  }
+  /*
+   * Friend tests. We want the abilty to test private methods
+   * without comprimising encapsulation for code generally.
+   * To that end make tests friends, but no one else
+   */
+  FRIEND_TEST(BcmTest, fpNoMissingOrQsetChangedGrpsPostInit);
  private:
+  void resetTablesImpl(std::unique_lock<std::mutex>& lock);
+
   enum Flags : uint32_t {
     RX_REGISTERED = 0x01,
     LINKSCAN_REGISTERED = 0x02
@@ -351,6 +416,8 @@ class BcmSwitch : public BcmSwitchIf {
    * building complete state.
    */
   std::shared_ptr<SwitchState> getWarmBootSwitchState() const;
+
+  void setupToCpuEgress();
 
   std::unique_ptr<BcmRxPacket> createRxPacket(opennsl_pkt_t* pkt);
   void changeDefaultVlan(VlanID id);
@@ -413,8 +480,18 @@ class BcmSwitch : public BcmSwitchIf {
   void processRemovedAggregatePort(
       const std::shared_ptr<AggregatePort>& aggPort);
 
+  void processLoadBalancerChanges(const StateDelta& delta);
+  void processChangedLoadBalancer(
+      const std::shared_ptr<LoadBalancer>& oldLoadBalancer,
+      const std::shared_ptr<LoadBalancer>& newLoadBalancer);
+  void processAddedLoadBalancer(
+      const std::shared_ptr<LoadBalancer>& loadBalancer);
+  void processRemovedLoadBalancer(
+      const std::shared_ptr<LoadBalancer>& loadBalancer);
+
   std::shared_ptr<SwitchState> stateChangedImpl(const StateDelta& delta);
 
+  void processSflowSamplingRateChanges(const StateDelta& delta);
   void processSflowCollectorChanges(const StateDelta& delta);
   void processChangedSflowCollector(
       const std::shared_ptr<SflowCollector>& oldCollector,
@@ -426,12 +503,6 @@ class BcmSwitch : public BcmSwitchIf {
 
   void processControlPlaneChanges(const StateDelta& delta);
 
-  /*
-   * Calls linkStateChanged below
-   */
-  static void linkscanCallback(int unit,
-                               opennsl_port_t port,
-                               opennsl_port_info_t* info);
   /*
    * linkStateChangedHwNotLocked is in the call chain started by link scan
    * thread while invoking our link state handler. Link scan thread
@@ -506,6 +577,11 @@ class BcmSwitch : public BcmSwitchIf {
    */
   void dropDhcpPackets();
 
+  /*
+   * Process packets for which L3 MTU check fails
+   */
+  void setL3MtuFailPackets();
+
   /**
    * Copy IPv6 link local multicast packets to CPU
    */
@@ -525,10 +601,11 @@ class BcmSwitch : public BcmSwitchIf {
    */
   void createSlowProtocolsGroup();
   /*
-   * During warm boot, check if any FP groups changed in a way that
-   * the group needs to be recreated (e.g. on QSET changes).
+   * During warm boot, check for missing FP Groups or FP groups
+   * for which QSETs changed.
    */
-  void setupChangedOrMissingFPGroups();
+  bool haveMissingOrQSetChangedFPGroups() const;
+  void setupFPGroups();
 
   /*
    * Forces a linkscan pass on the provided ports.
@@ -580,13 +657,22 @@ class BcmSwitch : public BcmSwitchIf {
    */
   std::unique_ptr<BufferStatsLogger> createBufferStatsLogger();
 
-   /*
-    * Check if state, speed update for this port port would
-    * be permissible in the hardware.
-    * Right now we check for valid speed and port state update
-    * given the constraints of lanes on the physical
-    * port group/QSFP. More checks can be added as needed.
-    */
+  /*
+   * Setup linkscan unless its explicitly disabled via featuresDesired_ flag
+   */
+  void setupLinkscan();
+  /*
+   * Setup packet RX unless its explicitly disabled via featuresDesired_ flag
+   */
+  void setupPacketRx();
+
+ /*
+  * Check if state, speed update for this port port would
+  * be permissible in the hardware.
+  * Right now we check for valid speed and port state update
+  * given the constraints of lanes on the physical
+  * port group/QSFP. More checks can be added as needed.
+  */
   bool isValidPortUpdate(const std::shared_ptr<Port>& oldPort,
     const std::shared_ptr<Port>& newPort,
     const std::shared_ptr<SwitchState>& newState) const;
@@ -602,9 +688,9 @@ class BcmSwitch : public BcmSwitchIf {
    */
   BcmPlatform* platform_{nullptr};
   Callback* callback_{nullptr};
-  std::unique_ptr<BcmUnit> unitObject_;
   int unit_{-1};
   uint32_t flags_{0};
+  uint32_t featuresDesired_{PACKET_RX_DESIRED | LINKSCAN_DESIRED};
   HashMode hashMode_;
   MmuState mmuState_{MmuState::UNKNOWN};
   bool bufferStatsEnabled_{false};
@@ -618,12 +704,14 @@ class BcmSwitch : public BcmSwitchIf {
   std::unique_ptr<BcmHostTable> hostTable_;
   std::unique_ptr<BcmRouteTable> routeTable_;
   std::unique_ptr<BcmAclTable> aclTable_;
+  std::unique_ptr<BcmStatUpdater> bcmStatUpdater_;
   std::unique_ptr<BcmCosManager> cosManager_;
   std::unique_ptr<BcmTableStats> bcmTableStats_;
   std::unique_ptr<BufferStatsLogger> bufferStatsLogger_;
   std::unique_ptr<BcmTrunkTable> trunkTable_;
   std::unique_ptr<BcmSflowExporterTable> sFlowExporterTable_;
   std::unique_ptr<BcmControlPlane> controlPlane_;
+  std::unique_ptr<BcmRtag7LoadBalancer> rtag7LoadBalancer_;
 
   /*
    * TODO - Right now we setup copp using logic embedded in code.
@@ -633,6 +721,8 @@ class BcmSwitch : public BcmSwitchIf {
    * variable.
    */
   std::vector<std::shared_ptr<AclEntry>> coppAclEntries_;
+  std::unique_ptr<BcmUnit> unitObject_;
+  BootType bootType_{BootType::UNINITIALIZED};
 
   /*
    * Lock to synchronize access to all BCM* data structures

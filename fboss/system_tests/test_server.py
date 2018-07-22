@@ -62,9 +62,10 @@ class TestServer(TestService.Iface):
 
     def ping(self, ip, options=None):
         """ @param ip : a string, e.g., "128.8.128.118" """
-        # Ping default options is to capture 1 packet
+        # Ping default options is to capture 3 packets
+        # 1 ping only is not resilient enough, and will cause flaky tests
         if not options:
-            options = ['-c', '1']
+            options = ['-c', '3']
         if ":" in ip:
             options.append('-6')
 
@@ -159,8 +160,6 @@ class TestServer(TestService.Iface):
         """ To send a packet, we need an open_live call.
             If one's already open, use that, if not, start and
             stop one quickly """
-        self.log.warning("Doing sendPkt(%s,len(%s))" % (interface_name,
-                                                    len(pkt)))
         ## NOTE: pcapy.reader.sendpacket() is not implemented!  use python
         raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
         raw.bind((interface_name, 0))

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <folly/io/async/EventBase.h>
+#include <folly/Conv.h>
 #include <folly/MacAddress.h>
 #include <memory>
 #include "fboss/agent/types.h"
@@ -104,10 +105,6 @@ class Platform {
   virtual std::string getVolatileStateDir() const = 0;
 
   /*
-   * Get filename where switch state JSON maybe stored
-   */
-  std::string getWarmBootSwitchStateFile() const;
-  /*
    * Get the directory where we will dump info when there is a crash.
    *
    * The directory is in persistent storage.
@@ -145,7 +142,7 @@ class Platform {
    * TODO(aeckert): make pure virtual once all platforms implement this.
    */
   virtual std::unique_ptr<HwTestHandle> createTestHandle(
-      std::unique_ptr<SwSwitch> sw) {
+      std::unique_ptr<SwSwitch> /*sw*/) {
     return nullptr;
   };
 

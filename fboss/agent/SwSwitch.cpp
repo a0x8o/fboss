@@ -13,29 +13,45 @@
 #include <thrift/lib/cpp2/async/HeaderClientChannel.h>
 #include <thrift/lib/cpp2/async/RequestChannel.h>
 
+#include <folly/Demangle.h>
+#include <folly/FileUtil.h>
+#include <folly/GLog.h>
+#include <folly/MacAddress.h>
+#include <folly/MapUtil.h>
+#include <folly/SocketAddress.h>
+#include <folly/String.h>
+#include <folly/logging/xlog.h>
+#include <folly/system/ThreadName.h>
+#include <glog/logging.h>
+#include <chrono>
+#include <condition_variable>
+#include <exception>
+#include <tuple>
 #include "common/stats/ServiceData.h"
+#include "fboss/agent/ApplyThriftConfig.h"
 #include "fboss/agent/ArpHandler.h"
 #include "fboss/agent/Constants.h"
-#include "fboss/agent/LacpTypes.h"
-#include "fboss/agent/IPv4Handler.h"
-#include "fboss/agent/IPv6Handler.h"
-#include "fboss/agent/RouteUpdateLogger.h"
-#include "fboss/agent/NeighborUpdater.h"
-#include "fboss/agent/UnresolvedNhopsProber.h"
 #include "fboss/agent/FbossError.h"
 #include "fboss/agent/HwSwitch.h"
+#include "fboss/agent/IPv4Handler.h"
+#include "fboss/agent/IPv6Handler.h"
+#include "fboss/agent/LacpTypes.h"
+#include "fboss/agent/LinkAggregationManager.h"
+#include "fboss/agent/LldpManager.h"
+#include "fboss/agent/NeighborUpdater.h"
 #include "fboss/agent/Platform.h"
+#include "fboss/agent/PortRemediator.h"
 #include "fboss/agent/PortStats.h"
 #include "fboss/agent/PortUpdateHandler.h"
+#include "fboss/agent/RouteUpdateLogger.h"
 #include "fboss/agent/RxPacket.h"
+#include "fboss/agent/SwitchStats.h"
+#include "fboss/agent/ThriftHandler.h"
 #include "fboss/agent/TunManager.h"
 #include "fboss/agent/TxPacket.h"
-#include "fboss/agent/SwitchStats.h"
 #include "fboss/agent/Utils.h"
 #include "fboss/agent/capture/PktCaptureManager.h"
-#include "fboss/pcap_distribution_service/if/gen-cpp2/PcapPushSubscriber.h"
-#include "fboss/pcap_distribution_service/if/gen-cpp2/pcap_pubsub_constants.h"
-#include "fboss/agent/LinkAggregationManager.h"
+#include "fboss/agent/gen-cpp2/switch_config_types_custom_protocol.h"
 #include "fboss/agent/packet/EthHdr.h"
 #include "fboss/agent/packet/IPv4Hdr.h"
 #include "fboss/agent/packet/IPv6Hdr.h"
@@ -45,24 +61,8 @@
 #include "fboss/agent/state/StateDelta.h"
 #include "fboss/agent/state/StateUpdateHelpers.h"
 #include "fboss/agent/state/SwitchState.h"
-#include "fboss/agent/ApplyThriftConfig.h"
-#include "fboss/agent/LldpManager.h"
-#include "fboss/agent/PortRemediator.h"
-#include "fboss/agent/gen-cpp2/switch_config_types_custom_protocol.h"
-#include "fboss/agent/ThriftHandler.h"
-#include <folly/FileUtil.h>
-#include <folly/MacAddress.h>
-#include <folly/MapUtil.h>
-#include <folly/String.h>
-#include <folly/Logging.h>
-#include <folly/SocketAddress.h>
-#include <folly/system/ThreadName.h>
-#include <folly/Demangle.h>
-#include <chrono>
-#include <exception>
-#include <condition_variable>
-#include <glog/logging.h>
-#include <tuple>
+#include "fboss/pcap_distribution_service/if/gen-cpp2/PcapPushSubscriber.h"
+#include "fboss/pcap_distribution_service/if/gen-cpp2/pcap_pubsub_constants.h"
 
 using folly::EventBase;
 using folly::io::Cursor;
@@ -197,7 +197,7 @@ void SwSwitch::constructPushClient(uint16_t port) {
 
 void SwSwitch::killDistributionProcess(){
   pcapPusher_->future_kill();
-  LOG(INFO) << "KILLING DISTRIBUTION PROCESS FROM AGENT";
+  XLOG(INFO) << "KILLING DISTRIBUTION PROCESS FROM AGENT";
 }
 
 SwSwitch::~SwSwitch() {
@@ -207,7 +207,7 @@ SwSwitch::~SwSwitch() {
 void SwSwitch::stop() {
   setSwitchRunState(SwitchRunState::EXITING);
 
-  LOG(INFO) << "Stopping SwSwitch...";
+  XLOG(INFO) << "Stopping SwSwitch...";
 
   // First tell the hw to stop sending us events by unregistering the callback
   // After this we should no longer receive packets or link state changed events
@@ -241,10 +241,6 @@ void SwSwitch::stop() {
     lagManager_.reset();
   }
 
-  if (unresolvedNhopsProber_) {
-    unresolvedNhopsProber_.reset();
-  }
-
   // Need to destroy IPv6Handler as it is a state observer,
   // but we must do it after we've stopped TunManager.
   // Otherwise, we might attempt to call sendL3Packet which
@@ -257,6 +253,7 @@ void SwSwitch::stop() {
   updThreadHeartbeat_.reset();
   packetTxThreadHeartbeat_.reset();
   lacpThreadHeartbeat_.reset();
+  neighborCacheThreadHeartbeat_.reset();
 
   // stops the background and update threads.
   stopThreads();
@@ -303,20 +300,20 @@ SwSwitch::SwitchRunState SwSwitch::getSwitchRunState() const {
 void SwSwitch::gracefulExit() {
   if (isFullyInitialized()) {
     steady_clock::time_point begin = steady_clock::now();
-    LOG(INFO) << "[Exit] Starting SwSwitch graceful exit";
+    XLOG(INFO) << "[Exit] Starting SwSwitch graceful exit";
     ipv6_->floodNeighborAdvertisements();
     arp_->floodGratuituousArp();
     steady_clock::time_point neighborFloodDone = steady_clock::now();
-    LOG(INFO)
+    XLOG(INFO)
         << "[Exit] Neighbor flood time "
         << duration_cast<duration<float>>(neighborFloodDone - begin).count();
     // Stop handlers and threads before uninitializing h/w
     stop();
     steady_clock::time_point stopThreadsAndHandlersDone = steady_clock::now();
-    LOG(INFO) << "[Exit] Stop thread and handlers time "
-              << duration_cast<duration<float>>(
-                     stopThreadsAndHandlersDone - neighborFloodDone)
-                     .count();
+    XLOG(INFO) << "[Exit] Stop thread and handlers time "
+               << duration_cast<duration<float>>(
+                      stopThreadsAndHandlersDone - neighborFloodDone)
+                      .count();
 
     folly::dynamic switchState = folly::dynamic::object;
     // TODO - Serialize both desired and applied state to
@@ -325,13 +322,13 @@ void SwSwitch::gracefulExit() {
     // desired state.
     switchState[kSwSwitch] = getAppliedState()->toFollyDynamic();
     steady_clock::time_point switchStateToFollyDone = steady_clock::now();
-    LOG(INFO) << "[Exit] Switch state to folly dynamic "
-              << duration_cast<duration<float>>(
-                     switchStateToFollyDone - stopThreadsAndHandlersDone)
-                     .count();
+    XLOG(INFO) << "[Exit] Switch state to folly dynamic "
+               << duration_cast<duration<float>>(
+                      switchStateToFollyDone - stopThreadsAndHandlersDone)
+                      .count();
     // Cleanup if we ever initialized
     hw_->gracefulExit(switchState);
-    LOG(INFO)
+    XLOG(INFO)
         << "[Exit] SwSwitch Graceful Exit time "
         << duration_cast<duration<float>>(steady_clock::now() - begin).count();
   }
@@ -345,15 +342,14 @@ void SwSwitch::updateStats(){
     getHw()->updateStats(stats());
   } catch (const std::exception& ex) {
     stats()->updateStatsException();
-    LOG(ERROR) << "Error running updateStats: "
-      << folly::exceptionStr(ex);
+    XLOG(ERR) << "Error running updateStats: " << folly::exceptionStr(ex);
   }
 }
 
 void SwSwitch::registerNeighborListener(
     std::function<void(const std::vector<std::string>& added,
                        const std::vector<std::string>& deleted)> callback) {
-  VLOG(2) << "Registering neighbor listener";
+  XLOG(DBG2) << "Registering neighbor listener";
   lock_guard<mutex> g(neighborListenerMutex_);
   neighborListener_ = std::move(callback);
 }
@@ -376,7 +372,7 @@ void SwSwitch::exitFatal() const noexcept {
   switchState[kSwSwitch] =  getAppliedState()->toFollyDynamic();
   switchState[kHwSwitch] = hw_->toFollyDynamic();
   if (!dumpStateToFile(platform_->getCrashSwitchStateFile(), switchState)) {
-    LOG(ERROR) << "Unable to write switch state JSON to file";
+    XLOG(ERR) << "Unable to write switch state JSON to file";
   }
 }
 
@@ -432,8 +428,8 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
   auto initialStateDesired = hwInitRet.switchState;
   bootType_ = hwInitRet.bootType;
 
-  VLOG(0) << "hardware initialized in " <<
-    hwInitRet.bootTime << " seconds; applying initial config";
+  XLOG(DBG0) << "hardware initialized in " << hwInitRet.bootTime
+             << " seconds; applying initial config";
 
   // Store the initial state
   initialState->publish();
@@ -453,11 +449,11 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
   // route
   RouteUpdater updater(initialStateDesired->getRouteTables());
   updater.addRoute(RouterID(0), folly::IPAddressV4("0.0.0.0"), 0,
-      StdClientIds2ClientID(StdClientIds::STATIC_ROUTE),
+      StdClientIds2ClientID(StdClientIds::STATIC_INTERNAL),
       RouteNextHopEntry(RouteForwardAction::DROP,
         AdminDistance::MAX_ADMIN_DISTANCE));
   updater.addRoute(RouterID(0), folly::IPAddressV6("::"), 0,
-      StdClientIds2ClientID(StdClientIds::STATIC_ROUTE),
+      StdClientIds2ClientID(StdClientIds::STATIC_INTERNAL),
       RouteNextHopEntry(RouteForwardAction::DROP,
         AdminDistance::MAX_ADMIN_DISTANCE));
   auto newRt = updater.updateDone();
@@ -483,7 +479,7 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
   }
 
   startThreads();
-  LOG(INFO)
+  XLOG(INFO)
       << "Time to init switch and start all threads "
       << duration_cast<duration<float>>(steady_clock::now() - begin).count();
 
@@ -499,13 +495,6 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
 
   if (flags & SwitchFlags::ENABLE_LLDP) {
     lldpManager_ = std::make_unique<LldpManager>(this);
-  }
-
-  if (flags & SwitchFlags::ENABLE_NHOPS_PROBER) {
-    unresolvedNhopsProber_ = std::make_unique<UnresolvedNhopsProber>(this);
-    // Feed initial state.
-    unresolvedNhopsProber_->stateUpdated(
-        StateDelta(std::make_shared<SwitchState>(), getState()));
   }
 
   if (flags & SwitchFlags::ENABLE_LACP) {
@@ -547,6 +536,15 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
       *folly::getThreadName(lacpThread_->get_id()),
       FLAGS_thread_heartbeat_ms,
       updateLacpThreadHeartbeatStats);
+
+  neighborCacheThreadHeartbeat_ = std::make_unique<ThreadHeartbeat>(
+      &neighborCacheEventBase_,
+      *folly::getThreadName(neighborCacheThread_->get_id()),
+      FLAGS_thread_heartbeat_ms,
+      [this](int delay, int backlog) {
+        stats()->neighborCacheHeartbeatDelay(delay);
+        stats()->neighborCacheEventBacklog(backlog);
+      });
 
   portRemediator_->init();
 
@@ -612,7 +610,7 @@ void SwSwitch::fibSynced() {
 
 void SwSwitch::registerStateObserver(StateObserver* observer,
                                      const string name) {
-  VLOG(2) << "Registering state observer: " << name;
+  XLOG(DBG2) << "Registering state observer: " << name;
   updateEventBase_.runImmediatelyOrRunInEventBaseThreadAndWait([=]() {
       addStateObserver(observer, name);
   });
@@ -657,8 +655,8 @@ void SwSwitch::notifyStateObservers(const StateDelta& delta) {
       observer->stateUpdated(delta);
     } catch (const std::exception& ex) {
     // TODO: Figure out the best way to handle errors here.
-      LOG(FATAL) << "error notifying " << observerName.second << " of update: "
-                 << folly::exceptionStr(ex);
+    XLOG(FATAL) << "error notifying " << observerName.second
+                << " of update: " << folly::exceptionStr(ex);
     }
   }
 }
@@ -784,7 +782,7 @@ void SwSwitch::handlePendingUpdates() {
     ++iter;
 
     shared_ptr<SwitchState> intermediateState;
-    LOG(INFO) << "preparing state update " << update->getName();
+    XLOG(INFO) << "preparing state update " << update->getName();
     try {
       intermediateState = update->applyUpdate(newDesiredState);
     } catch (const std::exception& ex) {
@@ -863,10 +861,9 @@ int SwSwitch::getHighresSamplers(HighresSamplerList* samplers,
     unique_ptr<HighresSampler> sampler;
 
     // Check for cross-platform samplers
-    if (namespaceString.compare(DumbCounterSampler::kIdentifier) == 0) {
+    if (namespaceString == DumbCounterSampler::kIdentifier) {
       sampler = make_unique<DumbCounterSampler>(counterSet);
-    } else if (namespaceString.compare(InterfaceRateSampler::kIdentifier) ==
-               0) {
+    } else if (namespaceString == InterfaceRateSampler::kIdentifier) {
       sampler = make_unique<InterfaceRateSampler>(counterSet);
     }
 
@@ -875,7 +872,7 @@ int SwSwitch::getHighresSamplers(HighresSamplerList* samplers,
         numCountersAdded += sampler->numCounters();
         samplers->push_back(std::move(sampler));
       } else {
-        LOG(WARNING) << "Cannot use " << namespaceString;
+        XLOG(WARNING) << "Cannot use " << namespaceString;
       }
     } else {
       // Otherwise, check if the hwSwitch knows which samplers to add
@@ -883,7 +880,7 @@ int SwSwitch::getHighresSamplers(HighresSamplerList* samplers,
       if (n > 0) {
         numCountersAdded += n;
       } else {
-        LOG(WARNING) << "No counters added for namespace: " << namespaceString;
+        XLOG(WARNING) << "No counters added for namespace: " << namespaceString;
       }
     }
   }
@@ -919,8 +916,8 @@ std::shared_ptr<SwitchState> SwSwitch::applyUpdate(
   DCHECK_EQ(oldState, getAppliedState());
 
   auto start = std::chrono::steady_clock::now();
-  LOG(INFO) << "Updating state: old_gen=" << oldState->getGeneration() <<
-    " new_gen=" << newState->getGeneration();
+  XLOG(INFO) << "Updating state: old_gen=" << oldState->getGeneration()
+             << " new_gen=" << newState->getGeneration();
   DCHECK_GT(newState->getGeneration(), oldState->getGeneration());
 
   StateDelta delta(oldState, newState);
@@ -952,8 +949,8 @@ std::shared_ptr<SwitchState> SwSwitch::applyUpdate(
     //
     // Another thing we could try here is rolling back to the old state.
     hw_->exitFatal();
-    LOG(FATAL) << "error applying state change to hardware: " <<
-      folly::exceptionStr(ex);
+    XLOG(FATAL) << "error applying state change to hardware: "
+                << folly::exceptionStr(ex);
   }
 
   setStateInternal(newAppliedState, newState);
@@ -968,7 +965,7 @@ std::shared_ptr<SwitchState> SwSwitch::applyUpdate(
   auto duration =
     std::chrono::duration_cast<std::chrono::microseconds>(end - start);
   stats()->stateUpdate(duration);
-  VLOG(0) << "Update state took " << duration.count() << "us";
+  XLOG(DBG0) << "Update state took " << duration.count() << "us";
   return newAppliedState;
 }
 
@@ -984,7 +981,7 @@ PortStats* SwSwitch::portStats(PortID portID) {
       portID, getState()->getPort(portID)->getName());
   } else {
     // only for port0 case
-    VLOG(0) << "Port node doesn't exist, use default name=port" << portID;
+    XLOG(DBG0) << "Port node doesn't exist, use default name=port" << portID;
     return stats()->createPortStats(portID, folly::to<string>("port", portID));
   }
 }
@@ -1029,8 +1026,7 @@ void SwSwitch::packetReceived(std::unique_ptr<RxPacket> pkt) noexcept {
     handlePacket(std::move(pkt));
   } catch (const std::exception& ex) {
     portStats(port)->pktError();
-    LOG(ERROR) << "error processing trapped packet: " <<
-      folly::exceptionStr(ex);
+    XLOG(ERR) << "error processing trapped packet: " << folly::exceptionStr(ex);
     // Return normally, without letting the exception propagate to our caller.
     return;
   }
@@ -1076,13 +1072,14 @@ void SwSwitch::handlePacket(std::unique_ptr<RxPacket> pkt) {
     publishRxPacket(pkt.get(), ethertype);
   }
 
-  VLOG(5) << "trapped packet: src_port=" << pkt->getSrcPort() << " srcAggPort="
-          << (pkt->isFromAggregatePort()
-                  ? folly::to<string>(pkt->getSrcAggregatePort())
-                  : "None")
-          << " vlan=" << pkt->getSrcVlan() << " length=" << len
-          << " src=" << srcMac << " dst=" << dstMac << " ethertype=0x"
-          << std::hex << ethertype << " :: " << pkt->describeDetails();
+  XLOG(DBG5) << "trapped packet: src_port=" << pkt->getSrcPort()
+             << " srcAggPort="
+             << (pkt->isFromAggregatePort()
+                     ? folly::to<string>(pkt->getSrcAggregatePort())
+                     : "None")
+             << " vlan=" << pkt->getSrcVlan() << " length=" << len
+             << " src=" << srcMac << " dst=" << dstMac << " ethertype=0x"
+             << std::hex << ethertype << " :: " << pkt->describeDetails();
 
   switch (ethertype) {
   case ArpHandler::ETHERTYPE_ARP:
@@ -1112,7 +1109,8 @@ void SwSwitch::handlePacket(std::unique_ptr<RxPacket> pkt) {
         LOG_EVERY_N(WARNING, 60) << "Received LACP frame but LACP not enabled";
       }
     } else if (subtype == LACPDU::EtherSubtype::MARKER) {
-      LOG(WARNING) << "Received Marker frame but Marker Protocol not supported";
+      XLOG(WARNING)
+          << "Received Marker frame but Marker Protocol not supported";
     }
   }
     return;
@@ -1126,7 +1124,8 @@ void SwSwitch::handlePacket(std::unique_ptr<RxPacket> pkt) {
 }
 
 void SwSwitch::linkStateChanged(PortID portId, bool up) {
-  LOG(INFO) << "Link state changed: " << portId << "->" << (up ? "UP" : "DOWN");
+  XLOG(INFO) << "Link state changed: " << portId << "->"
+             << (up ? "UP" : "DOWN");
   if (not isFullyInitialized()) {
     return;
   }
@@ -1168,6 +1167,9 @@ void SwSwitch::startThreads() {
       [=] { this->threadLoop("fbossQsfpCacheThread", &qsfpCacheEventBase_); }));
   lacpThread_.reset(new std::thread(
       [=] { this->threadLoop("fbossLacpThread", &lacpEventBase_); }));
+  neighborCacheThread_.reset(new std::thread([=] {
+    this->threadLoop("fbossNeighborCacheThread", &neighborCacheEventBase_);
+  }));
 }
 
 void SwSwitch::stopThreads() {
@@ -1201,6 +1203,10 @@ void SwSwitch::stopThreads() {
     lacpEventBase_.runInEventBaseThread(
         [this] { lacpEventBase_.terminateLoopSoon(); });
   }
+  if (neighborCacheThread_) {
+    neighborCacheEventBase_.runInEventBaseThread(
+        [this] { neighborCacheEventBase_.terminateLoopSoon(); });
+  }
   if (backgroundThread_) {
     backgroundThread_->join();
   }
@@ -1218,6 +1224,9 @@ void SwSwitch::stopThreads() {
   }
   if (lacpThread_) {
     lacpThread_->join();
+  }
+  if (neighborCacheThread_) {
+    neighborCacheThread_->join();
   }
 }
 
@@ -1267,7 +1276,7 @@ void SwSwitch::sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
     // send failures--even on successful return from sendPacket*() the
     // send may ultimately fail since it occurs asynchronously in the
     // background.
-    LOG(ERROR) << "failed to send packet out port " << portID;
+    XLOG(ERR) << "failed to send packet out port " << portID;
   }
 }
 
@@ -1276,15 +1285,15 @@ void SwSwitch::sendPacketOutOfPort(
     AggregatePortID aggPortID) noexcept {
   auto aggPort = getState()->getAggregatePorts()->getAggregatePortIf(aggPortID);
   if (!aggPort) {
-    LOG(ERROR) << "failed to send packet out aggregate port " << aggPortID
-               << ": no aggregate port corresponding to identifier";
+    XLOG(ERR) << "failed to send packet out aggregate port " << aggPortID
+              << ": no aggregate port corresponding to identifier";
     return;
   }
 
   auto subportAndFwdStates = aggPort->subportAndFwdState();
   if (subportAndFwdStates.begin() == subportAndFwdStates.end()) {
-    LOG(ERROR) << "failed to send packet out aggregate port " << aggPortID
-               << ": aggregate port has no constituent physical ports";
+    XLOG(ERR) << "failed to send packet out aggregate port " << aggPortID
+              << ": aggregate port has no constituent physical ports";
     return;
   }
 
@@ -1308,8 +1317,8 @@ void SwSwitch::sendPacketOutOfPort(
       return;
     }
   }
-  LOG(INFO) << "failed to send packet out aggregate port" << aggPortID
-            << ": aggregate port has no enabled physical ports";
+  XLOG(INFO) << "failed to send packet out aggregate port" << aggPortID
+             << ": aggregate port has no enabled physical ports";
 }
 
 void SwSwitch::sendPacketSwitched(std::unique_ptr<TxPacket> pkt) noexcept {
@@ -1319,7 +1328,7 @@ void SwSwitch::sendPacketSwitched(std::unique_ptr<TxPacket> pkt) noexcept {
     // send failures--even on successful return from sendPacketSwitched() the
     // send may ultimately fail since it occurs asynchronously in the
     // background.
-    LOG(ERROR) << "failed to send L2 switched packet";
+    XLOG(ERR) << "failed to send L2 switched packet";
   }
 }
 
@@ -1339,10 +1348,9 @@ void SwSwitch::sendL3Packet(
   const uint32_t minLen = 68;
   uint32_t tailRoom = (l2Len + l3Len >= minLen) ? 0 : minLen - l2Len - l3Len;
   if (buf->headroom() < l2Len || buf->tailroom() < tailRoom) {
-    LOG(ERROR) << "Packet is not big enough headroom=" << buf->headroom()
-               << " required=" << l2Len
-               << ", tailroom=" << buf->tailroom()
-               << " required=" << tailRoom;
+    XLOG(ERR) << "Packet is not big enough headroom=" << buf->headroom()
+              << " required=" << l2Len << ", tailroom=" << buf->tailroom()
+              << " required=" << tailRoom;
     return;
   }
 
@@ -1353,7 +1361,7 @@ void SwSwitch::sendL3Packet(
   if (maybeIfID.hasValue()) {
     auto intf = state->getInterfaces()->getInterfaceIf(*maybeIfID);
     if (!intf) {
-      LOG(ERROR) << "Interface " << *maybeIfID << " doesn't exists in state.";
+      XLOG(ERR) << "Interface " << *maybeIfID << " doesn't exists in state.";
       return;
     }
 
@@ -1464,8 +1472,7 @@ void SwSwitch::sendL3Packet(
     stats()->pktFromHost(l3Len);
     sendPacketSwitched(std::move(pkt));
   } catch (const std::exception& ex) {
-    LOG(ERROR) << "Failed to send out L3 packet :"
-               << folly::exceptionStr(ex);
+    XLOG(ERR) << "Failed to send out L3 packet :" << folly::exceptionStr(ex);
   }
 }
 
@@ -1487,8 +1494,8 @@ void SwSwitch::applyConfig(const std::string& reason) {
         std::string configFilename = FLAGS_config;
         std::pair<shared_ptr<SwitchState>, std::string> rval;
         if (!configFilename.empty()) {
-          LOG(INFO) << "Loading config from local config file "
-                    << configFilename;
+          XLOG(INFO) << "Loading config from local config file "
+                     << configFilename;
           rval = applyThriftConfigFile(state, configFilename, platform_.get(),
               &curConfig_);
         } else {
@@ -1541,12 +1548,12 @@ AdminDistance SwSwitch::clientIdToAdminDistance(int clientId) const {
   auto distance = curConfig_.clientIdToAdminDistance.find(clientId);
   if (distance == curConfig_.clientIdToAdminDistance.end()) {
     // In case we get a client id we don't know about
-    LOG(ERROR) << "No admin distance mapping available for client id "
-               << clientId << ". Using default distance - MAX_ADMIN_DISTANCE";
+    XLOG(ERR) << "No admin distance mapping available for client id "
+              << clientId << ". Using default distance - MAX_ADMIN_DISTANCE";
     return AdminDistance::MAX_ADMIN_DISTANCE;
   }
 
-  if (VLOG_IS_ON(3)) {
+  if (XLOG_IS_ON(DBG3)) {
     auto clientName = folly::get_default(
         _StdClientIds_VALUES_TO_NAMES, StdClientIds(clientId),
         "UNKNOWN");
@@ -1554,9 +1561,9 @@ AdminDistance SwSwitch::clientIdToAdminDistance(int clientId) const {
         _AdminDistance_VALUES_TO_NAMES,
         static_cast<AdminDistance>(distance->second),
         "UNKNOWN");
-    VLOG(3) << "Mapping client id " << clientId << " (" << clientName
-            << ") to admin distance " << distance->second << " ("
-            << distanceString << ").";
+    XLOG(DBG3) << "Mapping client id " << clientId << " (" << clientName
+               << ") to admin distance " << distance->second << " ("
+               << distanceString << ").";
   }
 
   return static_cast<AdminDistance>(distance->second);

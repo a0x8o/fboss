@@ -128,7 +128,7 @@ std::shared_ptr<SwitchState> applyInitConfig() {
   config.interfaces[0].vlanID = 1;
   config.interfaces[0].routerID = 0;
   config.interfaces[0].__isset.mac = true;
-  config.interfaces[0].mac = "00:00:00:00:00:11";
+  config.interfaces[0].mac_ref().value_unchecked() = "00:00:00:00:00:11";
   config.interfaces[0].ipAddresses.resize(2);
   config.interfaces[0].ipAddresses[0] = "1.1.1.1/24";
   config.interfaces[0].ipAddresses[1] = "1::1/48";
@@ -137,7 +137,7 @@ std::shared_ptr<SwitchState> applyInitConfig() {
   config.interfaces[1].vlanID = 2;
   config.interfaces[1].routerID = 0;
   config.interfaces[1].__isset.mac = true;
-  config.interfaces[1].mac = "00:00:00:00:00:22";
+  config.interfaces[1].mac_ref().value_unchecked() = "00:00:00:00:00:22";
   config.interfaces[1].ipAddresses.resize(2);
   config.interfaces[1].ipAddresses[0] = "2.2.2.2/24";
   config.interfaces[1].ipAddresses[1] = "2::1/48";
@@ -146,7 +146,7 @@ std::shared_ptr<SwitchState> applyInitConfig() {
   config.interfaces[2].vlanID = 3;
   config.interfaces[2].routerID = 0;
   config.interfaces[2].__isset.mac = true;
-  config.interfaces[2].mac = "00:00:00:00:00:33";
+  config.interfaces[2].mac_ref().value_unchecked() = "00:00:00:00:00:33";
   config.interfaces[2].ipAddresses.resize(2);
   config.interfaces[2].ipAddresses[0] = "3.3.3.3/24";
   config.interfaces[2].ipAddresses[1] = "3::1/48";
@@ -155,7 +155,7 @@ std::shared_ptr<SwitchState> applyInitConfig() {
   config.interfaces[3].vlanID = 4;
   config.interfaces[3].routerID = 0;
   config.interfaces[3].__isset.mac = true;
-  config.interfaces[3].mac = "00:00:00:00:00:44";
+  config.interfaces[3].mac_ref().value_unchecked() = "00:00:00:00:00:44";
   config.interfaces[3].ipAddresses.resize(2);
   config.interfaces[3].ipAddresses[0] = "4.4.4.4/24";
   config.interfaces[3].ipAddresses[1] = "4::1/48";
@@ -638,7 +638,7 @@ TEST(Route, Interface) {
   config.interfaces[0].vlanID = 1;
   config.interfaces[0].routerID = 0;
   config.interfaces[0].__isset.mac = true;
-  config.interfaces[0].mac = "00:00:00:00:00:11";
+  config.interfaces[0].mac_ref().value_unchecked() = "00:00:00:00:00:11";
   config.interfaces[0].ipAddresses.resize(2);
   config.interfaces[0].ipAddresses[0] = "1.1.1.1/24";
   config.interfaces[0].ipAddresses[1] = "1::1/48";
@@ -646,7 +646,7 @@ TEST(Route, Interface) {
   config.interfaces[1].vlanID = 2;
   config.interfaces[1].routerID = 0;
   config.interfaces[1].__isset.mac = true;
-  config.interfaces[1].mac = "00:00:00:00:00:22";
+  config.interfaces[1].mac_ref().value_unchecked() = "00:00:00:00:00:22";
   config.interfaces[1].ipAddresses.resize(2);
   config.interfaces[1].ipAddresses[0] = "2.2.2.2/24";
   config.interfaces[1].ipAddresses[1] = "2::1/48";
@@ -752,7 +752,7 @@ TEST(Route, MultipleAddressInterface) {
   config.interfaces[0].vlanID = 1;
   config.interfaces[0].routerID = 0;
   config.interfaces[0].__isset.mac = true;
-  config.interfaces[0].mac = "00:00:00:00:00:11";
+  config.interfaces[0].mac_ref().value_unchecked() = "00:00:00:00:00:11";
   config.interfaces[0].ipAddresses.resize(4);
   config.interfaces[0].ipAddresses[0] = "1.1.1.1/24";
   config.interfaces[0].ipAddresses[1] = "1.1.1.2/24";
@@ -791,6 +791,72 @@ TEST(Route, MultipleAddressInterface) {
     EXPECT_EQ(RouteForwardAction::NEXTHOPS, rt->getForwardInfo().getAction());
     EXPECT_FWD_INFO(rt, InterfaceID(1), "1::2");
   }
+}
+
+// Test interface + static routes
+TEST(Route, InterfaceAndStatic) {
+  auto platform = createMockPlatform();
+  RouterID rid = RouterID(0);
+  auto stateV0 = make_shared<SwitchState>();
+  auto tablesV0 = stateV0->getRouteTables();
+
+  cfg::SwitchConfig config;
+  config.vlans.resize(2);
+  config.vlans[0].id = 1;
+  config.vlans[1].id = 2;
+
+  config.interfaces.resize(2);
+  config.interfaces[0].intfID = 1;
+  config.interfaces[0].vlanID = 1;
+  config.interfaces[0].routerID = 0;
+  config.interfaces[0].__isset.mac = true;
+  config.interfaces[0].mac_ref().value_unchecked() = "00:00:00:00:00:11";
+  config.interfaces[0].ipAddresses.resize(2);
+  config.interfaces[0].ipAddresses[0] = "1.1.1.1/24";
+  config.interfaces[0].ipAddresses[1] = "1::1/48";
+  config.interfaces[1].intfID = 2;
+  config.interfaces[1].vlanID = 2;
+  config.interfaces[1].routerID = 0;
+  config.interfaces[1].__isset.mac = true;
+  config.interfaces[1].mac_ref().value_unchecked() = "00:00:00:00:00:22";
+  config.interfaces[1].ipAddresses.resize(2);
+  config.interfaces[1].ipAddresses[0] = "2.2.2.2/24";
+  config.interfaces[1].ipAddresses[1] = "2::1/48";
+  // Add v4/v6 static routes with nhops
+  config.__isset.staticRoutesWithNhops = true;
+  config.staticRoutesWithNhops.resize(2);
+  config.staticRoutesWithNhops[0].nexthops.resize(1);
+  config.staticRoutesWithNhops[0].prefix = "2001::/64";
+  config.staticRoutesWithNhops[0].nexthops[0] = "2::2";
+  config.staticRoutesWithNhops[1].nexthops.resize(1);
+  config.staticRoutesWithNhops[1].prefix = "20.20.20.0/24";
+  config.staticRoutesWithNhops[1].nexthops[0] = "2.2.2.3";
+
+  auto insertStaticNoNhopRoutes = [=](auto& staticRouteNoNhops,
+                                      int prefixStartIdx) {
+    staticRouteNoNhops.resize(2);
+    staticRouteNoNhops[0].prefix = folly::sformat("240{}::/64", prefixStartIdx);
+    staticRouteNoNhops[1].prefix =
+        folly::sformat("30.30.{}.0/24", prefixStartIdx);
+  };
+  // Add v4/v6 static routes to CPU/NULL
+  config.__isset.staticRoutesToCPU = true;
+  insertStaticNoNhopRoutes(config.staticRoutesToCPU, 1);
+  config.__isset.staticRoutesToNull = true;
+  insertStaticNoNhopRoutes(config.staticRoutesToNull, 2);
+
+  auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
+  ASSERT_NE(nullptr, stateV1);
+  stateV1->publish();
+  auto tablesV1 = stateV1->getRouteTables();
+  EXPECT_NODEMAP_MATCH(tablesV1);
+  EXPECT_NE(tablesV0, tablesV1);
+  // 5 = 2 (interface routes) + 1 (static routes with nhops) +
+  // 1 static routes to CPU) + 1 (static routes to NULL)
+  EXPECT_EQ(5, tablesV1->getRouteTableIf(rid)->getRibV4()->size());
+  // 6 = 2 (interface routes) + 1 (static routes with nhops) +
+  // 1 (static routes to CPU) + 1 (static routes to NULL) + 1 (link local route)
+  EXPECT_EQ(6, tablesV1->getRouteTableIf(rid)->getRibV6()->size());
 }
 
 namespace TEMP {
@@ -947,12 +1013,12 @@ TEST(RouteTableMap, applyConfig) {
   config.interfaces[0].vlanID = 1;
   config.interfaces[0].routerID = 0;
   config.interfaces[0].__isset.mac = true;
-  config.interfaces[0].mac = "00:00:00:00:00:11";
+  config.interfaces[0].mac_ref().value_unchecked() = "00:00:00:00:00:11";
   config.interfaces[1].intfID = 2;
   config.interfaces[1].vlanID = 2;
   config.interfaces[1].routerID = 1;
   config.interfaces[1].__isset.mac = true;
-  config.interfaces[1].mac = "00:00:00:00:00:22";
+  config.interfaces[1].mac_ref().value_unchecked() = "00:00:00:00:00:22";
 
   auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
   ASSERT_NE(nullptr, stateV1);
@@ -1033,7 +1099,7 @@ TEST(RouteTableMap, applyConfig) {
   config.interfaces[2].vlanID = 3;
   config.interfaces[2].routerID = 2;
   config.interfaces[2].__isset.mac = true;
-  config.interfaces[2].mac = "00:00:00:00:00:33";
+  config.interfaces[2].mac_ref().value_unchecked() = "00:00:00:00:00:33";
   config.interfaces[2].ipAddresses.resize(2);
   config.interfaces[2].ipAddresses[0] = "1.1.1.1/24";
   config.interfaces[2].ipAddresses[1] = "::1/48";
@@ -1091,7 +1157,7 @@ TEST(Route, changedRoutesPostUpdate) {
   config.interfaces[0].vlanID = 1;
   config.interfaces[0].routerID = 0;
   config.interfaces[0].__isset.mac = true;
-  config.interfaces[0].mac = "00:00:00:00:00:11";
+  config.interfaces[0].mac_ref().value_unchecked() = "00:00:00:00:00:11";
   config.interfaces[0].ipAddresses.resize(2);
   config.interfaces[0].ipAddresses[0] = "1.1.1.1/24";
   config.interfaces[0].ipAddresses[1] = "1::1/48";
@@ -1226,7 +1292,7 @@ TEST(Route, PruneAddedRoutes) {
   config.interfaces[0].vlanID = 21;
   config.interfaces[0].routerID = 0;
   config.interfaces[0].__isset.mac = true;
-  config.interfaces[0].mac = "fa:ce:b0:0c:21:00";
+  config.interfaces[0].mac_ref().value_unchecked() = "fa:ce:b0:0c:21:00";
   config.interfaces[0].ipAddresses.resize(2);
   config.interfaces[0].ipAddresses[0] = "10.0.21.1/24";
   config.interfaces[0].ipAddresses[1] = "face:b00c:0:21::1/64";
@@ -1321,7 +1387,7 @@ TEST(Route, PruneChangedRoutes) {
   config.interfaces[0].vlanID = 21;
   config.interfaces[0].routerID = 0;
   config.interfaces[0].__isset.mac = true;
-  config.interfaces[0].mac = "fa:ce:b0:0c:21:00";
+  config.interfaces[0].mac_ref().value_unchecked() = "fa:ce:b0:0c:21:00";
   config.interfaces[0].ipAddresses.resize(2);
   config.interfaces[0].ipAddresses[0] = "10.0.21.1/24";
   config.interfaces[0].ipAddresses[1] = "face:b00c:0:21::1/64";
@@ -1404,7 +1470,7 @@ TEST(Route, PruneChangedRoutes) {
   auto revertedEntry =
       state4->getRouteTables()->getRouteTable(rid0)->getRibV6()->longestMatch(
           prefix42.network);
-  ASSERT(revertedEntry->isToCPU());
+  ASSERT_TRUE(revertedEntry->isToCPU());
   EXPECT_NODEMAP_MATCH(state4->getRouteTables());
 }
 
@@ -2084,8 +2150,7 @@ TEST(RouteTypes, toFromRouteNextHops) {
                     folly::Optional<InterfaceID> intf) {
     auto bAddr = facebook::network::toBinaryAddress(folly::IPAddress(ipaddr));
     if (intf.hasValue()) {
-      bAddr.__isset.ifName = true;
-      bAddr.ifName = util::createTunIntfName(intf.value());
+      bAddr.ifName_ref() = util::createTunIntfName(intf.value());
     }
     bool found = false;
     for (const auto& entry : nhts) {
@@ -2118,8 +2183,7 @@ TEST(RouteTypes, toFromRouteNextHops) {
   facebook::network::thrift::BinaryAddress addr;
 
   addr = facebook::network::toBinaryAddress(folly::IPAddress("10.0.0.1"));
-  addr.__isset.ifName = true;
-  addr.ifName = "fboss10";
+  addr.ifName_ref() = "fboss10";
   NextHopThrift nht;
   nht.address = addr;
   {
@@ -2129,8 +2193,7 @@ TEST(RouteTypes, toFromRouteNextHops) {
   }
 
   addr = facebook::network::toBinaryAddress(folly::IPAddress("face::1"));
-  addr.__isset.ifName = true;
-  addr.ifName = "fboss10";
+  addr.ifName_ref() = "fboss10";
   nht.address = addr;
   {
     NextHop nh = util::fromThrift(nht);
@@ -2139,8 +2202,7 @@ TEST(RouteTypes, toFromRouteNextHops) {
   }
 
   addr = facebook::network::toBinaryAddress(folly::IPAddress("fe80::1"));
-  addr.__isset.ifName = true;
-  addr.ifName = "fboss10";
+  addr.ifName_ref() = "fboss10";
   nht.address = addr;
   {
     NextHop nh = util::fromThrift(nht);

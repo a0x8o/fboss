@@ -17,7 +17,6 @@
 #include "common/fb303/cpp/FacebookBase2.h"
 #include "fboss/agent/FbossError.h"
 #include "fboss/agent/types.h"
-#include "fboss/agent/HighresCounterSubscriptionHandler.h"
 #include "fboss/agent/if/gen-cpp2/FbossCtrl.h"
 #include "fboss/agent/if/gen-cpp2/NeighborListenerClient.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
@@ -26,6 +25,7 @@
 #include <folly/String.h>
 #include <thrift/lib/cpp/server/TServerEventHandler.h>
 #include <thrift/lib/cpp2/async/DuplexChannel.h>
+#include <thrift/lib/cpp2/server/ThriftServer.h>
 
 namespace facebook { namespace fboss {
 
@@ -119,6 +119,7 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
                                           int32_t interfaceId) override;
   void getPortInfo(PortInfoThrift& portInfo, int32_t portId) override;
   void getAllPortInfo(std::map<int32_t, PortInfoThrift>& portInfo) override;
+  void clearPortStats(std::unique_ptr<std::vector<int32_t>> ports) override;
   void getPortStats(PortInfoThrift& portInfo, int32_t portId) override;
   void getAllPortStats(std::map<int32_t, PortInfoThrift>& portInfo) override;
   void getRunningConfig(std::string& configStr) override;
@@ -165,20 +166,6 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
    */
   void connectionDestroyed(
       apache::thrift::server::TConnectionContext* ctx) override;
-
-  /*
-   * Thrift handler for subscriptions to high-resolution counters.  The callback
-   * result is a boolean that designates whether or not any samplers were
-   * found.
-   *
-   * @param[in]    callback    The callback for after we finish processing the
-   *                           request.
-   * @param[in]    req         The subscription request, which specifies the
-   *                           counter names, timeouts, sampling intervals, etc.
-   */
-  void async_tm_subscribeToCounters(
-      ThriftCallback<bool> callback,
-      std::unique_ptr<CounterSubscribeRequest> req) override;
 
   /*
    * Thrift handler for keepalive messages.  It's a no-op, but prevents the
@@ -231,6 +218,14 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
   void patchCurrentStateJSON(
       std::unique_ptr<std::string> jsonPointer,
       std::unique_ptr<std::string> jsonPatch) override;
+
+  SwitchRunState getSwitchRunState() override;
+
+  void setSSLPolicy(apache::thrift::SSLPolicy sslPolicy) {
+    sslPolicy_ = sslPolicy;
+  }
+
+  SSLType getSSLPolicy() override;
 
  protected:
   void ensureConfigured(folly::StringPiece function);
@@ -313,10 +308,6 @@ class ThriftHandler : virtual public FbossCtrlSvIf,
   int thriftIdleTimeout_;
   std::vector<const TConnectionContext*> brokenClients_;
 
-  // A thread-safe data structure that helps the thrift handler map connection
-  // contexts to high resolution connection information
-  folly::Synchronized<
-      std::unordered_map<const apache::thrift::server::TConnectionContext*,
-                         std::shared_ptr<Signal>>> highresKillSwitches_;
+  apache::thrift::SSLPolicy sslPolicy_;
 };
 }} // facebook::fboss

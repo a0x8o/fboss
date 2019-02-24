@@ -27,9 +27,12 @@ extern "C" {
 #include <memory>
 #include <string>
 #include <vector>
+#include "fboss/agent/hw/bcm/BcmMirror.h"
+#include "fboss/agent/hw/bcm/BcmQosMap.h"
 #include "fboss/agent/hw/bcm/BcmRtag7Module.h"
-#include "fboss/agent/state/RouteTypes.h"
 #include "fboss/agent/hw/bcm/types.h"
+#include "fboss/agent/state/QosPolicy.h"
+#include "fboss/agent/state/RouteTypes.h"
 
 #include "fboss/agent/hw/bcm/BcmAclRange.h"
 
@@ -39,10 +42,14 @@ class BcmSwitch;
 class BcmSwitchIf;
 class InterfaceMap;
 class LoadBalancerMap;
+class QosPolicyMap;
 class RouteTableMap;
 class SwitchState;
 class Vlan;
+struct MirrorTunnel;
 class VlanMap;
+class MirrorMap;
+class PortMap;
 
 class BcmWarmBootCache {
  public:
@@ -98,6 +105,19 @@ class BcmWarmBootCache {
    */
   std::shared_ptr<AclMap> reconstructAclMap() const;
   std::shared_ptr<LoadBalancerMap> reconstructLoadBalancers() const;
+  std::shared_ptr<QosPolicyMap> reconstructQosPolicies() const;
+
+  /*
+   * Reconstruct mirror table
+   */
+  std::shared_ptr<MirrorMap> reconstructMirrors() const;
+
+  /*
+   * Reconstruct port vlan membership
+   */
+  void reconstructPortVlans(std::shared_ptr<SwitchState>* state) const;
+
+  void reconstructPortMirrors(std::shared_ptr<SwitchState>* state);
 
   /*
    * Get all cached ecmp egress Ids
@@ -144,6 +164,16 @@ class BcmWarmBootCache {
   // current h/w acls: key = priority, value = BcmAclEntryHandle
   using Priority2BcmAclEntryHandle = boost::container::flat_map<
         int, BcmAclEntryHandle>;
+  using MirrorEgressPath2Handle = boost::container::flat_map<
+      std::pair<opennsl_gport_t, folly::Optional<MirrorTunnel>>,
+      BcmMirrorHandle>;
+  using MirroredPort2Handle = boost::container::
+      flat_map<std::pair<opennsl_gport_t, MirrorDirection>, BcmMirrorHandle>;
+  using MirroredAcl2Handle = boost::container::
+      flat_map<std::pair<BcmAclEntryHandle, MirrorDirection>, BcmMirrorHandle>;
+  using IngressQosMaps = std::vector<std::unique_ptr<BcmQosMap>>;
+  using IngressQosMapsItr = IngressQosMaps::iterator;
+
   struct AclStatStatus {
     BcmAclStatHandle stat{-1};
     bool claimed{false};
@@ -188,6 +218,23 @@ class BcmWarmBootCache {
                         BcmAclStatHandle aclStatHandle);
 
   void populateRtag7State();
+  void populateIngressQosMaps();
+
+  void populateMirrors();
+  void populateMirroredPorts();
+  void populateMirroredPort(opennsl_gport_t port);
+  void populateMirroredAcl(BcmAclEntryHandle handle);
+
+  void removeUnclaimedMirrors();
+  void stopUnclaimedPortMirroring(
+      opennsl_gport_t port,
+      MirrorDirection direction,
+      BcmMirrorHandle mirror);
+  void stopUnclaimedAclMirroring(
+      BcmAclEntryHandle aclEntry,
+      MirrorDirection direction,
+      BcmMirrorHandle mirror);
+  void removeUnclaimedMirror(BcmMirrorHandle mirror);
 
  public:
   /*
@@ -402,10 +449,14 @@ class BcmWarmBootCache {
   AclEntry2AclStatItr AclEntry2AclStat_end() {
     return aclEntry2AclStat_.end();
   }
-  AclEntry2AclStatItr findAclStat(const BcmAclEntryHandle& bcmAclEntry) {
-    return aclEntry2AclStat_.find(bcmAclEntry);
-  }
+  AclEntry2AclStatItr findAclStat(const BcmAclEntryHandle& bcmAclEntry);
   void programmed(AclEntry2AclStatItr itr);
+
+  IngressQosMapsItr findIngressQosMap(const std::set<QosRule>& qosRules);
+  IngressQosMapsItr ingressQosMaps_end() {
+    return ingressQosMaps_.end();
+  }
+  void programmed(IngressQosMapsItr itr);
 
   /*
    * owner is done programming its entries remove any entries
@@ -421,6 +472,31 @@ class BcmWarmBootCache {
   const BcmSwitchIf* getHw() const {
     return hw_;
   }
+
+  using MirrorEgressPath2HandleCitr =
+      typename MirrorEgressPath2Handle::const_iterator;
+  MirrorEgressPath2HandleCitr mirrorsBegin() const;
+  MirrorEgressPath2HandleCitr mirrorsEnd() const;
+  MirrorEgressPath2HandleCitr findMirror(
+      opennsl_gport_t port,
+      const folly::Optional<MirrorTunnel>& tunnel) const;
+  void programmedMirror(MirrorEgressPath2HandleCitr itr);
+
+  using MirroredPort2HandleCitr = typename MirroredPort2Handle::const_iterator;
+  MirroredPort2HandleCitr mirroredPortsBegin() const;
+  MirroredPort2HandleCitr mirroredPortsEnd() const;
+  MirroredPort2HandleCitr findMirroredPort(
+      opennsl_gport_t port,
+      MirrorDirection direction) const;
+  void programmedMirroredPort(MirroredPort2HandleCitr itr);
+
+  using MirroredAcl2HandleCitr = typename MirroredAcl2Handle::const_iterator;
+  MirroredAcl2HandleCitr mirroredAclsBegin() const;
+  MirroredAcl2HandleCitr mirroredAclsEnd() const;
+  MirroredAcl2HandleCitr findMirroredAcl(
+      BcmAclEntryHandle entry,
+      MirrorDirection direction) const;
+  void programmedMirroredAcl(MirroredAcl2HandleCitr itr);
 
  private:
   /*
@@ -491,6 +567,12 @@ class BcmWarmBootCache {
   // acl stats
   AclEntry2AclStat aclEntry2AclStat_;
 
+  // QoS maps
+  IngressQosMaps ingressQosMaps_;
+
   std::unique_ptr<SwitchState> dumpedSwSwitchState_;
+  MirrorEgressPath2Handle mirrorEgressPath2Handle_;
+  MirroredPort2Handle mirroredPort2Handle_;
+  MirroredAcl2Handle mirroredAcl2Handle_;
 };
 }} // facebook::fboss

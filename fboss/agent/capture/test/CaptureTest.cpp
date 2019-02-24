@@ -46,17 +46,17 @@ unique_ptr<HwTestHandle> setupTestHandle() {
   cfg::Vlan thriftVlan;
   thriftVlan.name = "Vlan1";
   thriftVlan.id = 1;
-  thriftVlan.intfID = 1;
+  thriftVlan.intfID_ref().value_unchecked() = 1;
   thriftVlan.routable = true;
   thriftVlan.ipAddresses = {"10.0.0.1"};
-  thriftVlan.dhcpRelayAddressV4 = "10.1.2.3";
+  thriftVlan.dhcpRelayAddressV4_ref().value_unchecked() = "10.1.2.3";
   thriftCfg.vlans.push_back(thriftVlan);
 
   cfg::Interface thriftIface;
   thriftIface.intfID = 1;
   thriftIface.vlanID = 1;
   thriftIface.ipAddresses.push_back("10.0.0.1/24");
-  thriftIface.mac = "02:01:02:03:04:05";
+  thriftIface.mac_ref().value_unchecked() = "02:01:02:03:04:05";
   thriftIface.__isset.mac = "02:01:02:03:04:05";
   thriftCfg.interfaces.push_back(thriftIface);
 
@@ -206,14 +206,14 @@ TEST(CaptureTest, FullCapture) {
   // Receive a packet for which we don't have an ARP entry
   // This should trigger the switch to send an ARP request
   // and set a pending entry.
-  EXPECT_HW_CALL(sw, sendPacketSwitched_(_)).Times(1);
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(1);
+  EXPECT_HW_CALL(sw, sendPacketSwitchedAsync_(_)).Times(1);
+  EXPECT_HW_CALL(sw, stateChanged(_)).Times(1);
   sw->packetReceived(ipPkt.clone());
   waitForStateUpdates(sw);
 
   // Receive an ARP reply for the desired IP. This should cause the
   // arp entry to change from pending to active
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(1);
+  EXPECT_HW_CALL(sw, stateChanged(_)).Times(1);
   sw->packetReceived(arpPkt.clone());
   waitForStateUpdates(sw);
 

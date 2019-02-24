@@ -9,7 +9,6 @@
  */
 #pragma once
 
-#include "fboss/agent/HighresCounterUtil.h"
 #include "fboss/agent/HwSwitch.h"
 #include "fboss/agent/if/gen-cpp2/ctrl_types.h"
 #include "fboss/agent/state/StateUpdate.h"
@@ -23,6 +22,7 @@
 #include <folly/Range.h>
 #include <folly/ThreadLocal.h>
 #include <folly/io/async/EventBase.h>
+#include <folly/Optional.h>
 
 #include <atomic>
 #include <memory>
@@ -51,15 +51,14 @@ class NeighborUpdater;
 class RouteUpdateLogger;
 class StateObserver;
 class TunManager;
-class PortRemediator;
+class MirrorManager;
 
 enum SwitchFlags : int {
   DEFAULT = 0,
   ENABLE_TUN = 1,
   ENABLE_LLDP = 2,
   PUBLISH_STATS = 4,
-  ENABLE_NHOPS_PROBER = 8,
-  ENABLE_LACP = 16
+  ENABLE_LACP = 8
 };
 
 inline SwitchFlags operator|=(SwitchFlags& a, const SwitchFlags b) {
@@ -80,16 +79,6 @@ inline SwitchFlags operator|=(SwitchFlags& a, const SwitchFlags b) {
  */
 class SwSwitch : public HwSwitch::Callback {
  public:
-  // Ordered set of run states for SwSwitch,
-  // SwSwitch can only move forward from a
-  // lower numbered state to the next
-  enum class SwitchRunState: int {
-    UNINITIALIZED,
-    INITIALIZED,
-    CONFIGURED,
-    FIB_SYNCED,
-    EXITING
-  };
 
   typedef std::function<
     std::shared_ptr<SwitchState>(const std::shared_ptr<SwitchState>&)>
@@ -264,27 +253,7 @@ class SwSwitch : public HwSwitch::Callback {
    *          What is the reson for applying config. This will be printed for
    *          logging purposes.
    */
-  void applyConfig(const std::string& reason);
-
-  /**
-   * Get a set of high resolution samplers that we can query quickly.
-   *
-   * @return        The number of counters we've added samplers for.
-   * @param[out]    samplers    A vector of high-resolution samplers.  We will
-   *                            append new samplers to this list.
-   * @param[in]     counters    The requested counters.  We will try to return a
-   *                            set of samplers that handle all requested
-   *                            counters.
-   *
-   * Note that the set of returned samplers will not include invalid counters
-   * and may not be a 1:1 mapping with the requested counters---some samplers
-   * handle multiple counters
-   *
-   * The mapping between requested counters and returned samplers (as well as
-   * which counters are even valid) is hardware-specific.
-   */
-  int getHighresSamplers(HighresSamplerList* samplers,
-                         const std::set<CounterRequest>& counters);
+  void applyConfig(const std::string& reason, bool reload = false);
 
   /*
    * Registers an observer of all state updates. An observer will be notified of
@@ -463,17 +432,19 @@ class SwSwitch : public HwSwitch::Callback {
    */
   std::unique_ptr<TxPacket> allocateL3TxPacket(uint32_t l3Len);
 
-  void sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
-                           PortID portID) noexcept;
+  void sendPacketOutOfPortAsync(
+      std::unique_ptr<TxPacket> pkt,
+      PortID portID,
+      folly::Optional<uint8_t> cos = folly::none) noexcept;
 
-  void sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
+  void sendPacketOutOfPortAsync(std::unique_ptr<TxPacket> pkt,
                            AggregatePortID aggPortID) noexcept;
 
   /*
    * Send a packet, using switching logic to send it out the correct port(s)
    * for the specified VLAN and destination MAC.
    */
-  void sendPacketSwitched(std::unique_ptr<TxPacket> pkt) noexcept;
+  void sendPacketSwitchedAsync(std::unique_ptr<TxPacket> pkt) noexcept;
 
   /**
    * Send out L3 packet through HW
@@ -648,6 +619,12 @@ class SwSwitch : public HwSwitch::Callback {
   void publishRxPacket(RxPacket* packet, uint16_t ethertype);
   void publishTxPacket(TxPacket* packet, uint16_t ethertype);
 
+  /*
+   * Clear PortStats of the specified port.
+   */
+  void clearPortStats(const std::unique_ptr<std::vector<int32_t>>& ports);
+  SwitchRunState getSwitchRunState() const;
+
  private:
   void queueStateUpdateForGettingHwInSync(
       folly::StringPiece name,
@@ -680,7 +657,6 @@ class SwSwitch : public HwSwitch::Callback {
   void publishPortInfo();
   void publishRouteStats();
   void publishSwitchInfo(struct HwInitResult hwInitRet);
-  SwitchRunState getSwitchRunState() const;
   void setSwitchRunState(SwitchRunState desiredState);
   SwitchStats* createSwitchStats();
   void handlePacket(std::unique_ptr<RxPacket> pkt);
@@ -694,7 +670,6 @@ class SwSwitch : public HwSwitch::Callback {
   void startThreads();
   void stopThreads();
   void stop();
-  void initThread(folly::StringPiece name);
   void threadLoop(folly::StringPiece name, folly::EventBase* eventBase);
 
   /*
@@ -836,8 +811,6 @@ class SwSwitch : public HwSwitch::Callback {
    */
   std::map<StateObserver*, std::string> stateObservers_;
 
-  std::unique_ptr<PortRemediator> portRemediator_;
-
   std::unique_ptr<ChannelCloser> closer_; // must be before pcapPusher_
   std::unique_ptr<PcapPushSubscriberAsyncClient> pcapPusher_;
   std::atomic<bool> distributionServiceReady_{false};
@@ -848,6 +821,7 @@ class SwSwitch : public HwSwitch::Callback {
   std::unique_ptr<IPv6Handler> ipv6_;
   std::unique_ptr<NeighborUpdater> nUpdater_;
   std::unique_ptr<PktCaptureManager> pcapMgr_;
+  std::unique_ptr<MirrorManager> mirrorManager_;
   std::unique_ptr<RouteUpdateLogger> routeUpdateLogger_;
   std::unique_ptr<LinkAggregationManager> lagManager_;
 

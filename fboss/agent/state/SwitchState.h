@@ -18,10 +18,13 @@
 
 #include "fboss/agent/state/AclMap.h"
 #include "fboss/agent/state/AggregatePortMap.h"
+#include "fboss/agent/state/ForwardingInformationBaseMap.h"
 #include "fboss/agent/state/InterfaceMap.h"
 #include "fboss/agent/state/LoadBalancerMap.h"
+#include "fboss/agent/state/MirrorMap.h"
 #include "fboss/agent/state/NodeBase.h"
 #include "fboss/agent/state/PortMap.h"
+#include "fboss/agent/state/QosPolicyMap.h"
 #include "fboss/agent/state/RouteTableMap.h"
 #include "fboss/agent/state/VlanMap.h"
 #include "fboss/agent/types.h"
@@ -45,7 +48,9 @@ struct SwitchStateFields {
     fn(interfaces.get());
     fn(routeTables.get());
     fn(acls.get());
+    fn(qosPolicies.get());
     fn(loadBalancers.get());
+    fn(fibs.get());
   }
   /*
    * Serialize to folly::dynamic
@@ -63,8 +68,12 @@ struct SwitchStateFields {
   std::shared_ptr<RouteTableMap> routeTables;
   std::shared_ptr<AclMap> acls;
   std::shared_ptr<SflowCollectorMap> sFlowCollectors;
+  std::shared_ptr<QosPolicyMap> qosPolicies;
   std::shared_ptr<ControlPlane> controlPlane;
   std::shared_ptr<LoadBalancerMap> loadBalancers;
+  std::shared_ptr<MirrorMap> mirrors;
+  std::shared_ptr<ForwardingInformationBaseMap> fibs;
+
   VlanID defaultVlan{0};
 
 
@@ -209,6 +218,14 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
     return getFields()->sFlowCollectors;
   }
 
+  std::shared_ptr<QosPolicy> getQosPolicy(const std::string& name) const {
+    return getFields()->qosPolicies->getQosPolicyIf(name);
+  }
+
+  const std::shared_ptr<QosPolicyMap>& getQosPolicies() const {
+    return getFields()->qosPolicies;
+  }
+
   const std::shared_ptr<ControlPlane>& getControlPlane() const {
     return getFields()->controlPlane;
   }
@@ -269,6 +286,8 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
   }
 
   const std::shared_ptr<LoadBalancerMap>& getLoadBalancers() const;
+  const std::shared_ptr<MirrorMap>& getMirrors() const;
+  const std::shared_ptr<ForwardingInformationBaseMap>& getFibs() const;
 
   /*
    * The following functions modify the static state.
@@ -291,8 +310,10 @@ class SwitchState : public NodeBaseT<SwitchState, SwitchStateFields> {
   void resetAcls(std::shared_ptr<AclMap> acls);
   void resetSflowCollectors(
       const std::shared_ptr<SflowCollectorMap>& collectors);
+  void resetQosPolicies(std::shared_ptr<QosPolicyMap> qosPolicyMap);
   void resetControlPlane(std::shared_ptr<ControlPlane> cpu);
   void resetLoadBalancers(std::shared_ptr<LoadBalancerMap> loadBalancers);
+  void resetMirrors(std::shared_ptr<MirrorMap> mirrors);
 
  private:
   // Inherit the constructor required for clone()

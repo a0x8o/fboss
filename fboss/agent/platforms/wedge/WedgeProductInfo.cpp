@@ -46,6 +46,9 @@ constexpr auto kFabricLocationRight = "RIGHT";
 
 DEFINE_string(mode, "",
               "The mode the FBOSS controller is running as, wedge, lc, or fc");
+DEFINE_string(fruid_filepath,
+              "/var/facebook/fboss/fruid.json",
+              "File for storing the fruid data");
 
 namespace facebook { namespace fboss {
 
@@ -64,7 +67,8 @@ void WedgeProductInfo::initialize() {
     folly::readFile(path_.str().c_str(), data);
     parse(data);
   } catch (const std::exception& err) {
-    XLOG(ERR) << err.what();
+    XLOG(ERR) << "Failed initializing WedgeProductInfo from " << path_
+              << ", fall back to use fbwhoami: " << err.what();
     // if fruid info fails fall back to fbwhoami
     initFromFbWhoAmI();
   }
@@ -90,17 +94,14 @@ std::string WedgeProductInfo::getProductName() {
 void WedgeProductInfo::initMode() {
   if (FLAGS_mode.empty()) {
     auto modelName = getProductName();
-    if (modelName.find("Wedge100") == 0 ||
-               modelName.find("WEDGE100") == 0) {
+    if (modelName.find("Wedge100") == 0 || modelName.find("WEDGE100") == 0) {
       // Wedge100 comes from fruid.json, WEDGE100 comes from fbwhoami
       mode_ = WedgePlatformMode::WEDGE100;
-    } else if (modelName.find("Wedge") == 0 ||
-               modelName.find("WEDGE") == 0) {
-      // Wedge100 comes from fruid.json, WEDGE comes from fbwhoami
+    } else if (modelName.find("Wedge") == 0 || modelName.find("WEDGE") == 0) {
       mode_ = WedgePlatformMode::WEDGE;
     } else if (modelName.find("SCM-LC") == 0 || modelName.find("LC") == 0) {
-       // TODO remove LC once fruid.json is fixed on Galaxy Linecards
-       mode_ = WedgePlatformMode::GALAXY_LC;
+      // TODO remove LC once fruid.json is fixed on Galaxy Linecards
+      mode_ = WedgePlatformMode::GALAXY_LC;
     } else if (
         modelName.find("SCM-FC") == 0 || modelName.find("SCM-FAB") == 0 ||
         modelName.find("FAB") == 0) {
@@ -110,6 +111,8 @@ void WedgeProductInfo::initMode() {
       mode_ = WedgePlatformMode::MINIPACK;
     } else if (modelName.find("DCS-7368") == 0 || modelName.find("YAMP") == 0) {
       mode_ = WedgePlatformMode::YAMP;
+    } else if (modelName.find("fake_wedge40") == 0) {
+      mode_ = WedgePlatformMode::FAKE_WEDGE40;
     } else {
       throw std::runtime_error("invalid model name " + modelName);
     }
@@ -126,6 +129,8 @@ void WedgeProductInfo::initMode() {
       mode_ = WedgePlatformMode::MINIPACK;
     } else if (FLAGS_mode == "yamp") {
       mode_ = WedgePlatformMode::YAMP;
+    } else if (FLAGS_mode == "fake_wedge40") {
+      mode_ = WedgePlatformMode::FAKE_WEDGE40;
     } else {
       throw std::runtime_error("invalid mode " + FLAGS_mode);
     }

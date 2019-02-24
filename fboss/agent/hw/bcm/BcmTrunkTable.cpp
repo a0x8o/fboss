@@ -29,16 +29,29 @@ BcmTrunkTable::BcmTrunkTable(const BcmSwitch* hw)
 
 BcmTrunkTable::~BcmTrunkTable() {}
 
-void BcmTrunkTable::setupTrunking() {
-  if (!isBcmHWTrunkInitialized_) {
-    auto rv = opennsl_trunk_init(hw_->getUnit());
-    bcmCheckError(rv, "Failed to initialize trunking machinery");
-    isBcmHWTrunkInitialized_ = true;
+opennsl_trunk_t BcmTrunkTable::getBcmTrunkId(AggregatePortID id) const {
+  auto iter = trunks_.find(id);
+  if (iter == trunks_.end()) {
+    throw FbossError("Cannot find the BCM trunk id for aggregatePort ", id);
   }
+  return iter->second->id();
+}
+
+AggregatePortID BcmTrunkTable::getAggregatePortId(opennsl_trunk_t trunk) const {
+  for (const auto& idAndTrunk: trunks_) {
+    if (idAndTrunk.second->id() == trunk) {
+      return idAndTrunk.first;
+    }
+  }
+  throw FbossError("Cannot find the aggregatePort id for trunk ", trunk);
+}
+
+void BcmTrunkTable::setupTrunking() {
+  auto rv = opennsl_trunk_init(hw_->getUnit());
+  bcmCheckError(rv, "Failed to initialize trunking machinery");
 }
 
 void BcmTrunkTable::addTrunk(const std::shared_ptr<AggregatePort>& aggPort) {
-  setupTrunking();
   auto trunk = std::make_unique<BcmTrunk>(hw_);
   trunk->init(aggPort);
   auto trunkID = trunk->id();

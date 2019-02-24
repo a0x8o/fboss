@@ -10,7 +10,6 @@ include "fboss/agent/if/fboss.thrift"
 include "common/fb303/if/fb303.thrift"
 include "common/network/if/Address.thrift"
 include "fboss/agent/if/optic.thrift"
-include "fboss/agent/if/highres.thrift"
 include "fboss/qsfp_service/if/transceiver.thrift"
 
 typedef binary (cpp2.type = "::folly::fbstring") fbbinary
@@ -27,6 +26,22 @@ enum AdminDistance {
   IBGP = 200,
   NETLINK_LISTENER = 225,
   MAX_ADMIN_DISTANCE = 255
+}
+
+// SwSwitch run states. SwSwitch moves forward from a
+// lower numbered state to the next
+enum SwitchRunState {
+  UNINITIALIZED = 0,
+  INITIALIZED = 1,
+  CONFIGURED = 2,
+  FIB_SYNCED = 3,
+  EXITING = 4
+}
+
+enum SSLType {
+  DISABLED = 0,
+  PERMITTED = 1,
+  REQUIRED = 2,
 }
 
 struct IpPrefix {
@@ -71,10 +86,12 @@ struct IfAndIP {
 struct RouteDetails {
   1: required IpPrefix dest,
   2: required string action,
+  // Deprecated in favor of '7: nextHops'
   3: required list<IfAndIP> fwdInfo,
   4: required list<ClientAndNextHops> nextHopMulti,
   5: required bool isConnected,
   6: optional AdminDistance adminDistance,
+  7: list<NextHopThrift> nextHops,
 }
 
 struct ArpEntryThrift {
@@ -91,6 +108,10 @@ struct L2EntryThrift {
   1: string mac,
   2: i32 port,
   3: i32 vlanID,
+  // Add information about l2 entries associated with
+  // trunk ports. Only one of port, trunk is valid. If
+  // trunk is set we look at that.
+  4: optional i32 trunk
 }
 
 enum LacpPortRateThrift {
@@ -542,6 +563,9 @@ service FbossCtrl extends fb303.FacebookService {
   map<i32, PortInfoThrift> getAllPortInfo()
     throws (1: fboss.FbossBaseError error)
 
+  /* clear stats for specified port(s) */
+  void clearPortStats(1: list<i32> ports)
+
   /* Legacy names for getPortInfo() and getAllPortInfo() */
   PortInfoThrift getPortStats(1: i32 portId)
     throws (1: fboss.FbossBaseError error)
@@ -591,12 +615,6 @@ service FbossCtrl extends fb303.FacebookService {
     throws (1: fboss.FbossBaseError error)
 
   /*
-   * Subscribe to a set of high-resolution counters
-   */
-  bool subscribeToCounters(1: highres.CounterSubscribeRequest req)
-    throws (1: fboss.FbossBaseError error)
-
-  /*
    * Log all updates to routes that match this prefix, or are more
    * specific.
    */
@@ -632,6 +650,14 @@ service FbossCtrl extends fb303.FacebookService {
    * a valid JSON object string
    */
   void patchCurrentStateJSON(1: string jsonPointer, 2: string jsonPatch)
+
+  /*
+  * Switch run state
+  */
+  SwitchRunState getSwitchRunState()
+
+  SSLType getSSLPolicy()
+    throws (1: fboss.FbossBaseError error)
 }
 
 service NeighborListenerClient extends fb303.FacebookService {

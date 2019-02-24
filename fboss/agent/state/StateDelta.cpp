@@ -13,23 +13,23 @@
 #include "fboss/agent/state/AclMap.h"
 #include "fboss/agent/state/AggregatePort.h"
 #include "fboss/agent/state/AggregatePortMap.h"
+#include "fboss/agent/state/ArpTable.h"
 #include "fboss/agent/state/ControlPlane.h"
-#include "fboss/agent/state/SflowCollector.h"
+#include "fboss/agent/state/Interface.h"
+#include "fboss/agent/state/InterfaceMap.h"
+#include "fboss/agent/state/LoadBalancer.h"
 #include "fboss/agent/state/NodeMapDelta.h"
 #include "fboss/agent/state/Port.h"
 #include "fboss/agent/state/PortMap.h"
-#include "fboss/agent/state/SwitchState.h"
-#include "fboss/agent/state/Vlan.h"
-#include "fboss/agent/state/VlanMap.h"
-#include "fboss/agent/state/VlanMapDelta.h"
-#include "fboss/agent/state/Interface.h"
-#include "fboss/agent/state/InterfaceMap.h"
-#include "fboss/agent/state/ArpTable.h"
 #include "fboss/agent/state/Route.h"
 #include "fboss/agent/state/RouteTable.h"
 #include "fboss/agent/state/RouteTableMap.h"
 #include "fboss/agent/state/RouteTableRib.h"
-#include "fboss/agent/state/LoadBalancer.h"
+#include "fboss/agent/state/SflowCollector.h"
+#include "fboss/agent/state/SwitchState.h"
+#include "fboss/agent/state/Vlan.h"
+#include "fboss/agent/state/VlanMap.h"
+#include "fboss/agent/state/VlanMapDelta.h"
 
 #include "fboss/agent/state/NodeMapDelta-defs.h"
 
@@ -74,6 +74,11 @@ AclMapDelta StateDelta::getAclsDelta() const {
   return AclMapDelta(std::move(oldAcls), std::move(newAcls));
 }
 
+QosPolicyMapDelta StateDelta::getQosPoliciesDelta() const {
+  return QosPolicyMapDelta(
+      old_->getQosPolicies().get(), new_->getQosPolicies().get());
+}
+
 NodeMapDelta<AggregatePortMap> StateDelta::getAggregatePortsDelta() const {
   return NodeMapDelta<AggregatePortMap>(
       old_->getAggregatePorts().get(), new_->getAggregatePorts().get());
@@ -92,6 +97,16 @@ NodeMapDelta<LoadBalancerMap> StateDelta::getLoadBalancersDelta() const {
 DeltaValue<ControlPlane> StateDelta::getControlPlaneDelta() const {
   return DeltaValue<ControlPlane>(old_->getControlPlane(),
                                   new_->getControlPlane());
+}
+
+NodeMapDelta<MirrorMap> StateDelta::getMirrorsDelta() const {
+  return NodeMapDelta<MirrorMap>(
+      old_->getMirrors().get(), new_->getMirrors().get());
+}
+
+ForwardingInformationBaseMapDelta StateDelta::getFibsDelta() const {
+  return ForwardingInformationBaseMapDelta(
+      old_->getFibs().get(), new_->getFibs().get());
 }
 
 std::ostream& operator<<(std::ostream& out, const StateDelta& stateDelta) {
@@ -132,10 +147,16 @@ template class NodeMapDelta<InterfaceMap>;
 template class NodeMapDelta<PortMap>;
 template class NodeMapDelta<RouteTableMap>;
 template class NodeMapDelta<AclMap>;
+template class NodeMapDelta<QosPolicyMap>;
 template class NodeMapDelta<AggregatePortMap>;
 template class NodeMapDelta<SflowCollectorMap>;
 template class NodeMapDelta<RouteTableRibNodeMap<folly::IPAddressV4>>;
 template class NodeMapDelta<RouteTableRibNodeMap<folly::IPAddressV6>>;
 template class NodeMapDelta<LoadBalancerMap>;
-
+template class NodeMapDelta<MirrorMap>;
+template class NodeMapDelta<
+    ForwardingInformationBaseMap,
+    ForwardingInformationBaseContainerDelta>;
+template class NodeMapDelta<ForwardingInformationBaseV4>;
+template class NodeMapDelta<ForwardingInformationBaseV6>;
 }} // facebook::fboss

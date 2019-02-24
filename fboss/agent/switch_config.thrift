@@ -87,6 +87,7 @@ enum PortFEC {
 struct L4PortRange {
   1: i32 min
   2: i32 max
+  3: bool invert = false
 }
 
 /**
@@ -96,6 +97,7 @@ struct L4PortRange {
 struct PktLenRange {
   1: i16 min
   2: i16 max
+  3: bool invert = false
 }
 
 enum IpType {
@@ -121,6 +123,71 @@ enum IpFragMatch {
   MATCH_NOT_FIRST_FRAGMENT = 3
   // any fragment
   MATCH_ANY_FRAGMENT = 4
+}
+
+union MirrorEgressPort {
+  1: string name
+  2: i32 logicalID
+}
+
+/*
+ * Mirror destination
+ * At least one of the below paramaters must be set
+ *
+ *  egressPort - name or ID of port from which mirror traffic egresses
+ *               required for SPAN
+ *               optional for ERSPAN port mirroring
+ *  ip - mirror to remote (ipv4) destination
+ *               required and used only for ERSPAN
+ *
+ */
+struct MirrorDestination {
+  1: optional MirrorEgressPort egressPort
+  2: optional string ip
+}
+
+/*
+ * Mirror,
+ *   - name, a logical identifier of mirror
+ *   - destination, to deliver mirrored traffic
+ *   - direction of a traffic to mirror
+ *
+ * Mirroring allows replication of data plane traffic to another destination
+ * This destination can be specified either as an egress port, an egress port
+ * and a remote routable ip (v4) address, or only remote routable ip (v4)
+ * address.
+ *
+ * If only egress port is specified, then mirrored data-plane traffic egresses
+ * the specified port.
+ *
+ * If egress port & remote ip are specified, then mirrored data-plane traffic
+ * egresses the specified port and is delivered to destination ip address.
+ *
+ * If only remote ip is specified, then mirrored data-plane traffic is delivered
+ * to the destination ip address via any possible egress port.
+ *
+ * traffic delivered to remote ip address is ERSPAN (type 1) encapsulated.
+ * this is basically a "gre" tunnel with protocol type 0x88be
+ * L2 frame is encapsulated in gre tunnel and delivered to remote routable
+ * destination.
+ *
+ * A traffic to mirror, can be selected using twowways
+ *    1) a traffic ingressing or egressing a particular port
+ *    2) a traffic ingressing or egressing that meets "acl" criteria,
+ *    (this mirrors a traffic ingressing/egressing switch's acl engine)
+ *
+ *  mirror direction if INGRESS, only ingressing traffic is mirrored
+ *  mirror direction if EGRESS, only egressing traffic is mirrored
+ *  mirror direction if BOTH, both ingress/egress traffic is mirrored
+ *
+ * Only four mirror destinations are possible
+ *
+ * Mirroring should be used with caution and in circumstances to debug traffic
+ * issues, as this feature duplicates traffic and so doubles traffic load.
+ */
+struct Mirror {
+  1: string name
+  2: MirrorDestination destination
 }
 
 /**
@@ -224,9 +291,17 @@ struct PacketCounterMatchAction {
   1: string counterName
 }
 
+struct SetDscpMatchAction {
+  1: byte dscpValue;
+}
+
 struct MatchAction {
   1: optional QueueMatchAction sendToQueue
-  2: optional PacketCounterMatchAction packetCounter
+  2: optional PacketCounterMatchAction packetCounter_DEPRECATED
+  3: optional SetDscpMatchAction setDscp
+  4: optional string ingressMirror
+  5: optional string egressMirror
+  6: optional string counter
 }
 
 struct MatchToAction {
@@ -327,9 +402,21 @@ struct PortQueue {
   11: optional list<ActiveQueueManagement> aqms;
 }
 
+struct QosRule {
+  1: i16 queueId
+  2: list<i16> dscp = []
+}
+
+struct QosPolicy {
+  1: string name
+  2: list<QosRule> rules
+}
+
 struct TrafficPolicyConfig {
   // Order of entries determines priority of acls when applied
   1: list<MatchToAction> matchToAction = []
+  2: optional string defaultQosPolicy
+  3: optional map<i32, string> portIdToQosPolicy
 }
 
 struct CPUTrafficPolicyConfig {
@@ -346,6 +433,22 @@ enum PacketRxReason {
   L3_DEST_MISS = 5 // L3 DIP miss
   TTL_1        = 6 // L3UC or IPMC packet with TTL equal to 1
   CPU_IS_NHOP  = 7 // The CPU port is the next-hop in the routing table
+}
+
+enum PortLoopbackMode {
+  NONE  = 0
+  PHY   = 1
+  MAC   = 2
+}
+
+enum LLDPTag {
+  PDU_END     = 0,
+  CHASSIS     = 1,
+  PORT        = 2,
+  TTL         = 3,
+  PORT_DESC   = 4,
+  SYSTEM_NAME = 5,
+  SYSTEM_DESC = 6,
 }
 
 /**
@@ -431,6 +534,28 @@ struct Port {
    * Should FEC be on for this port?
    */
   16: PortFEC fec = PortFEC.OFF
+
+  /*
+   * Setup port in loopback mode
+   */
+   17: PortLoopbackMode loopbackMode = PortLoopbackMode.NONE
+  /**
+   * if port is mirrored?
+   */
+  18: optional string ingressMirror
+  19: optional string egressMirror
+
+  /**
+   * The LLDP values we expect to receive on this port, to validate
+   * against the actual values received from the neighbour.
+   *
+   * Only LLDP tags with a string representation, or a clear transform to
+   * a string (e.g. uint16_t) can be specified.
+   *
+   * For composite tags, such as Port/Chassis ID, only the string portion
+   * is compared.
+   */
+  20: map<LLDPTag, string> expectedLLDPValues
 }
 
 enum LacpPortRate {
@@ -684,7 +809,16 @@ struct Fields {
 }
 
 enum HashingAlgorithm {
-  CRC16_CCITT = 1
+  CRC16_CCITT = 1,
+
+  CRC32_LO = 3,
+  CRC32_HI = 4,
+
+  CRC32_ETHERNET_LO = 5,
+  CRC32_ETHERNET_HI = 6,
+
+  CRC32_KOOPMAN_LO  = 7,
+  CRC32_KOOPMAN_HI  = 8,
 }
 
 struct LoadBalancer {
@@ -694,6 +828,16 @@ struct LoadBalancer {
   // If not set, the seed will be chosen so as to remain constant across process
   // restarts
   4: optional i32 seed
+}
+
+enum CounterType {
+  PACKETS = 0,
+  BYTES = 1,
+}
+
+struct TrafficCounter {
+  1: string name
+  2: list<CounterType> types = [PACKETS]
 }
 
 /**
@@ -771,11 +915,15 @@ struct SwitchConfig {
    */
   22: optional string dhcpReplySrcOverrideV4
   23: optional string dhcpReplySrcOverrideV6
-  24: optional TrafficPolicyConfig globalEgressTrafficPolicy
+  24: optional TrafficPolicyConfig globalEgressTrafficPolicy_DEPRECATED
   25: optional string config_version
   26: list<SflowCollector> sFlowCollectors = []
   27: optional Lacp lacp
   28: list<PortQueue> cpuQueues = []
   29: optional CPUTrafficPolicyConfig cpuTrafficPolicy
   30: list<LoadBalancer> loadBalancers = []
+  31: optional TrafficPolicyConfig dataPlaneTrafficPolicy
+  32: list<Mirror> mirrors = []
+  33: list<TrafficCounter> trafficCounters = []
+  34: list<QosPolicy> qosPolicies = []
 }

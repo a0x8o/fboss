@@ -71,6 +71,17 @@ PortFields PortFields::fromThrift(state::PortFields const& portThrift) {
       << "Unexpected FEC value: " << portThrift.portFEC;
   port.fec = cfg::PortFEC(itrPortFec->second);
 
+  if (portThrift.portLoopbackMode.empty()) {
+    // Backward compatibility for when we were not serializing loopback mode
+    port.loopbackMode = cfg::PortLoopbackMode::NONE;
+  } else {
+    auto itrPortLoopbackMode = cfg::_PortLoopbackMode_NAMES_TO_VALUES.find(
+        portThrift.portLoopbackMode.c_str());
+    CHECK(itrPortLoopbackMode != cfg::_PortLoopbackMode_NAMES_TO_VALUES.end())
+      << "Unexpected loopback mode value: " << portThrift.portLoopbackMode;
+    port.loopbackMode = cfg::PortLoopbackMode(itrPortLoopbackMode->second);
+  }
+
   port.pause.tx = portThrift.txPause;
   port.pause.rx = portThrift.rxPause;
 
@@ -87,6 +98,14 @@ PortFields PortFields::fromThrift(state::PortFields const& portThrift) {
     port.queues.push_back(
         std::make_shared<PortQueue>(PortQueueFields::fromThrift(queue)));
   }
+
+  if (portThrift.ingressMirror) {
+    port.ingressMirror = portThrift.ingressMirror;
+  }
+  if (portThrift.egressMirror) {
+    port.egressMirror = portThrift.egressMirror;
+  }
+  port.qosPolicy.assign(portThrift.qosPolicy);
 
   return port;
 }
@@ -121,6 +140,12 @@ state::PortFields PortFields::toThrift() const {
       << "Unexpected port FEC: " << static_cast<int>(fec);
   port.portFEC = itrPortFec->second;
 
+  auto itrPortLoopbackMode =
+      cfg::_PortLoopbackMode_VALUES_TO_NAMES.find(loopbackMode);
+  CHECK(itrPortLoopbackMode != cfg::_PortLoopbackMode_VALUES_TO_NAMES.end())
+      << "Unexpected port LoopbackMode: " << static_cast<int>(loopbackMode);
+  port.portLoopbackMode = itrPortLoopbackMode->second;
+
   port.txPause = pause.tx;
   port.rxPause = pause.rx;
 
@@ -136,6 +161,14 @@ state::PortFields PortFields::toThrift() const {
     port.queues.push_back(queue->getFields()->toThrift());
   }
 
+  if (ingressMirror) {
+    port.ingressMirror = ingressMirror;
+  }
+  if (egressMirror) {
+    port.egressMirror = egressMirror;
+  }
+  port.qosPolicy.assign(qosPolicy);
+
   return port;
 }
 
@@ -147,7 +180,7 @@ void Port::initDefaultConfigState(cfg::Port* config) const {
   // Copy over port identifiers and reset to (default)
   // admin disabled state.
   config->logicalID = getID();
-  config->name = getName();
+  config->name_ref().value_unchecked() = getName();
   config->state = cfg::PortState::DISABLED;
 }
 

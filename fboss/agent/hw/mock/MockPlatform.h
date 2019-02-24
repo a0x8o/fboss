@@ -45,10 +45,13 @@ class MockPlatform : public Platform {
   MOCK_CONST_METHOD1(getPlatformPort, PlatformPort*(PortID port));
   MOCK_CONST_METHOD0(getLocalMac, folly::MacAddress());
   MOCK_METHOD1(onHwInitialized, void(SwSwitch* sw));
+  MOCK_METHOD1(onInitialConfigApplied, void(SwSwitch* sw));
 
  private:
   void createTmpDir();
   void cleanupTmpDir();
+
+  void initImpl() override {}
 
   /*
    * A temporary directory that contains the volatile and persistent state

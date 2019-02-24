@@ -10,32 +10,42 @@
 #pragma once
 
 #include "fboss/agent/hw/bcm/gen-cpp2/bcmswitch_types.h"
+#include "fboss/agent/state/StateDelta.h"
 
 namespace facebook { namespace fboss {
 
 class BcmSwitch;
 
-class BcmTableStats {
+class BcmHwTableStatManager {
  public:
-  explicit BcmTableStats(const BcmSwitch* hw, bool isAlpmEnabled=false) : hw_(hw),
-    isAlpmEnabled_(isAlpmEnabled) {}
-  void refresh() {
-    stats_.hw_table_stats_stale =
-        !(refreshHwStatusStats() && refreshLPMStats() && refreshFPStats());
-    if (!isAlpmEnabled_) {
-      stats_.hw_table_stats_stale |= !(refreshLPMOnlyStats());
-    }
-  }
-  void publish() const;
+  explicit BcmHwTableStatManager(
+      const BcmSwitch* hw,
+      bool isAlpmEnabled = false)
+      : hw_(hw), isAlpmEnabled_(isAlpmEnabled) {}
+
+  void refresh(const StateDelta& delta, BcmHwTableStats* stats);
+  void publish(BcmHwTableStats stats) const;
 
  private:
-  bool refreshHwStatusStats();
+  bool refreshHwStatusStats(BcmHwTableStats* stats);
   // Stats for both LPM and ALPM mode
-  bool refreshLPMStats();
+  bool refreshLPMStats(BcmHwTableStats* stats);
   // Stats only supported in LPM mode
-  bool refreshLPMOnlyStats();
+  bool refreshLPMOnlyStats(BcmHwTableStats* stats);
   // Stats pertaining to FP
-  bool refreshFPStats();
+  bool refreshFPStats(BcmHwTableStats* stats);
+
+  void updateBcmStateChangeStats(
+      const StateDelta& delta,
+      BcmHwTableStats* stats);
+
+  void decrementBcmMirrorStat(
+      const std::shared_ptr<Mirror>& removedMirror,
+      BcmHwTableStats* stats);
+  void incrementBcmMirrorStat(
+      const std::shared_ptr<Mirror>& addedMirror,
+      BcmHwTableStats* stats);
+
   const BcmSwitch* hw_{nullptr};
 
   BcmHwTableStats stats_;

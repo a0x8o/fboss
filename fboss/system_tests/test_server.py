@@ -1,7 +1,4 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
+#!/usr/bin/env python3
 
 """
 A service to run on testing hosts, so that we can source traffic, sync
@@ -25,7 +22,7 @@ from os.path import isfile
 
 import json
 import logging
-import pcapy            # this library currently only supports python 2.x :-(
+import pcapy
 import signal
 import socket
 import subprocess
@@ -247,8 +244,9 @@ class TestServer(TestService.Iface):
 
     def add_interface(self, ifName, deviceType):
         if ifName in self.added_interfaces:
-            raise FbossBaseError(
-                "Device {} already exists".format(ifName))
+            self.log.debug("Device {} already exists".format(ifName))
+            return True
+
 
         strDeviceType = self.DEVICE_TYPE_ENUM_TO_STRING.get(deviceType)
         if not strDeviceType:

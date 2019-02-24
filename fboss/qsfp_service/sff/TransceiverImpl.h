@@ -10,9 +10,12 @@
 #pragma once
 
 #include <cstdint>
+#include <folly/Optional.h>
 #include <folly/String.h>
 #include "fboss/agent/types.h"
 #include "fboss/agent/FbossError.h"
+#include "fboss/qsfp_service/if/gen-cpp2/transceiver_types.h"
+
 
 namespace facebook { namespace fboss {
 
@@ -38,11 +41,21 @@ class TransceiverImpl {
   virtual bool detectTransceiver() = 0;
 
   /*
+   * In an implementation where newly inserted transceivers needs to be cleared
+   * out of reset. This is the function to do it.
+   */
+  virtual void ensureOutOfReset(){};
+
+  /*
    * Returns the name of the port
    */
   virtual folly::StringPiece getName() = 0;
 
   virtual int getNum() const = 0;
+
+  virtual folly::Optional<TransceiverStats> getTransceiverStats() {
+    return folly::Optional<TransceiverStats>();
+  }
 
  private:
   // Forbidden copy contructor and assignment operator

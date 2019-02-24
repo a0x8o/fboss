@@ -10,20 +10,21 @@
 #include "fboss/agent/state/SwitchState.h"
 
 #include "fboss/agent/FbossError.h"
+#include "fboss/agent/state/AclEntry.h"
+#include "fboss/agent/state/AclMap.h"
 #include "fboss/agent/state/AggregatePort.h"
 #include "fboss/agent/state/AggregatePortMap.h"
 #include "fboss/agent/state/ControlPlane.h"
-#include "fboss/agent/state/Port.h"
-#include "fboss/agent/state/PortMap.h"
-#include "fboss/agent/state/Vlan.h"
-#include "fboss/agent/state/VlanMap.h"
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/InterfaceMap.h"
+#include "fboss/agent/state/Port.h"
+#include "fboss/agent/state/PortMap.h"
+#include "fboss/agent/state/QosPolicyMap.h"
 #include "fboss/agent/state/RouteTable.h"
 #include "fboss/agent/state/RouteTableMap.h"
-#include "fboss/agent/state/AclEntry.h"
-#include "fboss/agent/state/AclMap.h"
 #include "fboss/agent/state/SflowCollectorMap.h"
+#include "fboss/agent/state/Vlan.h"
+#include "fboss/agent/state/VlanMap.h"
 
 #include "fboss/agent/state/NodeBase-defs.h"
 
@@ -40,12 +41,14 @@ constexpr auto kDefaultVlan = "defaultVlan";
 constexpr auto kAcls = "acls";
 constexpr auto kSflowCollectors = "sFlowCollectors";
 constexpr auto kControlPlane = "controlPlane";
+constexpr auto kQosPolicies = "qosPolicies";
 constexpr auto kArpTimeout = "arpTimeout";
 constexpr auto kNdpTimeout = "ndpTimeout";
 constexpr auto kArpAgerInterval = "arpAgerInterval";
 constexpr auto kMaxNeighborProbes = "maxNeighborProbes";
 constexpr auto kStaleEntryInterval = "staleEntryInterval";
 constexpr auto kLoadBalancers = "loadBalancers";
+constexpr auto kMirrors = "mirrors";
 }
 
 namespace facebook { namespace fboss {
@@ -58,8 +61,11 @@ SwitchStateFields::SwitchStateFields()
       routeTables(make_shared<RouteTableMap>()),
       acls(make_shared<AclMap>()),
       sFlowCollectors(make_shared<SflowCollectorMap>()),
+      qosPolicies(make_shared<QosPolicyMap>()),
       controlPlane(make_shared<ControlPlane>()),
-      loadBalancers(make_shared<LoadBalancerMap>()) {}
+      loadBalancers(make_shared<LoadBalancerMap>()),
+      mirrors(make_shared<MirrorMap>()),
+      fibs(make_shared<ForwardingInformationBaseMap>()) {}
 
 folly::dynamic SwitchStateFields::toFollyDynamic() const {
   folly::dynamic switchState = folly::dynamic::object;
@@ -70,8 +76,10 @@ folly::dynamic SwitchStateFields::toFollyDynamic() const {
   switchState[kAcls] = acls->toFollyDynamic();
   switchState[kSflowCollectors] = sFlowCollectors->toFollyDynamic();
   switchState[kDefaultVlan] = static_cast<uint32_t>(defaultVlan);
+  switchState[kQosPolicies] = qosPolicies->toFollyDynamic();
   switchState[kControlPlane] = controlPlane->toFollyDynamic();
   switchState[kLoadBalancers] = loadBalancers->toFollyDynamic();
+  switchState[kMirrors] = mirrors->toFollyDynamic();
   return switchState;
 }
 
@@ -90,6 +98,10 @@ SwitchStateFields::fromFollyDynamic(const folly::dynamic& swJson) {
       swJson[kSflowCollectors]);
   }
   switchState.defaultVlan = VlanID(swJson[kDefaultVlan].asInt());
+  if (swJson.find(kQosPolicies) != swJson.items().end()) {
+    switchState.qosPolicies =
+        QosPolicyMap::fromFollyDynamic(swJson[kQosPolicies]);
+  }
   if (swJson.find(kControlPlane) != swJson.items().end()) {
     switchState.controlPlane = ControlPlane::fromFollyDynamic(
       swJson[kControlPlane]);
@@ -97,6 +109,9 @@ SwitchStateFields::fromFollyDynamic(const folly::dynamic& swJson) {
   if (swJson.find(kLoadBalancers) != swJson.items().end()) {
     switchState.loadBalancers =
         LoadBalancerMap::fromFollyDynamic(swJson[kLoadBalancers]);
+  }
+  if (swJson.find(kMirrors) != swJson.items().end()) {
+    switchState.mirrors = MirrorMap::fromFollyDynamic(swJson[kMirrors]);
   }
   //TODO verify that created state here is internally consistent t4155406
   return switchState;
@@ -219,6 +234,10 @@ void SwitchState::resetSflowCollectors(
   writableFields()->sFlowCollectors = collectors;
 }
 
+void SwitchState::resetQosPolicies(std::shared_ptr<QosPolicyMap> qosPolicies) {
+  writableFields()->qosPolicies = qosPolicies;
+}
+
 void SwitchState::resetControlPlane(
     std::shared_ptr<ControlPlane> controlPlane) {
   writableFields()->controlPlane = controlPlane;
@@ -231,6 +250,19 @@ void SwitchState::resetLoadBalancers(
 
 const std::shared_ptr<LoadBalancerMap>& SwitchState::getLoadBalancers() const {
   return getFields()->loadBalancers;
+}
+
+void SwitchState::resetMirrors(std::shared_ptr<MirrorMap> mirrors) {
+  writableFields()->mirrors.swap(mirrors);
+}
+
+const std::shared_ptr<MirrorMap>& SwitchState::getMirrors() const {
+  return getFields()->mirrors;
+}
+
+const std::shared_ptr<ForwardingInformationBaseMap>& SwitchState::getFibs()
+    const {
+  return getFields()->fibs;
 }
 
 template class NodeBaseT<SwitchState, SwitchStateFields>;

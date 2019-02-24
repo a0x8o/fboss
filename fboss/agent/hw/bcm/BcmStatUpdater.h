@@ -9,9 +9,10 @@
  */
 #pragma once
 
-#include "fboss/agent/types.h"
-#include "fboss/agent/hw/bcm/types.h"
 #include "common/stats/MonotonicCounter.h"
+#include "fboss/agent/hw/bcm/BcmTableStats.h"
+#include "fboss/agent/hw/bcm/types.h"
+#include "fboss/agent/types.h"
 
 #include <queue>
 #include <folly/Synchronized.h>
@@ -22,10 +23,11 @@ namespace facebook { namespace fboss {
 using facebook::stats::MonotonicCounter;
 
 class BcmSwitch;
+class StateDelta;
 
 class BcmStatUpdater {
  public:
-  explicit BcmStatUpdater(int unit);
+  explicit BcmStatUpdater(BcmSwitch* hw, bool isAlpmEnabled);
   ~BcmStatUpdater() {}
 
   /* Thread safety:
@@ -45,28 +47,62 @@ class BcmStatUpdater {
    *  thread safety.
    */
 
-  MonotonicCounter* getCounterIf(BcmAclStatHandle handle);
+  MonotonicCounter* getCounterIf(
+      BcmAclStatHandle handle,
+      cfg::CounterType type);
   size_t getCounterCount() const;
 
   /* Functions to be called during state update */
-  void toBeAddedAclStat(BcmAclStatHandle handle, const std::string& name);
+  void toBeAddedAclStat(
+      BcmAclStatHandle handle,
+      const std::string& name,
+      const std::vector<cfg::CounterType>& counterTypes);
   void toBeRemovedAclStat(BcmAclStatHandle handle);
-  void refresh();
+  void refreshPostBcmStateChange(const StateDelta& delta);
 
   /* Functions to be called during stats collection (UpdateStatsThread) */
   void updateStats();
 
- private:
-  void updateAclStat(int unit, BcmAclStatHandle handle,
-    std::chrono::seconds now, MonotonicCounter* counter);
+  void clearPortStats(const std::unique_ptr<std::vector<int32_t>>& ports);
 
-  int unit_;
+  BcmHwTableStats getHwTableStats() {
+    return *tableStats_.rlock();
+  }
+
+ private:
+  void updateAclStat(
+      int unit,
+      BcmAclStatHandle handle,
+      cfg::CounterType counterType,
+      std::chrono::seconds now,
+      MonotonicCounter* counter);
+
+  std::string counterTypeToString(cfg::CounterType type);
+
+  void updateAclStats();
+  void updateHwTableStats();
+  void refreshHwTableStats(const StateDelta& delta);
+  void refreshAclStats();
+
+  BcmSwitch* hw_;
+  std::unique_ptr<BcmHwTableStatManager> bcmTableStatsManager_;
 
   /* ACL stats */
+  struct AclCounterDescriptor {
+    AclCounterDescriptor(BcmAclStatHandle hdl, cfg::CounterType type)
+        : handle(hdl), counterType(type) {}
+    bool operator<(const AclCounterDescriptor& d) const {
+      return std::tie(handle, counterType) < std::tie(d.handle, d.counterType);
+    }
+    BcmAclStatHandle handle;
+    cfg::CounterType counterType;
+  };
+  folly::Synchronized<BcmHwTableStats> tableStats_;
   std::queue<BcmAclStatHandle> toBeRemovedAclStats_;
-  std::queue<std::pair<BcmAclStatHandle, std::string>> toBeAddedAclStats_;
-  folly::Synchronized<boost::container::flat_map<BcmAclStatHandle,
-    std::unique_ptr<MonotonicCounter>>> aclStats_;
+  std::queue<std::pair<std::string, AclCounterDescriptor>> toBeAddedAclStats_;
+  folly::Synchronized<
+      std::map<AclCounterDescriptor, std::unique_ptr<MonotonicCounter>>>
+      aclStats_;
 };
 
 }} // facebook::fboss

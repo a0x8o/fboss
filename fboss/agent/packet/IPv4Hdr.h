@@ -126,6 +126,10 @@ class IPv4Hdr {
   void computeChecksum();
   template<typename CursorType>
   void write(CursorType* cursor) const;
+  template<typename CursorType>
+  void serialize(CursorType* cursor) const {
+    write(cursor);
+  }
 
   /*
    * Compute the partial checksum over the IPv4 pseudo-header.
@@ -259,7 +263,7 @@ void IPv4Hdr::write(CursorType* cursor) const {
   // If extra options are present, serialize them back blindly
   if (UNLIKELY(ihl > 5)) {
     CHECK_LE(ihl, 15) << "Corrupted ihl value";
-    cursor->template push(optionBuf, (ihl - 5) * 4);
+    cursor->push(optionBuf, (ihl - 5) * 4);
   }
 }
 

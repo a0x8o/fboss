@@ -14,21 +14,32 @@
 #include <folly/Optional.h>
 #include <folly/futures/Future.h>
 
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
+#include "fboss/agent/gen-cpp2/platform_config_types.h"
 #include "fboss/agent/hw/bcm/BcmPlatformPort.h"
 #include "fboss/agent/hw/bcm/BcmPort.h"
-#include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/if/gen-cpp2/ctrl_types.h"
+#include "fboss/agent/state/Port.h"
 
 namespace facebook { namespace fboss {
 
 class WedgePlatform;
 
+struct FrontPanelResources {
+  FrontPanelResources(
+      TransceiverID transceiver,
+      std::vector<ChannelID> channels)
+      : transceiver(transceiver), channels(std::move(channels)) {}
+
+  TransceiverID transceiver;
+  std::vector<ChannelID> channels;
+};
+
 class WedgePort : public BcmPlatformPort {
  protected:
   WedgePort(PortID id,
             WedgePlatform* platform,
-            folly::Optional<TransceiverID> frontPanelPort,
-            folly::Optional<ChannelID> channel);
+            folly::Optional<FrontPanelResources> frontPanel);
 
  public:
   PortID getPortID() const override { return id_; }
@@ -48,20 +59,23 @@ class WedgePort : public BcmPlatformPort {
                         bool discards, bool errors) override;
   void linkSpeedChanged(const cfg::PortSpeed& speed) override;
   void linkStatusChanged(bool up, bool adminUp) override;
+  void externalState(ExternalState) override;
 
   PortStatus toThrift(const std::shared_ptr<Port>& port);
 
   folly::Optional<TransceiverID> getTransceiverID() const override {
-    return frontPanelPort_;
+    if (!frontPanel_) {
+      return folly::none;
+    }
+    return frontPanel_->transceiver;
   }
 
   bool supportsTransceiver() const override {
-    return getTransceiverID().hasValue();
+    return frontPanel_.hasValue();
   }
 
-  virtual folly::Optional<ChannelID> getChannel() const {
-    return channel_;
-  }
+  // TODO: deprecate this
+  virtual folly::Optional<ChannelID> getChannel() const;
 
   std::vector<int32_t> getChannels() const;
 
@@ -79,27 +93,39 @@ class WedgePort : public BcmPlatformPort {
     return true;
   }
 
+  virtual void portChanged(std::shared_ptr<Port> port) {
+    port_ = std::move(port);
+  }
+
+  // TODO: make return value not optional after all platforms are
+  // updated to support port programming like this.
+  folly::Optional<cfg::PlatformPortSettings> getPlatformPortSettings(
+      cfg::PortSpeed speed);
+
  protected:
   bool isControllingPort() const;
   bool isInSingleMode() const;
 
   PortID id_{0};
   WedgePlatform* platform_{nullptr};
+
+  // TODO(aeckert): deprecate cached speed
   cfg::PortSpeed speed_{cfg::PortSpeed::DEFAULT};
-  folly::Optional<TransceiverID> frontPanelPort_;
-  folly::Optional<ChannelID> channel_;
+
+  folly::Optional<FrontPanelResources> frontPanel_;
   BcmPort* bcmPort_{nullptr};
+
+  std::shared_ptr<Port> port_{nullptr};
 
  private:
   // Forbidden copy constructor and assignment operator
-  WedgePort(WedgePort const &) = delete;
-  WedgePort& operator=(WedgePort const &) = delete;
+  WedgePort(WedgePort const&) = delete;
+  WedgePort& operator=(WedgePort const&) = delete;
 
   virtual TxOverrides getTxOverrides() const override {
     return TxOverrides();
-  }
+    }
 
-  folly::Future<TransceiverInfo> getTransceiverInfo() const;
-};
-
+    folly::Future<TransceiverInfo> getTransceiverInfo() const;
+  };
 }} // facebook::fboss

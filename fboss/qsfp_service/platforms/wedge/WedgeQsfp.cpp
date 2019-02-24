@@ -9,9 +9,9 @@
  */
 
 #include "WedgeQsfp.h"
-#include "fboss/lib/usb/UsbError.h"
 #include <folly/Conv.h>
 #include <folly/Memory.h>
+#include <folly/ScopeGuard.h>
 
 #include <folly/logging/xlog.h>
 #include "fboss/qsfp_service/StatsPublisher.h"
@@ -24,59 +24,68 @@ using std::unique_ptr;
 
 namespace facebook { namespace fboss {
 
-WedgeQsfp::WedgeQsfp(int module, WedgeI2CBusLock* wedgeI2CBus)
-  : module_(module),
-    wedgeI2CBusLock_(wedgeI2CBus) {
+WedgeQsfp::WedgeQsfp(int module, TransceiverI2CApi* wedgeI2CBus)
+    : module_(module), threadSafeI2CBus_(wedgeI2CBus) {
   moduleName_ = folly::to<std::string>(module);
 }
 
 WedgeQsfp::~WedgeQsfp() {
 }
 
-// Note that the module_ starts at 0, but the USB I2C bus module
+// Note that the module_ starts at 0, but the I2C bus module
 // assumes that QSFP module numbers extend from 1 to 16.
 //
 bool WedgeQsfp::detectTransceiver() {
-  uint8_t buf[1];
-  try {
-    wedgeI2CBusLock_->moduleRead(module_ + 1, TransceiverI2CApi::ADDR_QSFP,
-                                 0, sizeof(buf), buf);
-  } catch (const UsbError& ex) {
-    /*
-     * This can either mean that we failed to open the USB device
-     * because it was already in use, or that the I2C read failed.
-     * At some point we might want to return more a more accurate
-     * status value to higher-level functions.
-     */
-    return false;
-  }
-  return true;
+  return threadSafeI2CBus_->isPresent(module_ + 1);
+}
+
+void WedgeQsfp::ensureOutOfReset() {
+  threadSafeI2CBus_->ensureOutOfReset(module_ + 1);
 }
 
 int WedgeQsfp::readTransceiver(int dataAddress, int offset,
                                int len, uint8_t* fieldValue) {
   try {
-    wedgeI2CBusLock_->moduleRead(module_ + 1, dataAddress, offset, len,
+    SCOPE_EXIT {
+      wedgeQsfpstats_.updateReadDownTime();
+    };
+    SCOPE_FAIL {
+      StatsPublisher::bumpReadFailure();
+    };
+    SCOPE_SUCCESS {
+      wedgeQsfpstats_.recordReadSuccess();
+    };
+    threadSafeI2CBus_->moduleRead(module_ + 1, dataAddress, offset, len,
                                   fieldValue);
-  } catch (const UsbError& ex) {
+  } catch (const std::exception& ex) {
     XLOG(ERR) << "Read from transceiver " << module_ << " at offset " << offset
               << " with length " << len << " failed: " << ex.what();
-    StatsPublisher::bumpReadFailure();
     throw;
   }
   return len;
 }
 
-int WedgeQsfp::writeTransceiver(int dataAddress, int offset,
-                            int len, uint8_t* fieldValue) {
+int WedgeQsfp::writeTransceiver(
+    int dataAddress,
+    int offset,
+    int len,
+    uint8_t* fieldValue) {
   try {
-    wedgeI2CBusLock_->moduleWrite(module_ + 1, dataAddress, offset, len,
-                                   fieldValue);
-  } catch (const UsbError& ex) {
+    SCOPE_EXIT {
+      wedgeQsfpstats_.updateWriteDownTime();
+    };
+    SCOPE_FAIL {
+      StatsPublisher::bumpWriteFailure();
+    };
+    SCOPE_SUCCESS {
+      wedgeQsfpstats_.recordWriteSuccess();
+    };
+    threadSafeI2CBus_->moduleWrite(
+        module_ + 1, dataAddress, offset, len, fieldValue);
+  } catch (const std::exception& ex) {
     XLOG(ERR) << "Write to transceiver " << module_ << " at offset " << offset
               << " with length " << len
               << " failed: " << folly::exceptionStr(ex);
-    StatsPublisher::bumpWriteFailure();
     throw;
   }
   return len;
@@ -90,4 +99,9 @@ int WedgeQsfp::getNum() const {
   return module_;
 }
 
+folly::Optional<TransceiverStats> WedgeQsfp::getTransceiverStats() {
+  auto result = folly::Optional<TransceiverStats>();
+  result.assign(wedgeQsfpstats_.getStats());
+  return result;
+}
 }}

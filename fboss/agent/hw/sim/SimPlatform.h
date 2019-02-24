@@ -22,6 +22,7 @@ class SimPlatform : public Platform {
 
   HwSwitch* getHwSwitch() const override;
   void onHwInitialized(SwSwitch* sw) override;
+  void onInitialConfigApplied(SwSwitch* sw) override;
   std::unique_ptr<ThriftHandler> createHandler(SwSwitch* sw) override;
 
   folly::MacAddress getLocalMac() const override {
@@ -43,6 +44,8 @@ class SimPlatform : public Platform {
   // Forbidden copy constructor and assignment operator
   SimPlatform(SimPlatform const &) = delete;
   SimPlatform& operator=(SimPlatform const &) = delete;
+
+  void initImpl() {}
 
   folly::MacAddress mac_;
   std::unique_ptr<SimSwitch> hw_;

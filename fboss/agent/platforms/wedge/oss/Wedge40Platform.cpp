@@ -21,4 +21,13 @@ folly::ByteRange Wedge40Platform::defaultLed1Code() {
   return defaultLed0Code();
 }
 
+const PortQueue& Wedge40Platform::getDefaultPortQueueSettings(
+    cfg::StreamType /*streamType*/) const {
+  throw FbossError("PortQueue setting is not supported");
+}
+
+const PortQueue& Wedge40Platform::getDefaultControlPlaneQueueSettings(
+    cfg::StreamType /*streamType*/) const {
+  throw FbossError("ControlPlaneQueue setting is not supported");
+}
 }} // facebook::fboss

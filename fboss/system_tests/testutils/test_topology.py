@@ -3,12 +3,17 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from fboss.thrift_clients import FbossAgentClient, QsfpServiceClient
+from fboss.fb_thrift_clients import FbossAgentClient, QsfpServiceClient
+from fboss.thrift_clients import FbossAgentClient as PlainTextFbossAgentClient
+from fboss.thrift_clients import QsfpServiceClient as PlainTextQsfpServiceClient
 from fboss.netlink_manager.netlink_manager_client import NetlinkManagerClient
 from fboss.system_tests.testutils.test_client import TestClient
 from neteng.fboss.ttypes import FbossBaseError
+from fboss.system_tests.facebook.utils.ensemble_requirements import (
+    is_host_ping_reachable)
 
 from thrift.transport.TTransport import TTransportException
+from ServiceRouter import TServiceRouterException
 
 import logging
 import time
@@ -118,17 +123,20 @@ class FBOSSTestTopology(object):
         For now, this is just for single switch testing.
     """
 
-    def __init__(self, switch, port=None, qsfp_port=None):
+    def __init__(self, switch, ensemble, min_hosts,
+            port=None, qsfp_port=None):
         if port is None:
-            port = FbossAgentClient.DEFAULT_PORT
+            port = PlainTextFbossAgentClient.DEFAULT_PORT
         if qsfp_port is None:
-            qsfp_port = QsfpServiceClient.DEFAULT_PORT
+            qsfp_port = PlainTextQsfpServiceClient.DEFAULT_PORT
         self.port = port
         self.qsfp_port = qsfp_port
         self.log = logging.getLogger("__main__")
         self.switch = switch
         self.test_hosts = {}
         self.role_type = RoleType.SINGLE_SWITCH
+        self.ensemble = ensemble
+        self.min_hosts = min_hosts
 
     def add_host(self, host):
         """ This host is physically connected to this switch. """
@@ -151,19 +159,33 @@ class FBOSSTestTopology(object):
             raise unittest.SkipTest("Not able to find %d good hosts" %
                                     (n_hosts))
 
-    def verify_switch(self, log=None):
+    def verify_switch(self, retries=30, log=None, port=None):
         """ Verify the switch is THRIFT reachable """
         if not log:
             log = self.log
-        try:
-            with FbossAgentClient(self.switch.name, self.port) as client:
-                client.keepalive()  # will throw FbossBaseError on failure
-        except (FbossBaseError, TTransportException):
-            log.warning("Switch failed to thrift verify")
+        port = port or self.port
+        """ Verfiy that both userver and agent are reachable """
+        # check if userver is reachable, tests can bring down userver
+        # Example: T33276019
+        if not is_host_ping_reachable(self.switch.name, log):
             return False
-        return True
 
-    def verify_hosts(self, fail_on_error=False, min_hosts=0, retries=10,
+        """ Verify the switch is THRIFT reachable """
+        for retry in range(retries):  # don't use @retry, this is OSS
+            try:
+                with FbossAgentClient(self.switch.name, port) as client:
+                    client.keepalive()  # simple check, will pass if agent is up
+                    # this actually checks that agent is in a ready state
+                    client.getAllPortInfo()  # will throw FbossBaseError
+                    return True
+            except (FbossBaseError, TTransportException,
+                    TServiceRouterException) as e:
+                log.warning("Switch failed to thrift verify (try #%d): %s"
+                                % (retry, str(e)))
+                time.sleep(1)
+        return False
+
+    def verify_hosts(self, fail_on_error=False, min_hosts=0, retries=30,
                      log=None):
         """ Verify each host is thrift reachable
                 if fail_on_error is false, just remove unreachable
@@ -187,8 +209,13 @@ class FBOSSTestTopology(object):
                     self.remove_host(host_name)
         return len(self.test_hosts) >= min_hosts
 
-    def switch_thrift(self):
-        return FbossAgentClient(self.switch.name, self.port)
+    def switch_thrift(self, port=None):
+        port = port or self.port
+        return FbossAgentClient(self.switch.name, port=port)
+
+    def switch_thrift_plaintext(self, port=None):
+        port = port or self.port
+        return PlainTextFbossAgentClient(self.switch.name, port=port)
 
     def qsfp_thrift(self):
         return QsfpServiceClient(self.switch.name, self.qsfp_port)
@@ -234,9 +261,9 @@ class FBOSSChassisTestTopology(object):
 
     def __init__(self, chassis, cards, port=None, qsfp_port=None):
         if port is None:
-            port = FbossAgentClient.DEFAULT_PORT
+            port = PlainTextFbossAgentClient.DEFAULT_PORT
         if qsfp_port is None:
-            qsfp_port = QsfpServiceClient.DEFAULT_PORT
+            qsfp_port = PlainTextQsfpServiceClient.DEFAULT_PORT
         self.port = port
         self.qsfp_port = qsfp_port
         self.log = logging.getLogger("__main__")

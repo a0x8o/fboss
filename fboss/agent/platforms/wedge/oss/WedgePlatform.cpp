@@ -20,6 +20,7 @@ std::unique_ptr<ThriftHandler> WedgePlatform::createHandler(SwSwitch* sw) {
 }
 
 std::map<std::string, std::string> WedgePlatform::loadConfig() {
+  // TODO: use opennsl config to support more expressive configuration
   std::map<std::string, std::string> config;
   return config;
 }
@@ -27,10 +28,6 @@ std::map<std::string, std::string> WedgePlatform::loadConfig() {
 void WedgePlatform::initLEDs() {
   // TODO: Initialize the LEDs.  The LED handling code isn't open source yet,
   // but should be soon once we get approval for the required OpenNSL APIs.
-}
-
-bool WedgePlatform::isDu() const {
-  return false;
 }
 
 }} // facebook::fboss

@@ -22,27 +22,28 @@ from thrift.transport.TTransport import TTransportException
 
 class PortDetailsCmd(cmds.FbossCmd):
     def run(self, ports, show_down=True):
-        try:
-            self._client = self._create_agent_client()
-            resp = self._client.getAllPortInfo()
 
-        except FbossBaseError as e:
-            raise SystemExit('Fboss Error: ' + str(e))
-        except Exception as e:
-            raise Exception('Error: ' + str(e))
+        with self._create_agent_client() as client:
+            try:
+                resp = client.getAllPortInfo()
 
-        def use_port(port):
-            return (show_down or port.operState == 1) and \
-                   (not ports or port.portId in ports or port.name in ports)
+            except FbossBaseError as e:
+                raise SystemExit('Fboss Error: ' + str(e))
+            except Exception as e:
+                raise Exception('Error: ' + str(e))
 
-        port_details = {k: v for k, v in resp.items() if use_port(v)}
+            def use_port(port):
+                return (show_down or port.operState == 1) and \
+                       (not ports or port.portId in ports or port.name in ports)
 
-        if not port_details:
-            print("No ports found")
+            port_details = {k: v for k, v in resp.items() if use_port(v)}
 
-        for port in sorted(port_details.values(), key=utils.port_sort_fn):
-            self._print_port_details(port)
-            self._print_port_counters(port)
+            if not port_details:
+                print("No ports found")
+
+            for port in sorted(port_details.values(), key=utils.port_sort_fn):
+                self._print_port_details(port)
+                self._print_port_counters(client, port)
 
     def _convert_bps(self, bps):
         ''' convert bps to human readable form
@@ -97,7 +98,8 @@ class PortDetailsCmd(cmds.FbossCmd):
         fmt = '{:.<50}{}'
         lines = [
             ('Name', port_info.name.strip()),
-            ('Port ID', str(port_info.portId)),
+            ('ID', str(port_info.portId)),
+            ('Description', port_info.description or ""),
             ('Admin State', admin_status),
             ('Link State', oper_status),
             ('Speed', '{:.0f} {}'.format(speed, suffix)),
@@ -112,12 +114,13 @@ class PortDetailsCmd(cmds.FbossCmd):
         if hasattr(port_info, 'portQueues'):
             print(fmt.format("Unicast queues", len(port_info.portQueues)))
             for queue in port_info.portQueues:
-                name = "({})".format(+queue.name) if queue.name != "" else ""
+                name = "({})".format(queue.name) if queue.name != "" else ""
                 attrs = [queue.mode]
                 for val in ("weight", "reservedBytes", "scalingFactor"):
                     if hasattr(queue, val) and getattr(queue, val):
                         attrs.append("{}={}".format(val, getattr(queue, val)))
-                print("    Queue {}{:30}{}".format(queue.id, name, ",".join(attrs)))
+                print("    Queue {} {:29}{}".format(
+                    queue.id, name, ",".join(attrs)))
                 if hasattr(queue, "aqm") and getattr(queue, "aqm"):
                     aqm = getattr(queue, "aqm")
                     attrs1 = []
@@ -144,37 +147,68 @@ class PortDetailsCmd(cmds.FbossCmd):
                     attrs1.append("{}={}".format("ecn", ecn))
                     print('{:<5}{}'.format('', ",".join(attrs1)))
 
-        print(fmt.format('Description', port_info.description or ""))
-
-    def _print_port_counters(self, port_info):
+    def _print_port_counters(self, client, port_info):
         pass
 
 
 class PortFlapCmd(cmds.FbossCmd):
-    def run(self, ports):
+    FLAP_TIME = 1
+
+    def run(self, ports, all):
         try:
-            if not ports:
+            if all:
+                try:
+                    self._qsfp_client = self._create_qsfp_client()
+                except TTransportException:
+                    self._qsfp_client = None
+                self.flap_all_ports()
+            elif not ports:
                 print("Hmm, how did we get here?")
             else:
                 self.flap_ports(ports)
         except FbossBaseError as e:
             raise SystemExit('Fboss Error: ' + e)
 
-    def flap_ports(self, ports, flap_time=1):
-        self._client = self._create_agent_client()
-        resp = self._client.getPortStatus(ports)
-        for port, status in resp.items():
-            if not status.enabled:
-                print("Port %d is disabled by configuration, cannot flap" %
-                      (port))
-                continue
-            print("Disabling port %d" % (port))
-            self._client.setPortState(port, False)
-        time.sleep(flap_time)
-        for port, status in resp.items():
-            if status.enabled:
+        if hasattr(self, '_qsfp_client') and self._qsfp_client:
+            self._qsfp_client.__exit__(exec, None, None)
+
+    def flap_ports(self, ports, flap_time=FLAP_TIME):
+        with self._create_agent_client() as client:
+            resp = client.getPortStatus(ports)
+            for port, status in resp.items():
+                if not status.enabled:
+                    print("Port %d is disabled by configuration, cannot flap" %
+                          (port))
+                    continue
+                print("Disabling port %d" % (port))
+                client.setPortState(port, False)
+            time.sleep(flap_time)
+            for port, status in resp.items():
+                if status.enabled:
+                    print("Enabling port %d" % (port))
+                    client.setPortState(port, True)
+
+    def flap_all_ports(self, flap_time=FLAP_TIME):
+        with self._create_agent_client() as client:
+            qsfp_info_map = utils.get_qsfp_info_map(
+                self._qsfp_client, None, continue_on_error=True)
+            resp = client.getPortStatus()
+            flapped_ports = []
+            for port, status in resp.items():
+                if status.enabled and not status.up:
+                    qsfp_present = False
+                    if status.transceiverIdx and self._qsfp_client:
+                        qsfp_info = qsfp_info_map.get(
+                            status.transceiverIdx.transceiverId)
+                        qsfp_present = qsfp_info.present if qsfp_info else False
+                    if qsfp_present:
+                        print("Disabling port %d" % (port))
+                        client.setPortState(port, False)
+                        flapped_ports.append(port)
+            time.sleep(flap_time)
+            for port in flapped_ports:
                 print("Enabling port %d" % (port))
-                self._client.setPortState(port, True)
+                client.setPortState(port, True)
 
 
 class PortSetStatusCmd(cmds.FbossCmd):
@@ -185,11 +219,11 @@ class PortSetStatusCmd(cmds.FbossCmd):
             raise SystemExit('Fboss Error: ' + e)
 
     def set_status(self, ports, status):
-        self._client = self._create_agent_client()
-        for port in ports:
-            status_str = 'Enabling' if status else 'Disabling'
-            print("{} port {}".format(status_str, port))
-            self._client.setPortState(port, status)
+        with self._create_agent_client() as client:
+            for port in ports:
+                status_str = 'Enabling' if status else 'Disabling'
+                print("{} port {}".format(status_str, port))
+                client.setPortState(port, status)
 
 
 class PortStatsCmd(cmds.FbossCmd):
@@ -226,11 +260,11 @@ class PortStatsCmd(cmds.FbossCmd):
                                    self._get_lldp_string(port_id, n2ports, details)))
 
     def _get_counter_string(self, counters):
-        # bytes uPts mPts bPts err disc
+        # bytes uPkts mPkts bPkts errPkts discPkts
         field_fmt = '{:>15} {:>15} {:>10} {:>10} {:>10} {:>10}'
         if counters is None:
             return field_fmt.format("bytes", "uPkts", "mcPkts", "bcPkts",
-                                    "errs", "disc")
+                                    "errsPkts", "discPkts")
         else:
             return field_fmt.format(counters.bytes, counters.ucastPkts,
                                     counters.multicastPkts,
@@ -246,43 +280,53 @@ class PortStatsCmd(cmds.FbossCmd):
         return ret
 
 
+class PortStatsClearCmd(cmds.FbossCmd):
+    def run(self, ports):
+        client = self._create_agent_client()
+        client.clearPortStats(ports if ports else
+                client.getAllPortInfo().keys())
+
+
 class PortStatusCmd(cmds.FbossCmd):
     def run(self, detail, ports, verbose, internal, all):
-        self._client = self._create_agent_client()
-        try:
-            self._qsfp_client = self._create_qsfp_client()
-        except TTransportException:
-            self._qsfp_client = None
-        if detail or verbose:
-            PortStatusDetailCmd(
-                self._client, ports, self._qsfp_client, verbose
-            ).get_detail_status()
-        elif internal:
-            self.list_ports(ports, internal_port=True)
-        elif all:
-            self.list_ports(ports, all=True)
-        else:
-            self.list_ports(ports)
+        with self._create_agent_client() as client:
+            try:
+                self._qsfp_client = self._create_qsfp_client()
+            except TTransportException:
+                self._qsfp_client = None
+            if detail or verbose:
+                PortStatusDetailCmd(
+                    client, ports, self._qsfp_client, verbose
+                ).get_detail_status()
+            elif internal:
+                self.list_ports(client, ports, internal_port=True)
+            elif all:
+                self.list_ports(client, ports, all=True)
+            else:
+                self.list_ports(client, ports)
+
+        if hasattr(self, '_qsfp_client') and self._qsfp_client:
+            self._qsfp_client.__exit__(exec, None, None)
 
     def _get_field_format(self, internal_port):
         if internal_port:
-            field_fmt = '{:>6} {:<11} {:>12}  {}{:>10}  {:>12}  {:>6}'
-            print(field_fmt.format('Port ID', 'Port Name', 'Admin State', '',
-                                   'Link State', 'Transceiver', 'Speed'))
-            print('-' * 68)
+            field_fmt = '{:<6} {:>11} {:>12}  {}{:>10}  {:>12}  {:>6}'
+            print(field_fmt.format('ID', 'Name', 'AdminState', '',
+                                   'LinkState', 'Transceiver', 'Speed'))
+            print('-' * 67)
         else:
             field_fmt = '{:<11} {:>12}  {}{:>10}  {:>12}  {:>6}'
-            print(field_fmt.format('Port', 'Admin State', '', 'Link State',
+            print(field_fmt.format('Name', 'Admin State', '', 'Link State',
                                    'Transceiver', 'Speed'))
             print('-' * 59)
         return field_fmt
 
-    def list_ports(self, ports, internal_port=False, all=False):
+    def list_ports(self, client, ports, internal_port=False, all=False):
         field_fmt = self._get_field_format(internal_port)
-        port_status_map = self._client.getPortStatus(ports)
+        port_status_map = client.getPortStatus(ports)
         qsfp_info_map = utils.get_qsfp_info_map(
             self._qsfp_client, None, continue_on_error=True)
-        port_info_map = self._client.getAllPortInfo()
+        port_info_map = client.getAllPortInfo()
         missing_port_status = []
         for port_info in sorted(port_info_map.values(), key=utils.port_sort_fn):
             port_id = port_info.portId
@@ -722,8 +766,8 @@ class PortStatusDetailCmd(object):
 class PortDescriptionCmd(cmds.FbossCmd):
     def run(self, ports, show_down=True):
         try:
-            self._client = self._create_agent_client()
-            resp = self._client.getAllPortInfo()
+            with self._create_agent_client() as client:
+                resp = client.getAllPortInfo()
 
         except FbossBaseError as e:
             raise SystemExit('Fboss Error: ' + str(e))

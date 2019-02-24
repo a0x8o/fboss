@@ -38,6 +38,22 @@ class TransceiverImpl;
 void getQsfpFieldAddress(SffField field, int &dataAddress,
                         int &offset, int &length);
 
+/**
+ * This is the QSFP module error which should be throw only if it's module
+ * related issue.
+ */
+class QsfpModuleError : public std::exception {
+public:
+  explicit QsfpModuleError(const std::string& what) : what_(what) {}
+
+  const char* what() const noexcept override {
+    return what_.c_str();
+  }
+
+private:
+  std::string what_;
+};
+
 /*
  * This is the QSFP class which will be storing the QSFP EEPROM
  * data from the address 0xA0 which is static data. The class
@@ -76,7 +92,7 @@ class QsfpModule : public Transceiver {
   /*
    * Get the QSFP EEPROM Field
    */
-  int getFieldValue(SffField fieldName, uint8_t* fieldValue);
+  void getFieldValue(SffField fieldName, uint8_t* fieldValue);
 
   /*
    * Customize QSPF fields as necessary
@@ -158,6 +174,7 @@ class QsfpModule : public Transceiver {
   time_t lastRefreshTime_{0};
   time_t lastCustomizeTime_{0};
   time_t lastTxEnable_{0};
+  time_t lastPowerClassReset_{0};
 
   /*
    * Perform transceiver customization
@@ -233,6 +250,9 @@ class QsfpModule : public Transceiver {
    * caller needs to check if DOM is supported or not
    */
   std::string getQsfpString(SffField flag) const;
+
+  bool validateQsfpString(const std::string& value) const;
+
   /*
    * Fills in values for alarm and warning thresholds based on field name
    */
@@ -280,6 +300,10 @@ class QsfpModule : public Transceiver {
    * Return what power control capability is currently enabled
    */
   PowerControlState getPowerControlValue();
+  /*
+   * Return TransceiverStats
+   */
+  bool getTransceiverStats(TransceiverStats& stats);
   /*
    * This function returns true if both the sfp is present and the
    * cache data is not stale. This should be checked before any
@@ -340,6 +364,12 @@ class QsfpModule : public Transceiver {
    * since last time we refreshed the DOM data.
    */
   bool shouldRefresh(time_t cooldown) const;
+
+  /*
+   * In the case of Minipack using Facebook FPGA, we need to clear the reset
+   * register of QSFP whenever it is newly inserted.
+   */
+  void ensureOutOfReset() const;
 
   /*
    * Determine set speed of enabled member ports.

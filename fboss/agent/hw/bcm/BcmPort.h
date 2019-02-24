@@ -36,6 +36,8 @@ namespace facebook { namespace fboss {
 class BcmSwitch;
 class BcmPortGroup;
 class SwitchState;
+enum class MirrorDirection;
+enum class MirrorAction;
 
 /**
  * BcmPort is the class to abstract the physical port in BcmSwitch.
@@ -50,6 +52,7 @@ class BcmPort {
    * actual initialization logic should be performed there.
    */
   BcmPort(BcmSwitch* hw, opennsl_port_t port, BcmPlatformPort* platformPort);
+  ~BcmPort();
 
   void init(bool warmBoot);
 
@@ -59,6 +62,9 @@ class BcmPort {
   void disableLinkscan();
   void program(const std::shared_ptr<Port>& swPort);
   void setupQueue(const std::shared_ptr<PortQueue>& queue);
+
+  void attachIngressQosPolicy(const std::string& name);
+  void detachIngressQosPolicy();
 
   /*
    * Getters.
@@ -95,6 +101,7 @@ class BcmPort {
     const std::shared_ptr<SwitchState>& state) const;
 
   PortID getPortID() const;
+  std::string getPortName() const { return portName_; }
   LaneSpeeds supportedLaneSpeeds() const;
 
   bool supportsSpeed(cfg::PortSpeed speed);
@@ -138,8 +145,8 @@ class BcmPort {
   void prepareForGracefulExit();
 
   /**
-   * return true iff the port has Forward Error Correction (FEC)
-   * enabled
+   * return true if the port has Forward Error Correction (FEC)
+   * enabled or if CL91 FEC is enabled
    */
   bool isFECEnabled();
 
@@ -156,6 +163,16 @@ class BcmPort {
   BcmCosQueueManager* getQueueManager() const {
     return queueManager_.get();
   }
+
+  folly::Optional<std::string> getIngressPortMirror() const {
+    return ingressMirror_;
+  }
+  folly::Optional<std::string> getEgressPortMirror() const {
+    return egressMirror_;
+  }
+
+  void setIngressPortMirror(const std::string& mirrorName);
+  void setEgressPortMirror(const std::string& mirrorName);
 
  private:
   class BcmPortStats {
@@ -174,6 +191,8 @@ class BcmPort {
     std::chrono::seconds timeRetrieved_;
   };
 
+  uint32_t getCL91FECStatus() const;
+  bool isCL91FECApplicable() const;
   // no copy or assignment
   BcmPort(BcmPort const &) = delete;
   BcmPort& operator=(BcmPort const &) = delete;
@@ -201,6 +220,9 @@ class BcmPort {
                                             const std::string& name);
   bool getDesiredFECEnabledStatus(const std::shared_ptr<Port>& swPort);
   TransmitterTechnology getTransmitterTechnology(const std::string& name);
+  void updateMirror(
+      const folly::Optional<std::string>& swMirrorName,
+      MirrorDirection direction);
 
   opennsl_pbmp_t getPbmp();
 
@@ -208,8 +230,15 @@ class BcmPort {
   void setFEC(const std::shared_ptr<Port>& swPort);
   void setPause(const std::shared_ptr<Port>& swPort);
   void setTxSetting(const std::shared_ptr<Port>& swPort);
+  void setLoopbackMode(const std::shared_ptr<Port>& swPort);
+
   bool isMmuLossy() const;
   uint8_t determinePipe() const;
+
+  void applyMirrorAction(
+      const folly::Optional<std::string>& mirrorName,
+      MirrorAction action,
+      MirrorDirection direction);
 
   BcmSwitch* const hw_{nullptr};
   const opennsl_port_t port_;    // Broadcom physical port number
@@ -220,6 +249,8 @@ class BcmPort {
   BcmPlatformPort* const platformPort_{nullptr};
   int unit_{-1};
   std::string portName_{""};
+  folly::Optional<std::string> ingressMirror_;
+  folly::Optional<std::string> egressMirror_;
   TransmitterTechnology transmitterTechnology_{TransmitterTechnology::UNKNOWN};
 
   // The port group this port is a part of

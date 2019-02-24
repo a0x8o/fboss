@@ -3,7 +3,6 @@
 #include <folly/gen/Base.h>
 
 #include <folly/logging/xlog.h>
-#include "fboss/lib/usb/UsbError.h"
 #include "fboss/qsfp_service/platforms/wedge/WedgeQsfp.h"
 #include "fboss/qsfp_service/sff/QsfpModule.h"
 
@@ -16,19 +15,24 @@ void WedgeManager::initTransceiverMap() {
   // create the QSFP objects;  this is likely to be a permanent
   // error.
   try {
-    wedgeI2CBusLock_ = std::make_unique<WedgeI2CBusLock>(getI2CBus());
-  } catch (const LibusbError& ex) {
-    XLOG(ERR) << "failed to initialize USB to I2C interface";
+    wedgeI2cBus_ = getI2CBus();
+  } catch (const I2cError& ex) {
+    XLOG(ERR) << "failed to initialize I2C interface: " << ex.what();
     return;
   }
 
   // Wedge port 0 is the CPU port, so the first port associated with
   // a QSFP+ is port 1.  We start the transceiver IDs with 0, though.
   for (int idx = 0; idx < getNumQsfpModules(); idx++) {
-    auto qsfpImpl = std::make_unique<WedgeQsfp>(idx, wedgeI2CBusLock_.get());
+    auto qsfpImpl = std::make_unique<WedgeQsfp>(idx, wedgeI2cBus_.get());
     auto qsfp = std::make_unique<QsfpModule>(
         std::move(qsfpImpl), numPortsPerTransceiver());
-    qsfp->refresh();
+    try {
+      qsfp->refresh();
+    } catch (const std::exception& ex) {
+      XLOG(ERR) << "Transceiver " << idx
+                << ": Error populating initial data: " << ex.what();
+    }
     transceivers_.push_back(move(qsfp));
     XLOG(INFO) << "making QSFP for " << idx;
   }
@@ -46,7 +50,12 @@ void WedgeManager::getTransceiversInfo(std::map<int32_t, TransceiverInfo>& info,
   for (const auto& i : *ids) {
     TransceiverInfo trans;
     if (isValidTransceiver(i)) {
-      trans = transceivers_[TransceiverID(i)]->getTransceiverInfo();
+      try {
+        trans = transceivers_[TransceiverID(i)]->getTransceiverInfo();
+      } catch (const std::exception& ex) {
+        XLOG(ERR) << "Transceiver " << i
+                  << ": Error calling getTransceiverInfo(): " << ex.what();
+      }
     }
     info[i] = trans;
   }
@@ -64,7 +73,12 @@ void WedgeManager::getTransceiversRawDOMData(
   for (const auto& i : *ids) {
     RawDOMData data;
     if (isValidTransceiver(i)) {
-      data = transceivers_[TransceiverID(i)]->getRawDOMData();
+      try {
+        data = transceivers_[TransceiverID(i)]->getRawDOMData();
+      } catch (const std::exception& ex) {
+        XLOG(ERR) << "Transceiver " << i
+                  << ": Error calling getRawDOMData(): " << ex.what();
+      }
     }
     info[i] = data;
   }
@@ -77,34 +91,46 @@ void WedgeManager::customizeTransceiver(int32_t idx, cfg::PortSpeed speed) {
 void WedgeManager::syncPorts(
     std::map<int32_t, TransceiverInfo>& info,
     std::unique_ptr<std::map<int32_t, PortStatus>> ports) {
-
-  auto groups = folly::gen::from(*ports)
-    | folly::gen::filter([](const std::pair<int32_t, PortStatus>& item) {
+  auto groups =
+      folly::gen::from(*ports) |
+      folly::gen::filter([](const std::pair<int32_t, PortStatus>& item) {
         return item.second.__isset.transceiverIdx;
-      })
-    | folly::gen::groupBy([](const std::pair<int32_t, PortStatus>& item) {
-        return item.second.transceiverIdx.transceiverId;
-      })
-    | folly::gen::as<std::vector>();
+      }) |
+      folly::gen::groupBy([](const std::pair<int32_t, PortStatus>& item) {
+        return item.second.transceiverIdx_ref().value_unchecked().transceiverId;
+      }) |
+      folly::gen::as<std::vector>();
 
   for (auto& group : groups) {
     int32_t transceiverIdx = group.key();
     XLOG(INFO) << "Syncing ports of transceiver " << transceiverIdx;
 
-    auto transceiver = transceivers_.at(transceiverIdx).get();
-    transceiver->transceiverPortsChanged(group.values());
-    info[transceiverIdx] = transceiver->getTransceiverInfo();
+    try {
+      auto transceiver = transceivers_.at(transceiverIdx).get();
+      transceiver->transceiverPortsChanged(group.values());
+      info[transceiverIdx] = transceiver->getTransceiverInfo();
+    } catch (const std::exception& ex) {
+      XLOG(ERR) << "Transceiver " << transceiverIdx
+                << ": Error calling syncPorts(): " << ex.what();
+    }
   }
 }
 
 void WedgeManager::refreshTransceivers() {
+  wedgeI2cBus_->verifyBus(false);
+
   for (const auto& transceiver : transceivers_) {
-    transceiver->refresh();
+    try {
+      transceiver->refresh();
+    } catch (const std::exception& ex) {
+      XLOG(DBG2) << "Transceiver " << static_cast<int>(transceiver->getID())
+                << ": Error calling refresh(): " << ex.what();
+    }
   }
 }
 
-std::unique_ptr<BaseWedgeI2CBus> WedgeManager::getI2CBus() {
-  return std::make_unique<WedgeI2CBus>();
+std::unique_ptr<TransceiverI2CApi> WedgeManager::getI2CBus() {
+  return std::make_unique<WedgeI2CBusLock>(std::make_unique<WedgeI2CBus>());
 }
 
 }} // facebook::fboss

@@ -59,12 +59,6 @@ std::shared_ptr<SwitchState> publishAndApplyConfig(
     const Platform* platform,
     const cfg::SwitchConfig* prevCfg=nullptr);
 
-std::shared_ptr<SwitchState> publishAndApplyConfigFile(
-    std::shared_ptr<SwitchState>& state,
-    folly::StringPiece path,
-    const Platform* platform,
-    std::string prevCfgStr="");
-
 /*
  * Create a SwSwitch for testing purposes, with the specified initial state.
  *
@@ -74,7 +68,7 @@ std::shared_ptr<SwitchState> publishAndApplyConfigFile(
  */
 std::unique_ptr<HwTestHandle> createTestHandle(
   const std::shared_ptr<SwitchState>& = nullptr,
-  const folly::Optional<folly::MacAddress>& = nullptr,
+  const folly::Optional<folly::MacAddress>& = folly::none,
   SwitchFlags flags = DEFAULT);
 std::unique_ptr<HwTestHandle> createTestHandle(
     cfg::SwitchConfig* cfg,
@@ -148,11 +142,27 @@ void checkField(const ExpectedType& expected, const ActualType& actual,
  *       2401:db00:2110:3055::0001/64
  */
 std::shared_ptr<SwitchState> testStateA();
+/*
+ * Same as testStateA but with all ports
+ * enabled and up
+ */
+std::shared_ptr<SwitchState> testStateAWithPortsUp();
 
 /*
  * Test may want to tweak default configuration
  */
 std::shared_ptr<SwitchState> testState(cfg::SwitchConfig config);
+/*
+ * Bring all ports up for a given input state
+ */
+std::shared_ptr<SwitchState> bringAllPortsUp(
+    const std::shared_ptr<SwitchState>& in);
+
+/*
+ * Bring all ports down for a given input state
+ */
+std::shared_ptr<SwitchState> bringAllPortsDown(
+    const std::shared_ptr<SwitchState>& in);
 
 /*
  * The returned configuration object, if applied to a SwitchState with ports
@@ -176,6 +186,11 @@ cfg::SwitchConfig testConfigA();
  */
 std::shared_ptr<SwitchState> testStateB();
 
+/*
+ * Same as testStateA but with all ports
+ * enabled and up
+ */
+std::shared_ptr<SwitchState> testStateBWithPortsUp();
 /*
  * Convenience macro that wraps EXPECT_CALL() on the underlying MockHwSwitch
  */
@@ -249,11 +264,11 @@ void EXPECT_NO_ROUTE(const std::shared_ptr<RouteTableMap>& tables,
  * to call both filters on a packet to see which one it is.
  */
 #define EXPECT_PKT(sw, name, matchFn) \
-  EXPECT_HW_CALL(sw, sendPacketSwitched_( \
+  EXPECT_HW_CALL(sw, sendPacketSwitchedAsync_( \
                  TxPacketMatcher::createMatcher(name, matchFn)))
 
 #define EXPECT_MANY_PKTS(sw, name, matchFn) \
-  EXPECT_MANY_HW_CALLS(sw, sendPacketSwitched_( \
+  EXPECT_MANY_HW_CALLS(sw, sendPacketSwitchedAsync_( \
                  TxPacketMatcher::createMatcher(name, matchFn)))
 
 /**

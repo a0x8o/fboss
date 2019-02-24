@@ -12,11 +12,13 @@
 #include <stdexcept>
 
 #include <folly/IPAddress.h>
-#include "fboss/agent/packet/Ethertype.h"
+#include <folly/logging/xlog.h>
 #include "fboss/agent/packet/EthHdr.h"
+#include "fboss/agent/packet/Ethertype.h"
 #include "fboss/agent/packet/HdrParseError.h"
 #include "fboss/agent/packet/IPProto.h"
 #include "fboss/agent/packet/IPv6Hdr.h"
+#include "fboss/agent/packet/NDP.h"
 #include "fboss/agent/packet/PktUtil.h"
 
 namespace facebook { namespace fboss {
@@ -74,11 +76,11 @@ void ICMPHdr::serializePktHdr(folly::io::RWPrivateCursor* cursor,
                                 const IPv4Hdr& ipv4) {
   cursor->push(dstMac.bytes(), folly::MacAddress::SIZE);
   cursor->push(srcMac.bytes(), folly::MacAddress::SIZE);
-  cursor->writeBE<uint16_t>(ETHERTYPE_VLAN);
+  cursor->writeBE<uint16_t>(static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_VLAN));
   cursor->writeBE<uint16_t>(vlan);
-  cursor->writeBE<uint16_t>(ETHERTYPE_IPV4);
+  cursor->writeBE<uint16_t>(static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_IPV4));
 
-  DCHECK_EQ(ipv4.protocol, IP_PROTO_ICMP);
+  DCHECK_EQ(ipv4.protocol, static_cast<uint8_t>(IP_PROTO::IP_PROTO_ICMP));
   ipv4.write(cursor);
 }
 
@@ -95,17 +97,17 @@ void ICMPHdr::serializePktHdr(folly::io::RWPrivateCursor* cursor,
   // TODO: clean up the EthHdr code and use EthHdr here
   cursor->push(dstMac.bytes(), folly::MacAddress::SIZE);
   cursor->push(srcMac.bytes(), folly::MacAddress::SIZE);
-  cursor->writeBE<uint16_t>(ETHERTYPE_VLAN);
+  cursor->writeBE<uint16_t>(static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_VLAN));
   cursor->writeBE<uint16_t>(vlan);
-  cursor->writeBE<uint16_t>(ETHERTYPE_IPV6);
+  cursor->writeBE<uint16_t>(static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_IPV6));
 
   DCHECK_EQ(ipv6.payloadLength, ICMPHdr::SIZE + payloadLength);
-  DCHECK_EQ(ipv6.nextHeader, IP_PROTO_IPV6_ICMP);
+  DCHECK_EQ(
+      ipv6.nextHeader, static_cast<uint8_t>(IP_PROTO::IP_PROTO_IPV6_ICMP));
   ipv6.serialize(cursor);
 }
 
 uint32_t ICMPHdr::computeTotalLengthV6(uint32_t payloadLength) {
   return payloadLength + ICMPHdr::SIZE + IPv6Hdr::SIZE + EthHdr::SIZE;
 }
-
 }}

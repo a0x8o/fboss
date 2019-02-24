@@ -41,23 +41,15 @@ class LldpManager : private folly::AsyncTimeout {
                     TLV_LENGTH_BITS_LENGTH = 9,
                     TLV_TYPE_LEFT_SHIFT_OFFSET = 9,
                     TLV_LENGTH_LEFT_SHIFT_OFFSET = 1,
-                    CHASSIS_TLV_TYPE = 0x01,
                     CHASSIS_TLV_LENGTH = 0x07,
-                    CHASSIS_TLV_SUB_TYPE_MAC = 0x04,
-                    PORT_TLV_TYPE = 0x02,
-                    PORT_TLV_SUB_TYPE_INTERFACE = 0x5,
-                    SYSTEM_NAME_TLV_TYPE = 0x5,
-                    SYSTEM_DESCRIPTION_TLV_TYPE = 0x6,
-                    SYSTEM_CAPABILITY_TLV_TYPE = 0x7,
                     SYSTEM_CAPABILITY_TLV_LENGTH = 0x4,
                     SYSTEM_CAPABILITY_SWITCH = 1 << 2, // 3rd bit for switch
                     SYSTEM_CAPABILITY_ROUTER = 1 << 4, // 5th bit for router
-                    TTL_TLV_TYPE = 0x3,
                     TTL_TLV_LENGTH = 0x2,
                     TTL_TLV_VALUE = 120,
-                    PDU_END_TLV_TYPE = 0,
                     PDU_END_TLV_LENGTH = 0};
-  explicit LldpManager(SwSwitch* sw);
+  explicit LldpManager(
+      SwSwitch* sw);
   ~LldpManager() override;
   static const folly::MacAddress LLDP_DEST_MAC;
 
@@ -71,7 +63,7 @@ class LldpManager : private folly::AsyncTimeout {
   /*
    * Stop sending LLDP packets.
    *
-   * This must be called before while the SwSwitch background thread is still
+   * This must be called while the SwSwitch background thread is still
    * running.
    */
   void stop();
@@ -81,8 +73,19 @@ class LldpManager : private folly::AsyncTimeout {
                     folly::MacAddress src,
                     folly::io::Cursor cursor);
 
+  // Create an LLDP packet
+  static std::unique_ptr<TxPacket>
+  createLldpPkt(SwSwitch* sw,
+                const folly::MacAddress macaddr,
+                VlanID,
+                const std::string& hostname,
+                const std::string& portname,
+                const std::string& portdesc,
+                const uint16_t ttl,
+                const uint16_t capabilities);
+
   // This function is internal.  It is only public for use in unit tests.
-  void sendLldpOnAllPorts(bool checkPortStatusFlag);
+  void sendLldpOnAllPorts();
 
   LinkNeighborDB* getDB() {
     return &db_;
@@ -92,13 +95,19 @@ class LldpManager : private folly::AsyncTimeout {
     db_.portDown(port);
   }
 
+  // Helper to calculate the packet size which createLldpPkt will allocate.
+  // Required for unit testing, if nothing else.
+  static uint32_t LldpPktSize(const std::string& hostname,
+                         const std::string& portname,
+                         const std::string& portdesc,
+                         const std::string& sysDesc);
+
  private:
   void timeoutExpired() noexcept override;
-  void sendLldpInfo(SwSwitch* sw, const std::shared_ptr<SwitchState>& swState,
-                    const std::shared_ptr<Port>& port);
+  void sendLldpInfo(const std::shared_ptr<Port>& port);
 
   SwSwitch* sw_{nullptr};
-  std::chrono::milliseconds interval_;
+  std::chrono::milliseconds intervalMsecs_;
   LinkNeighborDB db_;
 };
 

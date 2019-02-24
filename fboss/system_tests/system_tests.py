@@ -12,13 +12,18 @@ import unittest
 
 
 from fboss.system_tests.testutils.system_tests_runner import SystemTestsRunner
+from fboss.system_tests.facebook.utils.ensemble_health_check_utils import (
+    block_ensemble_and_create_task,
+)
+from neteng.netcastle.utils.basset_utils import BassetButler
+from neteng.netcastle.test_case import test_tags
 
 user_requested_tags = []
 
 Defaults = {
     "config": 'test_topologies/example_topology.py',
-    "console_log_level": logging.INFO,   # very terse, for console log_level
-    "file_log_level": logging.DEBUG,  # result/test-foo.log, more verbose
+    "console_log_level": 'info',   # very terse, for console log_level
+    "file_log_level": 'debug',  # result/test-foo.log, more verbose
     "log_dir": "results",
     "log_file": "{dir}/result-{test}.log",
     "test_topology": None,
@@ -31,27 +36,13 @@ Defaults = {
 }
 
 
-def _test_has_user_requested_tag(test_tags):
-    for tag in test_tags:
-        if tag in user_requested_tags:
-            return True
-    return False
-
-
-def test_tags(*args):
-    def fn(cls):
-        if _test_has_user_requested_tag(list(args)):
-            cls.valid_tags = True
-        return cls
-    return fn
-
-
 def generate_default_test_argparse(**kwargs):
     """ Put all command line args into a function, so that other
     programs (e.g., internal automation) can start with these args and build
     on them.
     """
     global Defaults
+    log_levels = ['debug', 'info', 'warning', 'error', 'critical']
     parser = argparse.ArgumentParser(description='FBOSS System Tests', **kwargs)
     parser.add_argument('tests', nargs='*',
                         help="List of test classes to run. For example:\n"
@@ -68,8 +59,14 @@ def generate_default_test_argparse(**kwargs):
     parser.add_argument('--log_dir', default=Defaults['log_dir'])
     parser.add_argument('--log_file', default=Defaults['log_file'])
     parser.add_argument('--min_hosts', type=int, default=Defaults['min_hosts'])
-    parser.add_argument('--console_log_level', default=Defaults['console_log_level'])
-    parser.add_argument('--file_log_level', default=Defaults['file_log_level'])
+    parser.add_argument(
+        '--console_log_level', type=str, default=Defaults['console_log_level'],
+        choices=log_levels,
+        help='Console log level ({})'.format(', '.join(log_levels)))
+    parser.add_argument(
+        '--file_log_level', type=str, default=Defaults['file_log_level'],
+        choices=log_levels,
+        help='File log level ({})'.format(', '.join(log_levels)))
     parser.add_argument('--repeat-tests', help="Times to repeatedly run tests",
                             type=int, default=Defaults['repeat-tests'])
     parser.add_argument('--tags',
@@ -120,7 +117,8 @@ def setup_logging(options):
         # setup the console log if not done already
         # this is different from the per test file log
         options.log = logging.getLogger("__main__")
-        options.log.setLevel(options.console_log_level)
+        options.log.setLevel(
+            getattr(logging, options.console_log_level.upper()))
 
 
 class FbossBaseSystemTest(unittest.TestCase):
@@ -128,52 +126,63 @@ class FbossBaseSystemTest(unittest.TestCase):
     _format = "%(asctime)s.%(msecs)03d  %(name)-10s: %(levelname)-8s: %(message)s"
     _datefmt = "%m/%d/%Y-%H:%M:%S"
 
-    TopologyIsSane = True
-
     def setUp(self):
-        if self.options is None:
-            raise Exception("options not set - did you call run_tests()?")
-        if (not hasattr(self.options, 'test_topology') or
-                    self.options.test_topology is None):
-            raise Exception("options.test_topology not set - " +
+        if not self.test_topology:
+            raise Exception("optitest_topology not set - " +
                             "did you call run_tests()?")
-        self.test_topology = self.options.test_topology  # save typing
         my_name = str(self.__class__.__name__ + "." + self._testMethodName)
         self.log = logging.getLogger(my_name)
         self.log.setLevel(logging.DEBUG)  # logging controlled by handlers
-        logfile_opts = {'test': my_name, 'dir': self.options.log_dir}
-        logfile = self.options.log_file.format(**logfile_opts)
+        logfile_opts = {'test': my_name, 'dir': self.log_dir}
+        logfile = self.log_file.format(**logfile_opts)
         # close old log files
         for handler in self.log.handlers:
             self.log.removeHandler(handler)
             handler.close()
         # open one unique for each test class
         handler = logging.FileHandler(logfile, mode='w+')
-        handler.setLevel(self.options.file_log_level)
+        handler.setLevel(
+            getattr(logging, self.file_log_level.upper()))
         handler.setFormatter(logging.Formatter(self._format, self._datefmt))
         self.log.addHandler(handler)
         self.test_hosts_in_topo = self.test_topology.number_of_hosts()
         # We have seen cases where previous testcase brings down the system
         # and all following testcaes fails. Instead we should skip a testcase
         # if system went to bad state.
-        if not self.TopologyIsSane:
-            raise unittest.SkipTest("Topology is in bad state, Skip Test")
+        if not self._verify_topo_and_block_bad_ensemble():
+            self.skipTest("Topology is in bad state, Skip Test")
 
     def tearDown(self):
         '''
         Make sure our topology is still in healthy state
         and no hosts got busted during test
         '''
-        if self.TopologyIsSane:     # don't test if things are already broken
-            self.log.info("Testing connection to switch")
-            self.TopologyIsSane = self.test_topology.verify_switch(log=self.log)
-            self.assertTrue(self.TopologyIsSane)
-            self.log.info("Testing connection to hosts")
-            self.TopologyIsSane = \
-                self.test_topology.verify_hosts(min_hosts=self.options.min_hosts,
-                                                log=self.log)
-            self.assertTrue(self.TopologyIsSane,
-                            "Test broke connectivity to hosts?")
+        if not self._verify_topo_and_block_bad_ensemble():
+            self.fail("Test Case broke topology healthy state")
+
+    def _verify_topo_and_block_bad_ensemble(self):
+        state, reason = self._get_topology_state()
+        ensemble = self.test_topology.ensemble
+        if not state:
+            if not BassetButler().get_attr(ensemble, 'task-id'):
+                ensemble = block_ensemble_and_create_task(
+                    ensemble,
+                    reason=reason,
+                    logger=self.log)
+                self.test_topology.ensemble = ensemble
+            return False
+        return True
+
+    def _get_topology_state(self):
+        self.log.info("Testing connection to switch")
+        if not self.test_topology.verify_switch(log=self.log):
+            self.log.info("Switch is not in good state")
+            return False, "Switch is not in good state"
+        if not self.test_topology.verify_hosts(
+           min_hosts=self.test_topology.min_hosts, log=self.log):
+            self.log.info("Hosts are not in good state")
+            return False, "Hosts are not in good state"
+        return True, ''
 
 
 def frob_options_into_tests(suite, options):
@@ -187,23 +196,24 @@ def frob_options_into_tests(suite, options):
             # recursively iterate through all of the TestSuites
             frob_options_into_tests(test, options)
         else:
-            test.options = options
+            test.test_topology = options.test_topology
+            test.log_file = options.log_file
+            test.file_log_level = options.file_log_level
+            test.log_dir = options.log_dir
 
 
 def add_interested_tests_to_test_suite(tests, suite):
     if not isinstance(tests, unittest.suite.TestSuite):
-        # If user uses tag and there is an import error on a test
-        # the "valid_tags" attributes are never added,
         # so the test would not be run and there is no error.
         # The next 2 lines is to explicitly add these tests
-        if isinstance(tests, unittest.loader._FailedTest):
+        if isinstance(tests, unittest.loader._FailedTest) or not user_requested_tags:
             suite.addTest(tests)
             return
-        # when user provides a tag , add testcases which has
-        # valid tags and add all testcases when user do not
-        # provide any tags
-        if hasattr(tests, "valid_tags") or not user_requested_tags:
-            suite.addTest(tests)
+        # Add testcase which has user provided tag
+        tags = test_tags.get_tags(tests)
+        for tag in tags:
+            if tag in user_requested_tags:
+                suite.addTest(tests)
         return
 
     for test in tests:

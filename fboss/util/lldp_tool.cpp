@@ -9,7 +9,7 @@
 #include "fboss/agent/hw/bcm/BcmError.h"
 #include "fboss/agent/hw/bcm/BcmRxPacket.h"
 #include "fboss/agent/hw/bcm/BcmUnit.h"
-#include "fboss/agent/hw/bcm/facebook/gen-cpp2/bcm_config_types.h"
+#include "fboss/agent/hw/bcm/gen-cpp2/bcm_config_types.h"
 #include "fboss/agent/lldp/LinkNeighbor.h"
 #include "fboss/agent/packet/Ethertype.h"
 #include "fboss/agent/packet/PktUtil.h"
@@ -217,7 +217,7 @@ void processPacket(IOBuf* buf,
 
     LinkNeighbor neighbor;
     bool parsed{false};
-    if (ethertype == ETHERTYPE_LLDP) {
+    if (ethertype == static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_LLDP)) {
       parsed = neighbor.parseLldpPdu(srcPort, srcVlan, srcMac,
                                      ethertype, &cursor);
     } else if (destMac == MAC_CDP) {
@@ -365,12 +365,13 @@ void BcmProcessor::configurePort(opennsl_port_t port, opennsl_vlan_t vlan) {
     }
 
     if (itr->second.__isset.portSpeedMbps) {
-      auto desiredSpeed = static_cast<int>(itr->second.portSpeedMbps);
+      auto desiredSpeed =
+          static_cast<int>(itr->second.portSpeedMbps_ref().value_unchecked());
       rv = opennsl_port_speed_set(unit_, port, desiredSpeed);
       bcmCheckError(rv, "failed to set desired speed for port: ", port);
     }
     if (itr->second.__isset.disableFEC) {
-      disableFEC = itr->second.disableFEC;
+      disableFEC = itr->second.disableFEC_ref().value_unchecked();
     }
   }
   // Enable the port

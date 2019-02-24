@@ -12,6 +12,7 @@
 #include <boost/cast.hpp>
 #include <thrift/lib/cpp2/protocol/Serializer.h>
 
+#include "fboss/agent/AgentConfig.h"
 #include "fboss/agent/ApplyThriftConfig.h"
 #include "fboss/agent/RxPacket.h"
 #include "fboss/agent/TunManager.h"
@@ -54,7 +55,7 @@ using ::testing::NiceMock;
 
 DEFINE_bool(switch_hw, false, "Run tests for actual hw");
 
-namespace facebook { namespace fboss {
+using namespace facebook::fboss;
 
 namespace {
 
@@ -126,6 +127,29 @@ std::unique_ptr<SwSwitch> setupMockSwitchWithHW(
   return sw;
 }
 
+shared_ptr<SwitchState> setAllPortState(
+    const shared_ptr<SwitchState>& in,
+    bool up) {
+  auto newState = in->clone();
+  auto newPortMap = newState->getPorts()->modify(&newState);
+  for (auto port : *newPortMap) {
+    auto newPort = port->clone();
+    newPort->setOperState(up);
+    newPort->setAdminState(
+        up ? cfg::PortState::ENABLED : cfg::PortState::DISABLED);
+    newPortMap->updatePort(newPort);
+  }
+  return newState;
+}
+}
+
+namespace facebook { namespace fboss {
+
+shared_ptr<SwitchState> bringAllPortsUp(const shared_ptr<SwitchState>& in) {
+  return setAllPortState(in, true);
+}
+shared_ptr<SwitchState> bringAllPortsDown(const shared_ptr<SwitchState>& in) {
+  return setAllPortState(in, false);
 }
 
 shared_ptr<SwitchState> publishAndApplyConfig(
@@ -135,21 +159,6 @@ shared_ptr<SwitchState> publishAndApplyConfig(
     const cfg::SwitchConfig* prevCfg) {
   state->publish();
   return applyThriftConfig(state, config, platform, prevCfg);
-}
-
-shared_ptr<SwitchState> publishAndApplyConfigFile(
-    shared_ptr<SwitchState>& state,
-    StringPiece path,
-    const Platform* platform,
-    std::string prevConfigStr) {
-  state->publish();
-  // Parse the prev JSON config.
-  cfg::SwitchConfig prevConfig;
-  if (prevConfigStr.size()) {
-    apache::thrift::SimpleJSONSerializer::deserialize<cfg::SwitchConfig>(
-        prevConfigStr.c_str(), prevConfig);
-  }
-  return applyThriftConfigFile(state, path, platform, &prevConfig).first;
 }
 
 unique_ptr<MockPlatform> createMockPlatform() {
@@ -442,6 +451,10 @@ shared_ptr<SwitchState> testStateA() {
   return state;
 }
 
+shared_ptr<SwitchState> testStateAWithPortsUp() {
+  return bringAllPortsUp(testStateA());
+}
+
 shared_ptr<SwitchState> testStateB() {
   // Setup a default state object
   auto state = make_shared<SwitchState>();
@@ -476,6 +489,10 @@ shared_ptr<SwitchState> testStateB() {
   auto newRt = updater.updateDone();
   state->resetRouteTables(newRt);
   return state;
+}
+
+shared_ptr<SwitchState> testStateBWithPortsUp() {
+  return bringAllPortsUp(testStateB());
 }
 
 std::string fbossHexDump(const IOBuf* buf) {

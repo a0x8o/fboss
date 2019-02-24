@@ -10,6 +10,7 @@
 #include "fboss/agent/state/PortQueue.h"
 #include "fboss/agent/state/NodeBase-defs.h"
 #include <folly/Conv.h>
+#include <sstream>
 
 namespace {
 template<typename Param>
@@ -64,7 +65,8 @@ state::PortQueueFields PortQueueFields::toThrift() const {
 // static, public
 PortQueueFields PortQueueFields::fromThrift(
     state::PortQueueFields const& queueThrift) {
-  PortQueueFields queue(static_cast<uint8_t>(queueThrift.id));
+  PortQueueFields queue;
+  queue.id = static_cast<uint8_t>(queueThrift.id);
 
   auto const itrStreamType = cfg::_StreamType_NAMES_TO_VALUES.find(
       queueThrift.streamType.c_str());
@@ -104,7 +106,42 @@ PortQueueFields PortQueueFields::fromThrift(
   return queue;
 }
 
-PortQueue::PortQueue(uint8_t id) : ThriftyBaseT(id) {
+std::string PortQueue::toString() const {
+  std::stringstream ss;
+  ss << "Queue id=" << static_cast<int>(getID())
+     << ", streamType=" << cfg::_StreamType_VALUES_TO_NAMES.at(getStreamType())
+     << ", scheduling="
+     << cfg::_QueueScheduling_VALUES_TO_NAMES.at(getScheduling())
+     << ", weight=" << getWeight();
+  if (getReservedBytes()) {
+    ss << ", reservedBytes=" << getReservedBytes().value();
+  }
+  if (getSharedBytes()) {
+    ss << ", sharedBytes=" << getSharedBytes().value();
+  }
+  if (getPacketsPerSec()) {
+    ss << ", packetsPerSec=" << getPacketsPerSec().value();
+  }
+  if (getScalingFactor()) {
+    ss << ", scalingFactor="
+       << cfg::_MMUScalingFactor_VALUES_TO_NAMES.at(getScalingFactor().value());
+  }
+  if (!getAqms().empty()) {
+    ss << ", aqms=[";
+    for (const auto& aqm: getAqms()) {
+      ss << "(behavior="
+         << cfg::_QueueCongestionBehavior_VALUES_TO_NAMES.at(aqm.first)
+         << ", detection=[min="
+         << aqm.second.get_detection().get_linear().minimumLength
+         << ", max=" << aqm.second.get_detection().get_linear().maximumLength
+         << "]), ";
+    }
+    ss << "]";
+  }
+  if (getName()) {
+    ss << ", name=" << getName().value();
+  }
+  return ss.str();
 }
 
 bool comparePortQueueAQMs(
@@ -126,19 +163,29 @@ bool checkSwConfPortQueueMatch(
     const std::shared_ptr<PortQueue>& swQueue,
     const cfg::PortQueue* cfgQueue) {
   return swQueue->getID() == cfgQueue->id &&
-         swQueue->getStreamType() == cfgQueue->streamType &&
-         swQueue->getScheduling() == cfgQueue->scheduling &&
-         (cfgQueue->scheduling == cfg::QueueScheduling::STRICT_PRIORITY ||
-          swQueue->getWeight() == cfgQueue->weight) &&
-         isPortQueueOptionalAttributeSame(swQueue->getReservedBytes(),
-           cfgQueue->__isset.reservedBytes, cfgQueue->reservedBytes) &&
-         isPortQueueOptionalAttributeSame(swQueue->getScalingFactor(),
-           cfgQueue->__isset.scalingFactor, cfgQueue->scalingFactor) &&
-         isPortQueueOptionalAttributeSame(swQueue->getPacketsPerSec(),
-           cfgQueue->__isset.packetsPerSec, cfgQueue->packetsPerSec) &&
-         isPortQueueOptionalAttributeSame(swQueue->getSharedBytes(),
-           cfgQueue->__isset.sharedBytes, cfgQueue->sharedBytes) &&
-         comparePortQueueAQMs(swQueue->getAqms(), cfgQueue->aqms);
+      swQueue->getStreamType() == cfgQueue->streamType &&
+      swQueue->getScheduling() == cfgQueue->scheduling &&
+      (cfgQueue->scheduling == cfg::QueueScheduling::STRICT_PRIORITY ||
+       swQueue->getWeight() == cfgQueue->weight_ref().value_unchecked()) &&
+      isPortQueueOptionalAttributeSame(
+             swQueue->getReservedBytes(),
+             cfgQueue->__isset.reservedBytes,
+             cfgQueue->reservedBytes_ref().value_unchecked()) &&
+      isPortQueueOptionalAttributeSame(
+             swQueue->getScalingFactor(),
+             cfgQueue->__isset.scalingFactor,
+             cfgQueue->scalingFactor_ref().value_unchecked()) &&
+      isPortQueueOptionalAttributeSame(
+             swQueue->getPacketsPerSec(),
+             cfgQueue->__isset.packetsPerSec,
+             cfgQueue->packetsPerSec_ref().value_unchecked()) &&
+      isPortQueueOptionalAttributeSame(
+             swQueue->getSharedBytes(),
+             cfgQueue->__isset.sharedBytes,
+             cfgQueue->sharedBytes_ref().value_unchecked()) &&
+      comparePortQueueAQMs(
+             swQueue->getAqms(), cfgQueue->aqms_ref().value_unchecked()) &&
+      swQueue->getName() == cfgQueue->name_ref().value_unchecked();
 }
 
 template class NodeBaseT<PortQueue, PortQueueFields>;

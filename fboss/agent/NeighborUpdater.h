@@ -27,7 +27,7 @@ class StateDelta;
 class Vlan;
 
 enum ArpOpCode : uint16_t;
-enum ICMPv6Type : uint8_t;
+enum class ICMPv6Type : uint8_t;
 
 /**
  * This class handles all updates to neighbor entries. Whenever we perform an
@@ -54,18 +54,20 @@ class NeighborUpdater : public AutoRegisterStateObserver {
   // Ndp events
   void sentNeighborSolicitation(VlanID vlan,
                                 folly::IPAddressV6 ip);
-  void receivedNdpMine(VlanID vlan,
-                       folly::IPAddressV6 ip,
-                       folly::MacAddress mac,
-                       PortDescriptor port,
-                       ICMPv6Type type,
-                       uint32_t flags);
-  void receivedNdpNotMine(VlanID vlan,
-                          folly::IPAddressV6 ip,
-                          folly::MacAddress mac,
-                          PortDescriptor port,
-                          ICMPv6Type type,
-                          uint32_t flags);
+  void receivedNdpMine(
+      VlanID vlan,
+      folly::IPAddressV6 ip,
+      folly::MacAddress mac,
+      PortDescriptor port,
+      ICMPv6Type type,
+      uint32_t flags);
+  void receivedNdpNotMine(
+      VlanID vlan,
+      folly::IPAddressV6 ip,
+      folly::MacAddress mac,
+      PortDescriptor port,
+      ICMPv6Type type,
+      uint32_t flags);
 
   // Arp events
   void sentArpRequest(VlanID vlan,
@@ -95,6 +97,9 @@ class NeighborUpdater : public AutoRegisterStateObserver {
   void portChanged(
       const std::shared_ptr<Port>& oldPort,
       const std::shared_ptr<Port>& newPort);
+  void aggregatePortChanged(
+    const std::shared_ptr<AggregatePort>& oldAggPort,
+    const std::shared_ptr<AggregatePort>& newAggPort);
 
   void sendNeighborUpdates(const VlanDelta& delta);
 

@@ -11,6 +11,7 @@
 
 #include "fboss/agent/hw/bcm/BcmPlatform.h"
 #include "fboss/agent/types.h"
+#include "fboss/agent/AgentConfig.h"
 #include "fboss/agent/StateObserver.h"
 #include "fboss/agent/platforms/wedge/WedgeProductInfo.h"
 #include "fboss/agent/platforms/wedge/WedgePortMapping.h"
@@ -35,7 +36,7 @@ class WedgePlatform : public BcmPlatform, public StateObserver {
   explicit WedgePlatform(std::unique_ptr<WedgeProductInfo> productInfo);
   ~WedgePlatform() override;
 
-  void init();
+  void initImpl() override;
   InitPortMap initPorts() override;
 
   void stateUpdated(const StateDelta& /*delta*/) override;
@@ -53,6 +54,7 @@ class WedgePlatform : public BcmPlatform, public StateObserver {
   void onUnitCreate(int unit) override;
   void onUnitAttach(int unit) override;
   void getProductInfo(ProductInfo& info) override;
+  void onInitialConfigApplied(SwSwitch* sw) override {}
 
   bool canUseHostTableForHostRoutes() const override {
     return FLAGS_enable_routes_in_host_table;
@@ -65,18 +67,6 @@ class WedgePlatform : public BcmPlatform, public StateObserver {
     return warmBootHelper_.get();
   }
 
-  uint32_t getMMUBufferBytes() const override {
-    // All wedge platforms have 16MB MMU buffer
-    return 16 * 1024 * 1024;
-  }
-  uint32_t getMMUCellBytes() const override {
-    // All wedge platforms have 208 byte cells
-    return 208;
-  }
-  bool isCosSupported() const override {
-    return true;
-  }
-
   QsfpCache* getQsfpCache() const {
     return qsfpCache_.get();
   }
@@ -86,14 +76,12 @@ class WedgePlatform : public BcmPlatform, public StateObserver {
   std::unique_ptr<WedgePortMapping> portMapping_{nullptr};
 
  private:
-  // TODO get rid of this once T21721301 is done
-  bool isDu() const;
   // Forbidden copy constructor and assignment operator
   WedgePlatform(WedgePlatform const &) = delete;
   WedgePlatform& operator=(WedgePlatform const &) = delete;
 
   void initLocalMac();
-  void initLEDs();
+  virtual void initLEDs();
   virtual std::map<std::string, std::string> loadConfig();
 
   virtual std::unique_ptr<BaseWedgeI2CBus> getI2CBus();

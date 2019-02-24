@@ -14,6 +14,8 @@
 #include "fboss/agent/state/StateDelta.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
 
+#include <folly/Optional.h>
+
 namespace facebook { namespace fboss {
 
 class MockPlatform;
@@ -45,8 +47,6 @@ class MockableHwSwitch : public MockHwSwitch {
 
   std::unique_ptr<TxPacket> allocatePacket(uint32_t) override;
 
-  std::shared_ptr<SwitchState> stateChanged(const StateDelta& delta) override;
-
   /*
    * These 'Adaptor' methods are super hacky, but are needed because
    * gmock does not support mocking move-only types. Note that this may
@@ -57,8 +57,13 @@ class MockableHwSwitch : public MockHwSwitch {
    * convert back to a unique_ptr so we match the real interface (and
    * the packet memory is safely owned).
    */
-  bool sendPacketSwitchedAdaptor(TxPacket* pkt) noexcept;
-  bool sendPacketOutOfPortAdaptor(TxPacket* pkt, PortID port) noexcept;
+  bool sendPacketSwitchedAsyncAdaptor(TxPacket* pkt) noexcept;
+  bool sendPacketOutOfPortAsyncAdaptor(
+      TxPacket* pkt,
+      PortID port,
+      folly::Optional<uint8_t> cos = folly::none) noexcept;
+  bool sendPacketSwitchedSyncAdaptor(TxPacket* pkt) noexcept;
+  bool sendPacketOutOfPortSyncAdaptor(TxPacket* pkt, PortID port) noexcept;
 
  private:
   // Forbidden copy constructor and assignment operator

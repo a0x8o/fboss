@@ -41,13 +41,10 @@ class BcmTrunkTable {
       const std::shared_ptr<AggregatePort>& newAggPort);
   void deleteTrunk(const std::shared_ptr<AggregatePort>& aggPort);
 
-  opennsl_trunk_t getBcmTrunkId(AggregatePortID id) const {
-    return static_cast<opennsl_trunk_t>(id);
-  }
-  AggregatePortID getAggregatePortId(opennsl_trunk_t trunk) const {
-    return AggregatePortID(trunk);
-  }
+  opennsl_trunk_t getBcmTrunkId(AggregatePortID id) const;
+  AggregatePortID getAggregatePortId(opennsl_trunk_t trunk) const;
 
+  size_t numTrunkPorts() const { return trunks_.size(); }
   // TODO(samank): Fill in method
   // Serialize to folly::dynamic
   folly::dynamic toFollyDynamic() const;
@@ -55,6 +52,8 @@ class BcmTrunkTable {
   opennsl_trunk_t linkDownHwNotLocked(opennsl_port_t port);
 
   void updateStats();
+  // Setup trunking machinery
+  void setupTrunking();
 
  private:
   // Forbidden copy constructor and assignment operator
@@ -65,11 +64,6 @@ class BcmTrunkTable {
       trunks_;
   const BcmSwitch* const hw_{nullptr};
 
-  // Setup trunking machinery
-  void setupTrunking();
-
-  // State that stores if the BCM trunk has been initialized.
-  bool isBcmHWTrunkInitialized_ = false;
 
   TrunkToMinimumLinkCountMap trunkToMinLinkCount_;
 };

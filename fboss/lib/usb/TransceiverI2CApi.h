@@ -10,8 +10,22 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 namespace facebook { namespace fboss {
+
+class I2cError : public std::exception {
+ public:
+  I2cError(const std::string& what) : what_(what) {}
+
+  const char* what() const noexcept override {
+    return what_.c_str();
+  }
+
+ private:
+  std::string what_;
+};
 
 /*
  * Abstract away some of the details of handling the I2C bus to query
@@ -27,6 +41,16 @@ class TransceiverI2CApi {
                           int offset, int len, uint8_t* buf) = 0;
   virtual void moduleWrite(unsigned int module, uint8_t i2cAddress,
                            int offset, int len, const uint8_t* buf) = 0;
+
+  virtual void verifyBus(bool autoReset) = 0;
+
+  virtual bool isPresent(unsigned int module) = 0;
+
+  /*
+   * Function bring transceiver out of reset whenever a transceiver has been
+   * detected plugging in.
+   */
+  virtual void ensureOutOfReset(unsigned int module) {};
 
   // Addresses to be queried by external callers:
   enum : uint8_t {

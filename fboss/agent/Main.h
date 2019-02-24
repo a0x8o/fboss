@@ -9,13 +9,24 @@
  */
 #pragma once
 #include <memory>
+
+namespace apache {
+namespace thrift {
+class ThriftServer;
+}
+} // namespace apache
+
 namespace facebook { namespace fboss {
 
+class AgentConfig;
 class Platform;
-typedef std::unique_ptr<Platform> (*PlatformInitFn)();
+
+typedef std::unique_ptr<Platform> (*PlatformInitFn)(
+    std::unique_ptr<AgentConfig>);
 
 int fbossMain(int argc, char** argv, PlatformInitFn initPlatform);
 void fbossInit(int argc, char** argv);
 void fbossFinalize();
+void setVersionInfo();
 
 }} // facebook::fboss

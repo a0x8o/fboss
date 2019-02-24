@@ -18,17 +18,18 @@
 #include "common/stats/ServiceData.h"
 
 #include "fboss/agent/SwitchStats.h"
-#include "fboss/agent/state/SwitchState.h"
-#include "fboss/agent/state/PortMap.h"
-#include "fboss/agent/state/Port.h"
 #include "fboss/agent/hw/bcm/BcmError.h"
+#include "fboss/agent/hw/bcm/BcmMirrorTable.h"
 #include "fboss/agent/hw/bcm/BcmPlatformPort.h"
-#include "fboss/agent/hw/bcm/BcmStatsConstants.h"
-#include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmPortGroup.h"
 #include "fboss/agent/hw/bcm/BcmPortQueueManager.h"
+#include "fboss/agent/hw/bcm/BcmStatsConstants.h"
+#include "fboss/agent/hw/bcm/BcmSwitch.h"
+#include "fboss/agent/hw/bcm/BcmWarmBootCache.h"
 #include "fboss/agent/hw/bcm/gen-cpp2/hardware_stats_constants.h"
-
+#include "fboss/agent/state/Port.h"
+#include "fboss/agent/state/PortMap.h"
+#include "fboss/agent/state/SwitchState.h"
 
 extern "C" {
 #include <opennsl/link.h>
@@ -218,6 +219,12 @@ BcmPort::BcmPort(BcmSwitch* hw, opennsl_port_t port,
              << ", FBOSS PortID:" << platformPort_->getPortID();
 }
 
+BcmPort::~BcmPort() {
+  applyMirrorAction(
+      ingressMirror_, MirrorAction::STOP, MirrorDirection::INGRESS);
+  applyMirrorAction(egressMirror_, MirrorAction::STOP, MirrorDirection::EGRESS);
+}
+
 void BcmPort::init(bool warmBoot) {
   bool up = false;
   if (warmBoot) {
@@ -240,6 +247,7 @@ void BcmPort::init(bool warmBoot) {
   // Notify platform port of initial state/speed
   getPlatformPort()->linkSpeedChanged(getSpeed());
   getPlatformPort()->linkStatusChanged(up, isEnabled());
+  getPlatformPort()->externalState(PlatformPort::ExternalState::NONE);
 
   enableLinkscan();
 }
@@ -370,10 +378,23 @@ void BcmPort::program(const shared_ptr<Port>& port) {
     // may still need to enable FEC
     setFEC(port);
   }
+
+  /* update mirrors for port, mirror add/update must happen earlier than
+   * updating mirrors for port */
+  updateMirror(port->getIngressMirror(), MirrorDirection::INGRESS);
+  updateMirror(port->getEgressMirror(), MirrorDirection::EGRESS);
+
+  if (port->getQosPolicy()) {
+    attachIngressQosPolicy(port->getQosPolicy().value());
+  } else {
+    detachIngressQosPolicy();
+  }
+
   setPause(port);
   // Update Tx Setting if needed.
   setTxSetting(port);
   setSflowRates(port);
+  setLoopbackMode(port);
 }
 
 void BcmPort::linkStatusChanged(const std::shared_ptr<Port>& port) {
@@ -466,7 +487,17 @@ void BcmPort::setInterfaceMode(const shared_ptr<Port>& swPort) {
   bcmCheckError(ret, "Failed to get current interface setting for port ",
                      swPort->getID());
 
-  if (curMode != desiredMode) {
+  // HACK: we cannot call speed_set w/out also
+  // calling interface_mode_set, otherwise the
+  // interface mode may change unexpectedly (details
+  // on T32158588). We call set_speed when the port
+  // is down, so also set mode here.
+  //
+  // TODO(aeckert): evaluate if we still need to set
+  // speed on down ports.
+
+  bool portUp = swPort->isPortUp();
+  if (curMode != desiredMode || !portUp) {
     // Changes to the interface setting only seem to take effect on the next
     // call to opennsl_port_speed_set()
     ret = opennsl_port_interface_set(unit_, port_, desiredMode);
@@ -785,20 +816,43 @@ std::chrono::seconds BcmPort::getTimeRetrieved() const {
   return lastPortStats_.rlock()->timeRetrieved();
 }
 
-/**
-  * TODO(rsher)
-  * comment back in when we move to the newer OpenNSL
-
-bool BcmPort::isFECEnabled() {
-  int value;
-  opennsl_port_phy_control_get(
-      unit_,
-      port_,
-      OPENNSL_PORT_PHY_CONTROL_FORWARD_ERROR_CORRECTION,
-      &value);
-  return (value == OPENNSL_PORT_PHY_CONTROL_FEC_ON);
+void BcmPort::applyMirrorAction(
+    const folly::Optional<std::string>& mirrorName,
+    MirrorAction action,
+    MirrorDirection direction) {
+  if (!mirrorName) {
+    return;
+  }
+  auto* bcmMirror = hw_->getBcmMirrorTable()->getMirrorIf(mirrorName.value());
+  CHECK(bcmMirror != nullptr);
+  bcmMirror->applyPortMirrorAction(getPortID(), action, direction);
 }
 
-*/
+void BcmPort::updateMirror(
+    const folly::Optional<std::string>& swMirrorName,
+    MirrorDirection direction) {
+  applyMirrorAction(
+      direction == MirrorDirection::INGRESS ? ingressMirror_ : egressMirror_,
+      MirrorAction::STOP,
+      direction);
+  if (direction == MirrorDirection::INGRESS) {
+    ingressMirror_ = swMirrorName;
+  } else {
+    egressMirror_ = swMirrorName;
+  }
+  applyMirrorAction(
+      direction == MirrorDirection::INGRESS ? ingressMirror_ : egressMirror_,
+      MirrorAction::START,
+      direction);
+}
+
+void BcmPort::setIngressPortMirror(const std::string& mirrorName) {
+  ingressMirror_.assign(mirrorName);
+}
+
+void BcmPort::setEgressPortMirror(const std::string& mirrorName) {
+  egressMirror_.assign(mirrorName);
+}
+
 
 }} // namespace facebook::fboss

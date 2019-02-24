@@ -115,24 +115,25 @@ TEST(Acl, applyConfig) {
   configV1.acls[0].__isset.srcL4PortRange = true;
   configV1.acls[0].dstL4PortRange.min = 3;
   configV1.acls[0].dstL4PortRange.max = 4;
+  configV1.acls[0].dstL4PortRange.invert = true;
   configV1.acls[0].__isset.dstL4PortRange = true;
   // Make sure it's used so that it isn't ignored
-  configV1.globalEgressTrafficPolicy = cfg::TrafficPolicyConfig();
-  configV1.__isset.globalEgressTrafficPolicy = true;
-  configV1.globalEgressTrafficPolicy.matchToAction.resize(1,
+  configV1.dataPlaneTrafficPolicy = cfg::TrafficPolicyConfig();
+  configV1.__isset.dataPlaneTrafficPolicy = true;
+  configV1.dataPlaneTrafficPolicy.matchToAction.resize(1,
       cfg::MatchToAction());
-  configV1.globalEgressTrafficPolicy.matchToAction[0].matcher = "acl3";
-  configV1.globalEgressTrafficPolicy.matchToAction[0].action =
+  configV1.dataPlaneTrafficPolicy.matchToAction[0].matcher = "acl3";
+  configV1.dataPlaneTrafficPolicy.matchToAction[0].action =
       cfg::MatchAction();
-  configV1.globalEgressTrafficPolicy.matchToAction[0].action.sendToQueue =
+  configV1.dataPlaneTrafficPolicy.matchToAction[0].action.sendToQueue =
       cfg::QueueMatchAction();
-  configV1.globalEgressTrafficPolicy.matchToAction[0]
+  configV1.dataPlaneTrafficPolicy.matchToAction[0]
       .action.sendToQueue.queueId = 1;
 
   auto stateV3 = publishAndApplyConfig(stateV2, &configV1, platform.get());
   EXPECT_NE(nullptr, stateV3);
   auto acls = stateV3->getAcls();
-  auto aclV3 = stateV3->getAcl("system:acl3");
+  auto aclV3 = stateV3->getAcl("acl3");
   ASSERT_NE(nullptr, aclV3);
   EXPECT_NE(aclV0, aclV3);
   EXPECT_EQ(0 + kAclStartPriority, aclV3->getPriority());
@@ -140,9 +141,11 @@ TEST(Acl, applyConfig) {
   EXPECT_FALSE(!aclV3->getSrcL4PortRange());
   EXPECT_EQ(aclV3->getSrcL4PortRange().value().getMin(), 1);
   EXPECT_EQ(aclV3->getSrcL4PortRange().value().getMax(), 2);
+  EXPECT_EQ(aclV3->getSrcL4PortRange().value().getInvert(), false);
   EXPECT_FALSE(!aclV3->getDstL4PortRange());
   EXPECT_EQ(aclV3->getDstL4PortRange().value().getMin(), 3);
   EXPECT_EQ(aclV3->getDstL4PortRange().value().getMax(), 4);
+  EXPECT_EQ(aclV3->getDstL4PortRange().value().getInvert(), true);
 
   // test min > max case
   configV1.acls[0].srcL4PortRange.min = 3;
@@ -161,16 +164,16 @@ TEST(Acl, applyConfig) {
   configV2.acls.resize(1);
   configV2.acls[0].name = "acl3";
   // Make sure it's used so that it isn't ignored
-  configV2.globalEgressTrafficPolicy = cfg::TrafficPolicyConfig();
-  configV2.__isset.globalEgressTrafficPolicy = true;
-  configV2.globalEgressTrafficPolicy.matchToAction.resize(1,
+  configV2.dataPlaneTrafficPolicy = cfg::TrafficPolicyConfig();
+  configV2.__isset.dataPlaneTrafficPolicy = true;
+  configV2.dataPlaneTrafficPolicy.matchToAction.resize(1,
       cfg::MatchToAction());
-  configV2.globalEgressTrafficPolicy.matchToAction[0].matcher = "acl3";
-  configV2.globalEgressTrafficPolicy.matchToAction[0].action =
+  configV2.dataPlaneTrafficPolicy.matchToAction[0].matcher = "acl3";
+  configV2.dataPlaneTrafficPolicy.matchToAction[0].action =
       cfg::MatchAction();
-  configV2.globalEgressTrafficPolicy.matchToAction[0].action.sendToQueue =
+  configV2.dataPlaneTrafficPolicy.matchToAction[0].action.sendToQueue =
       cfg::QueueMatchAction();
-  configV2.globalEgressTrafficPolicy.matchToAction[0]
+  configV2.dataPlaneTrafficPolicy.matchToAction[0]
       .action.sendToQueue.queueId = 1;
 
   // set pkt length range
@@ -180,7 +183,7 @@ TEST(Acl, applyConfig) {
 
   auto stateV4 = publishAndApplyConfig(stateV3, &configV2, platform.get());
   EXPECT_NE(nullptr, stateV4);
-  auto aclV4 = stateV4->getAcl("system:acl3");
+  auto aclV4 = stateV4->getAcl("acl3");
   ASSERT_NE(nullptr, aclV4);
   EXPECT_TRUE(aclV4->getPktLenRange());
   EXPECT_EQ(aclV4->getPktLenRange().value().getMin(), 34);
@@ -192,7 +195,7 @@ TEST(Acl, applyConfig) {
 
   auto stateV5 = publishAndApplyConfig(stateV4, &configV2, platform.get());
   EXPECT_NE(nullptr, stateV5);
-  auto aclV5 = stateV5->getAcl("system:acl3");
+  auto aclV5 = stateV5->getAcl("acl3");
   EXPECT_NE(nullptr, aclV5);
   EXPECT_EQ(aclV5->getIpFrag().value(), cfg::IpFragMatch::MATCH_NOT_FRAGMENTED);
 
@@ -203,7 +206,7 @@ TEST(Acl, applyConfig) {
 
   auto stateV6 = publishAndApplyConfig(stateV5, &configV2, platform.get());
   EXPECT_NE(nullptr, stateV6);
-  auto aclV6 = stateV6->getAcl("system:acl3");
+  auto aclV6 = stateV6->getAcl("acl3");
   EXPECT_NE(nullptr, aclV6);
 
   EXPECT_EQ(MacAddress(dstMacStr), aclV6->getDstMac());
@@ -212,7 +215,7 @@ TEST(Acl, applyConfig) {
 
   auto stateV7 = publishAndApplyConfig(stateV6, &configV2, platform.get());
   EXPECT_NE(nullptr, stateV7);
-  auto aclV7 = stateV7->getAcl("system:acl3");
+  auto aclV7 = stateV7->getAcl("acl3");
   EXPECT_NE(nullptr, aclV7);
 
   EXPECT_FALSE(aclV7->getDstMac());
@@ -355,7 +358,7 @@ TEST(Acl, AclGeneration) {
   config.ports[1].name = "port2";
   config.ports[1].state = cfg::PortState::ENABLED;
 
-  config.acls.resize(4);
+  config.acls.resize(5);
   config.acls[0].name = "acl1";
   config.acls[0].actionType = cfg::AclActionType::DENY;
   config.acls[0].__isset.srcIp = true;
@@ -374,39 +377,67 @@ TEST(Acl, AclGeneration) {
   config.acls[2].__isset.dscp = true;
   config.acls[3].name = "acl4";
   config.acls[3].actionType = cfg::AclActionType::DENY;
+  config.acls[4].name = "acl5";
+  config.acls[4].__isset.srcIp = true;
+  config.acls[4].srcIp = "2401:db00:21:7147:face:0:7:0/128";
+  config.acls[4].__isset.srcPort = true;
+  config.acls[4].srcPort = 5;
 
-  config.__isset.globalEgressTrafficPolicy = true;
-  config.globalEgressTrafficPolicy.matchToAction.resize(2,
+
+  config.__isset.dataPlaneTrafficPolicy = true;
+  config.dataPlaneTrafficPolicy.matchToAction.resize(3,
       cfg::MatchToAction());
-  config.globalEgressTrafficPolicy.matchToAction[0].matcher = "acl2";
-  config.globalEgressTrafficPolicy.matchToAction[0].action =
+  config.dataPlaneTrafficPolicy.matchToAction[0].matcher = "acl2";
+  config.dataPlaneTrafficPolicy.matchToAction[0].action =
       cfg::MatchAction();
-  config.globalEgressTrafficPolicy.matchToAction[0].action.sendToQueue =
+  config.dataPlaneTrafficPolicy.matchToAction[0].action.sendToQueue =
       cfg::QueueMatchAction();
-  config.globalEgressTrafficPolicy.matchToAction[0]
+  config.dataPlaneTrafficPolicy.matchToAction[0]
       .action.sendToQueue.queueId = 1;
-  config.globalEgressTrafficPolicy.matchToAction[1].matcher = "acl3";
-  config.globalEgressTrafficPolicy.matchToAction[1].action =
+  config.dataPlaneTrafficPolicy.matchToAction[1].matcher = "acl3";
+  config.dataPlaneTrafficPolicy.matchToAction[1].action =
       cfg::MatchAction();
-  config.globalEgressTrafficPolicy.matchToAction[1].action.sendToQueue =
+  config.dataPlaneTrafficPolicy.matchToAction[1].action.sendToQueue =
       cfg::QueueMatchAction();
-  config.globalEgressTrafficPolicy.matchToAction[1]
+  config.dataPlaneTrafficPolicy.matchToAction[1]
       .action.sendToQueue.queueId = 2;
+  config.dataPlaneTrafficPolicy.matchToAction[2].matcher = "acl5";
+  config.dataPlaneTrafficPolicy.matchToAction[2].action = cfg::MatchAction();
+  config.dataPlaneTrafficPolicy.matchToAction[2].action.setDscp =
+      cfg::SetDscpMatchAction();
+  config.dataPlaneTrafficPolicy.matchToAction[2].action.__isset.setDscp=
+      true;
+  config.dataPlaneTrafficPolicy.matchToAction[2].action.setDscp.dscpValue =
+      8;
 
   auto stateV1 = publishAndApplyConfig(stateV0, &config, platform.get());
   EXPECT_NE(stateV1, nullptr);
   auto acls = stateV1->getAcls();
   EXPECT_NE(acls, nullptr);
   EXPECT_NE(acls->getEntryIf("acl1"), nullptr);
-  EXPECT_NE(acls->getEntryIf("system:acl2"), nullptr);
-  EXPECT_NE(acls->getEntryIf("system:acl3"), nullptr);
+  EXPECT_NE(acls->getEntryIf("acl2"), nullptr);
+  EXPECT_NE(acls->getEntryIf("acl3"), nullptr);
+  EXPECT_NE(acls->getEntryIf("acl5"), nullptr);
 
   EXPECT_EQ(acls->getEntryIf("acl1")->getPriority(), kAclStartPriority);
   EXPECT_EQ(acls->getEntryIf("acl4")->getPriority(), kAclStartPriority + 1);
-  EXPECT_EQ(acls->getEntryIf("system:acl2")->getPriority(),
+  EXPECT_EQ(acls->getEntryIf("acl2")->getPriority(),
       kAclStartPriority + 2);
-  EXPECT_EQ(acls->getEntryIf("system:acl3")->getPriority(),
+  EXPECT_EQ(acls->getEntryIf("acl3")->getPriority(),
       kAclStartPriority + 3);
+  EXPECT_EQ(acls->getEntryIf("acl5")->getPriority(),
+      kAclStartPriority + 4);
+
+  // Ensure that the global actions in global traffic policy has been added to
+  // the ACL entries
+  EXPECT_TRUE(acls->getEntryIf("acl5")->getAclAction().hasValue());
+  EXPECT_EQ(
+      8,
+      acls->getEntryIf("acl5")
+          ->getAclAction()
+          ->getSetDscp()
+          .value()
+          .dscpValue);
 }
 
 TEST(Acl, SerializeAclEntry) {
@@ -441,23 +472,55 @@ TEST(Acl, SerializeAclEntry) {
   EXPECT_TRUE(aclAction.getSendToQueue());
   EXPECT_EQ(aclAction.getSendToQueue().value().second, true);
   EXPECT_EQ(aclAction.getSendToQueue().value().first.queueId, 3);
+}
 
-  // Test PacketCounterAction
-  entry = std::make_unique<AclEntry>(0, "stat0");
+TEST(Acl, SerializePacketCounter) {
+  auto entry = std::make_unique<AclEntry>(0, "stat0");
+  MatchAction action = MatchAction();
+  auto counter = cfg::TrafficCounter();
+  counter.name = "stat0.c";
+  action.setTrafficCounter(counter);
+  entry->setAclAction(action);
+
+  auto serialized = entry->toFollyDynamic();
+  auto entryBack = AclEntry::fromFollyDynamic(serialized);
+
+  EXPECT_TRUE(*entry == *entryBack);
+  EXPECT_TRUE(entryBack->getAclAction());
+  auto aclAction = entryBack->getAclAction().value();
+  EXPECT_TRUE(aclAction.getTrafficCounter());
+  EXPECT_EQ(aclAction.getTrafficCounter()->name, "stat0.c");
+  EXPECT_EQ(aclAction.getTrafficCounter()->types.size(), 1);
+  EXPECT_EQ(aclAction.getTrafficCounter()->types[0], cfg::CounterType::PACKETS);
+
+  // Test SetDscpMatchAction
+  entry = std::make_unique<AclEntry>(0, "DspNew");
   action = MatchAction();
-  auto packetCounterAction = cfg::PacketCounterMatchAction();
-  packetCounterAction.counterName = "stat0.c";
-  action.setPacketCounter(packetCounterAction);
+  auto setDscpMatchAction = cfg::SetDscpMatchAction();
+  setDscpMatchAction.dscpValue = 8;
+  action.setSetDscp(setDscpMatchAction);
+  entry->setAclAction(action);
+
+  serialized = entry->toFollyDynamic();
+  entryBack = AclEntry::fromFollyDynamic(serialized);
+  EXPECT_TRUE(*entry == *entryBack);
+  EXPECT_TRUE(entryBack->getAclAction());
+  aclAction = entryBack->getAclAction().value();
+  EXPECT_TRUE(aclAction.getSetDscp());
+  EXPECT_EQ(aclAction.getSetDscp().value().dscpValue, 8);
+
+  // Set 2 counter types
+  counter.types = {cfg::CounterType::PACKETS, cfg::CounterType::BYTES};
+  action.setTrafficCounter(counter);
   entry->setAclAction(action);
 
   serialized = entry->toFollyDynamic();
   entryBack = AclEntry::fromFollyDynamic(serialized);
 
   EXPECT_TRUE(*entry == *entryBack);
-  EXPECT_TRUE(entryBack->getAclAction());
   aclAction = entryBack->getAclAction().value();
-  EXPECT_TRUE(aclAction.getPacketCounter());
-  EXPECT_EQ(aclAction.getPacketCounter().value().counterName, "stat0.c");
+  EXPECT_EQ(aclAction.getTrafficCounter()->types.size(), 2);
+  EXPECT_EQ(aclAction.getTrafficCounter()->types, counter.types);
 }
 
 TEST(Acl, Ttl) {
@@ -501,9 +564,9 @@ TEST(Acl, TtlSerialization) {
   auto entry = std::make_unique<AclEntry>(0, "stat0");
   entry->setTtl(AclTtl(42, 0xff));
   auto action = MatchAction();
-  auto packetCounterAction = cfg::PacketCounterMatchAction();
-  packetCounterAction.counterName = "stat0.c";
-  action.setPacketCounter(packetCounterAction);
+  auto counter = cfg::TrafficCounter();
+  counter.name = "stat0.c";
+  action.setTrafficCounter(counter);
   entry->setAclAction(action);
 
   auto serialized = entry->toFollyDynamic();
@@ -543,4 +606,74 @@ TEST(Acl, IpType) {
   EXPECT_NE(nullptr, aclV1);
   EXPECT_TRUE(aclV1->getIpType());
   EXPECT_EQ(aclV1->getIpType().value(), ipType);
+}
+
+TEST(Acl, InvalidTrafficCounter) {
+  auto platform = createMockPlatform();
+  auto stateV0 = make_shared<SwitchState>();
+
+  cfg::SwitchConfig config;
+  config.acls.resize(1);
+  config.acls[0].name = "acl0";
+  config.acls[0].actionType = cfg::AclActionType::PERMIT;
+  config.__isset.dataPlaneTrafficPolicy = true;
+  config.dataPlaneTrafficPolicy.matchToAction.resize(1);
+  config.dataPlaneTrafficPolicy.matchToAction[0].matcher = "acl0";
+  config.dataPlaneTrafficPolicy.matchToAction[0].action.counter = "stat0";
+  config.dataPlaneTrafficPolicy.matchToAction[0].action.__isset.counter = true;
+
+  EXPECT_THROW(
+      publishAndApplyConfig(stateV0, &config, platform.get()), FbossError);
+}
+
+// TODO(adrs): deprecate packetCounter and remove this test
+TEST(Acl, TrafficCounterCompatibility) {
+  cfg::SwitchConfig config;
+  auto platform = createMockPlatform();
+  auto stateV0 = make_shared<SwitchState>();
+
+  // Create a state with 1 Acl and 1 counter
+  config.acls.resize(1);
+  config.acls[0].name = "acl0";
+  config.acls[0].actionType = cfg::AclActionType::PERMIT;
+  config.__isset.dataPlaneTrafficPolicy = true;
+  config.dataPlaneTrafficPolicy.matchToAction.resize(1);
+  auto& mta = config.dataPlaneTrafficPolicy.matchToAction[0];
+  mta.matcher = "acl0";
+  config.trafficCounters.resize(1);
+  config.trafficCounters[0].name = "stat0";
+  mta.action.counter = "stat0";
+  mta.action.__isset.counter = true;
+  auto refState = publishAndApplyConfig(stateV0, &config, platform.get());
+
+  // Manually craft the deprecated state with the 'packetCounter' field
+  auto jsonStateV0 = stateV0->toFollyDynamic();
+  jsonStateV0["acls"]["entries"].push_back(folly::dynamic::object(
+      "name", "acl0")("actionType", "PERMIT")("priority", 10000));
+  jsonStateV0["dataPlaneTrafficPolicy"] = folly::dynamic::object(
+      "matchToAction",
+      folly::dynamic::array(folly::dynamic::object("matcher", "acl0")(
+          "action",
+          folly::dynamic::object(
+              "packetCounter",
+              folly::dynamic::object("counterName", "stat0")))));
+  auto deprecatedState = SwitchState::fromFollyDynamic(jsonStateV0);
+  ASSERT_NE(nullptr, deprecatedState);
+  // MirrorMap::fromFollyDynamic() isn't implemented (yet) and always return
+  // nullptr.
+  // publishAndApplyConfig() isn't happy with the nullptr, so reset the mirrors
+  // with an empty map
+  deprecatedState->resetMirrors(std::make_shared<MirrorMap>());
+  auto newState =
+      publishAndApplyConfig(deprecatedState, &config, platform.get());
+
+  ASSERT_NE(nullptr, refState);
+  ASSERT_NE(nullptr, newState);
+  ASSERT_NE(nullptr, refState->getAcl("acl0"));
+  ASSERT_NE(nullptr, newState->getAcl("acl0"));
+  ASSERT_EQ(*(refState->getAcl("acl0")), *(newState->getAcl("acl0")));
+  auto aclAction = newState->getAcl("acl0")->getAclAction().value();
+  EXPECT_EQ(aclAction.getTrafficCounter()->name, "stat0");
+  EXPECT_EQ(aclAction.getTrafficCounter()->types.size(), 1);
+  EXPECT_EQ(aclAction.getTrafficCounter()->types[0], cfg::CounterType::PACKETS);
 }

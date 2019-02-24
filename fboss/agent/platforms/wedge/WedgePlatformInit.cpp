@@ -11,16 +11,14 @@
 
 #include <memory>
 
+#include "fboss/agent/AgentConfig.h"
 #include "fboss/agent/Platform.h"
+#include "fboss/agent/platforms/wedge/FakeWedge40Platform.h"
 #include "fboss/agent/platforms/wedge/GalaxyLCPlatform.h"
 #include "fboss/agent/platforms/wedge/GalaxyFCPlatform.h"
 #include "fboss/agent/platforms/wedge/WedgePlatform.h"
 #include "fboss/agent/platforms/wedge/Wedge40Platform.h"
 #include "fboss/agent/platforms/wedge/Wedge100Platform.h"
-
-DEFINE_string(fruid_filepath,
-              "/var/facebook/fboss/fruid.json",
-              "File for storing the fruid data");
 
 namespace facebook { namespace fboss {
 
@@ -37,6 +35,8 @@ std::unique_ptr<WedgePlatform> chooseWedgePlatform() {
     return std::make_unique<GalaxyLCPlatform>(std::move(productInfo));
   } else if (mode == WedgePlatformMode::GALAXY_FC) {
     return std::make_unique<GalaxyFCPlatform>(std::move(productInfo));
+  } else if (mode == WedgePlatformMode::FAKE_WEDGE40) {
+    return std::make_unique<FakeWedge40Platform>(std::move(productInfo));
   }
 
   // mode is neither of the offical platforms above, consider it as a Facebook
@@ -44,10 +44,10 @@ std::unique_ptr<WedgePlatform> chooseWedgePlatform() {
   return createFBWedgePlatform(std::move(productInfo));
 }
 
-std::unique_ptr<Platform> initWedgePlatform() {
+std::unique_ptr<Platform> initWedgePlatform(
+    std::unique_ptr<AgentConfig> config) {
   auto platform = chooseWedgePlatform();
-  platform->init();
+  platform->init(std::move(config));
   return std::move(platform);
 }
-
 }}

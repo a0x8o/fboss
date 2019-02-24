@@ -41,6 +41,11 @@ void WedgeI2CBusLock::close() {
   closeLocked();
 }
 
+void WedgeI2CBusLock::verifyBus(bool autoReset) {
+  BusGuard g(this);
+  wedgeI2CBus_->verifyBus(autoReset);
+}
+
 void WedgeI2CBusLock::moduleRead(unsigned int module, uint8_t address,
                              int offset, int len, uint8_t *buf) {
   BusGuard g(this);
@@ -63,6 +68,16 @@ void WedgeI2CBusLock::write(uint8_t address, int offset,
                             int len, const uint8_t *buf) {
   BusGuard g(this);
   wedgeI2CBus_->write(address, offset, len, buf);
+}
+
+bool WedgeI2CBusLock::isPresent(unsigned int module) {
+  BusGuard g(this);
+  return wedgeI2CBus_->isPresent(module);
+}
+
+void WedgeI2CBusLock::ensureOutOfReset(unsigned int module) {
+  BusGuard g(this);
+  wedgeI2CBus_->ensureOutOfReset(module);
 }
 
 }} // facebook::fboss

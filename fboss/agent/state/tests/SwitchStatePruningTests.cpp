@@ -109,8 +109,7 @@ void registerPortsAndPopulateConfig(
     auto& portObj = config.ports[index++];
     int portInt = int(portAndVlan.first);
     portObj.logicalID = portInt;
-    portObj.name = folly::to<std::string>("port", portInt);
-    portObj.__isset.name = true;
+    portObj.name_ref() = folly::to<std::string>("port", portInt);
   }
 
   index = 0;
@@ -120,7 +119,8 @@ void registerPortsAndPopulateConfig(
     int vlanInt = int(vlanTyped);
     vlanObj.id = vlanInt;
     vlanObj.name = folly::to<std::string>("vlan", vlanInt);
-    vlanObj.intfID = vlanInt; // interface and vlan ids are the same
+    vlanObj.intfID_ref().value_unchecked() =
+        vlanInt; // interface and vlan ids are the same
   }
 
   config.vlanPorts.resize(port2Vlan.size());
@@ -145,8 +145,7 @@ void registerPortsAndPopulateConfig(
       // If the map is provided, it should have outgoing mac for each
       // interface!
       auto macStr = (*vlan2MacPtr)[vlanTyped].toString();
-      interfaceObj.mac = macStr;
-      interfaceObj.__isset.mac = true;
+      interfaceObj.mac_ref() = macStr;
     }
   }
   return;
@@ -211,7 +210,7 @@ TEST(SwitchStatePruningTests, AddNeighborEntry) {
   // state1
   auto state1 = publishAndApplyConfig(state0, &config, &platform);
   ASSERT_NE(state1, nullptr);
-  ASSERT(!state1->isPublished());
+  ASSERT_TRUE(!state1->isPublished());
   state1->publish();
 
   shared_ptr<SwitchState> state2{state1};
@@ -309,7 +308,7 @@ TEST(SwitchStatePruningTests, ChangeNeighborEntry) {
   // state1
   auto state1 = publishAndApplyConfig(state0, &config, &platform);
   ASSERT_NE(state1, nullptr);
-  ASSERT(!state1->isPublished());
+  ASSERT_TRUE(!state1->isPublished());
   state1->publish();
 
   shared_ptr<SwitchState> state2{state1};
@@ -419,7 +418,7 @@ TEST(SwitchStatePruningTests, ModifyState) {
       port2VlanMap, &vlan2OutgoingMac, state0, config);
   auto state1 = publishAndApplyConfig(state0, &config, &platform);
   ASSERT_NE(state1, nullptr);
-  ASSERT(!state1->isPublished());
+  ASSERT_TRUE(!state1->isPublished());
   state1->publish();
 
   // state1 does not have any arp table. Let us create an arp table and add it
@@ -435,12 +434,12 @@ TEST(SwitchStatePruningTests, ModifyState) {
   // Add host1 (resolved) for vlan21
   freshArpTable->addEntry(host1ip, host1mac, host1port, host1intf);
   shared_ptr<Vlan> vlan1 = state1->getVlans()->getVlan(host1vlan);
-  ASSERT(state1 == state2); // point to same state
+  ASSERT_TRUE(state1 == state2); // point to same state
   auto vlanPtr = state1->getVlans()->getVlan(host1vlan)->modify(&state2);
   vlanPtr->setArpTable(std::move(freshArpTable));
-  ASSERT(vlan1.get() != vlanPtr);
+  ASSERT_TRUE(vlan1.get() != vlanPtr);
   shared_ptr<Vlan> vlan2 = state2->getVlans()->getVlan(host1vlan);
-  ASSERT(vlan1 != vlan2);
+  ASSERT_TRUE(vlan1 != vlan2);
 }
 
 // Test we can modify empty arp table without resetting the arp table to a new
@@ -466,7 +465,7 @@ TEST(SwitchStatePruningTests, ModifyEmptyArpTable) {
   // state1
   auto state1 = publishAndApplyConfig(state0, &config, &platform);
   ASSERT_NE(state1, nullptr);
-  ASSERT(!state1->isPublished());
+  ASSERT_TRUE(!state1->isPublished());
   state1->publish();
 
   shared_ptr<SwitchState> state2{state1};
@@ -477,20 +476,20 @@ TEST(SwitchStatePruningTests, ModifyEmptyArpTable) {
   auto host1vlan = VlanID(21);
   // Old arp table
   auto arp1 = state1->getVlans()->getVlan(host1vlan)->getArpTable();
-  ASSERT(state2->isPublished());
+  ASSERT_TRUE(state2->isPublished());
   auto arp1modified =
       state1->getVlans()->getVlan(host1vlan)->getArpTable()->modify(
           host1vlan, &state2);
-  ASSERT(!state2->isPublished());
+  ASSERT_TRUE(!state2->isPublished());
   arp1modified->addEntry(host1ip, host1mac, host1port, host1intf);
 
   auto arp2 = state2->getVlans()->getVlan(host1vlan)->getArpTable();
-  ASSERT(arp1 != arp2);
-  ASSERT(!arp2->isPublished());
-  ASSERT(arp2->getGeneration() == arp1->getGeneration() + 1);
+  ASSERT_TRUE(arp1 != arp2);
+  ASSERT_TRUE(!arp2->isPublished());
+  ASSERT_TRUE(arp2->getGeneration() == arp1->getGeneration() + 1);
 
   state2->publish();
-  ASSERT(arp2->isPublished());
+  ASSERT_TRUE(arp2->isPublished());
 }
 
 /**
@@ -518,7 +517,7 @@ TEST(SwitchStatePruningTests, ModifyArpTableMultipleTimes) {
   // state1
   auto state1 = publishAndApplyConfig(state0, &config, &platform);
   ASSERT_NE(state1, nullptr);
-  ASSERT(!state1->isPublished());
+  ASSERT_TRUE(!state1->isPublished());
   state1->publish();
 
   shared_ptr<SwitchState> state2{state1};
@@ -533,7 +532,7 @@ TEST(SwitchStatePruningTests, ModifyArpTableMultipleTimes) {
   auto host1vlan = VlanID(21);
   auto arp1 = state1->getVlans()->getVlan(host1vlan)->getArpTable();
   ASSERT_EQ(state1, state2);
-  ASSERT(state2->isPublished());
+  ASSERT_TRUE(state2->isPublished());
   // Make sure that the modify function on ArpTable modifies the SwitchState
   // and VlanMap and Vlan and the mofified new state is unpublished.
   auto arp1modified =
@@ -548,7 +547,7 @@ TEST(SwitchStatePruningTests, ModifyArpTableMultipleTimes) {
       state1->getVlans()->getVlan(host1vlan)->getArpTable(),
       state2->getVlans()->getVlan(host1vlan)->getArpTable());
   ASSERT_NE(arp1.get(), arp1modified);
-  ASSERT(!state2->isPublished());
+  ASSERT_TRUE(!state2->isPublished());
 
   shared_ptr<SwitchState> state3{state2};
   // state2 (unpublished)

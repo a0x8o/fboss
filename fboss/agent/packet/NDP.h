@@ -9,10 +9,15 @@
  */
 #pragma once
 
+#include "fboss/agent/packet/ICMPHdr.h"
+#include "fboss/agent/types.h"
+
+#include <folly/io/Cursor.h>
+
 namespace facebook { namespace fboss {
 
 /**
- * Constants for NDP option type fields
+ * Constants for NDP option type fields (RFC 4861 (sec 4.6))
  *
  * We're using a nested enum inside a class to get "enum class" like syntax,
  * but without the strict type checking, so we can still easily convert to and
@@ -41,4 +46,58 @@ struct NDPOptionLength {
   };
 };
 
+struct NeighborAdvertisementFlags {
+  enum Values : uint32_t {
+    ROUTER = 1UL << 31,
+    SOLICITED = 1UL << 30,
+    OVERRIDE = 1UL << 29,
+  };
+};
+
+class NDPOptionHdr {
+ public:
+  uint8_t type() const {
+    return type_;
+  }
+  uint8_t length() const {
+    return length_;
+  }
+  uint16_t payloadLength() const {
+    return sizeof(uint64_t) * length() - hdrLength();
+  }
+  static constexpr uint8_t hdrLength() {
+    return 2;
+  }
+
+  explicit NDPOptionHdr(folly::io::Cursor& cursor);
+
+ private:
+  uint8_t type_;
+  uint8_t length_;
+};
+
+class NDPOptions {
+ public:
+  folly::Optional<uint32_t> mtu{folly::none};
+  folly::Optional<folly::MacAddress> sourceLinkLayerAddress{folly::none};
+  folly::Optional<folly::MacAddress> targetLinkLayerAddress{folly::none};
+
+  NDPOptions() {}
+  explicit NDPOptions(folly::io::Cursor& cursor);
+
+  void tryParse(folly::io::Cursor& cursor);
+
+  void serialize(folly::io::RWPrivateCursor* cursor) const;
+  size_t computeTotalLength() const;
+
+ private:
+  void getMtu(const NDPOptionHdr& ndpHdr, folly::io::Cursor& cursor);
+  void getSourceLinkLayerAddress(
+      const NDPOptionHdr& ndpHdr,
+      folly::io::Cursor& cursor);
+  void getTargetLinkLayerAddress(
+      const NDPOptionHdr& ndpHdr,
+      folly::io::Cursor& cursor);
+  void skipOption(const NDPOptionHdr& ndpHdr, folly::io::Cursor& cursor);
+};
 }} // facebook::fboss

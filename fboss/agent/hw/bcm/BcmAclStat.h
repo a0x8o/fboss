@@ -21,7 +21,10 @@ class BcmSwitch;
  */
 class BcmAclStat {
  public:
-  BcmAclStat(BcmSwitch* hw, int gid);
+  BcmAclStat(
+      BcmSwitch* hw,
+      int gid,
+      const std::vector<cfg::CounterType>& counters);
   BcmAclStat(BcmSwitch* hw, BcmAclStatHandle statHandle)
     : hw_(hw), handle_(statHandle) {}
   ~BcmAclStat();
@@ -34,8 +37,10 @@ class BcmAclStat {
    * Check whether the acl details of handle in h/w matches the s/w acl and
    * ranges
    */
-  static bool isStateSame(BcmSwitch* hw, BcmAclStatHandle statHandle,
-    cfg::PacketCounterMatchAction& action);
+  static bool isStateSame(
+      BcmSwitch* hw,
+      BcmAclStatHandle statHandle,
+      cfg::TrafficCounter& counter);
 
  private:
   BcmSwitch* hw_;

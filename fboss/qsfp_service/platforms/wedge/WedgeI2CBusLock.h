@@ -20,7 +20,7 @@ namespace facebook { namespace fboss {
  * A small wrapper around CP2112 which is aware of the topology of wedge's QSFP
  * I2C bus, and can select specific QSFPs to query.
  */
-class WedgeI2CBusLock {
+class WedgeI2CBusLock : public TransceiverI2CApi {
  public:
   explicit WedgeI2CBusLock(std::unique_ptr<BaseWedgeI2CBus> wedgeI2CBus);
   void open();
@@ -31,6 +31,10 @@ class WedgeI2CBusLock {
                   int offset, int len, const uint8_t* buf);
   void read(uint8_t i2cAddress, int offset, int len, uint8_t* buf);
   void write(uint8_t i2cAddress, int offset, int len, const uint8_t* buf);
+
+  void verifyBus(bool autoReset);
+  bool isPresent(unsigned int module) override;
+  void ensureOutOfReset(unsigned int module) override;
 
  private:
   // Forbidden copy constructor and assignment operator

@@ -14,8 +14,13 @@ namespace {
 constexpr auto kQueueMatchAction = "queueMatchAction";
 constexpr auto kQueueId = "queueId";
 constexpr auto kSendToCPU = "sendToCPU";
-constexpr auto kPacketCounterMatchAction = "packetCounterMatchAction";
-constexpr auto kCounterName = "counterName";
+constexpr auto kSetDscpMatchAction = "setDscpMatchAction";
+constexpr auto kDscpValue = "dscpValue";
+constexpr auto kIngressMirror = "ingressMirror";
+constexpr auto kEgressMirror = "engressMirror";
+constexpr auto kCounter = "counter";
+constexpr auto kCounterName = "name";
+constexpr auto kCounterTypes = "types";
 }
 
 namespace facebook { namespace fboss {
@@ -28,10 +33,23 @@ folly::dynamic MatchAction::toFollyDynamic() const {
       sendToQueue_.value().first.queueId;
     matchAction[kQueueMatchAction][kSendToCPU] = sendToQueue_.value().second;
   }
-  if (packetCounter_) {
-    matchAction[kPacketCounterMatchAction] = folly::dynamic::object;
-    matchAction[kPacketCounterMatchAction][kCounterName] =
-      packetCounter_.value().counterName;
+  if (trafficCounter_) {
+    matchAction[kCounter] = folly::dynamic::object;
+    matchAction[kCounter][kCounterName] = trafficCounter_.value().name;
+    matchAction[kCounter][kCounterTypes] = folly::dynamic::array;
+    for (const auto& type : trafficCounter_.value().types) {
+      matchAction[kCounter][kCounterTypes].push_back(static_cast<int>(type));
+    }
+  }
+  if (setDscp_) {
+    matchAction[kSetDscpMatchAction] = folly::dynamic::object;
+    matchAction[kSetDscpMatchAction][kDscpValue] = setDscp_.value().dscpValue;
+  }
+  if (ingressMirror_) {
+    matchAction[kIngressMirror] = ingressMirror_.value();
+  }
+  if (egressMirror_) {
+    matchAction[kEgressMirror] = egressMirror_.value();
   }
   return matchAction;
 }
@@ -45,11 +63,37 @@ MatchAction MatchAction::fromFollyDynamic(
     bool sendToCPU = actionJson[kQueueMatchAction][kSendToCPU].asBool();
     matchAction.setSendToQueue(std::make_pair(queueAction, sendToCPU));
   }
+  if (actionJson.find(kCounter) != actionJson.items().end()) {
+    auto counter = cfg::TrafficCounter();
+    counter.name = actionJson[kCounter][kCounterName].asString();
+    counter.types.clear();
+    for (const auto& type : actionJson[kCounter][kCounterTypes]) {
+      counter.types.push_back(static_cast<cfg::CounterType>(type.asInt()));
+    }
+    matchAction.setTrafficCounter(counter);
+  }
+  // TODO(adrs): get rid of this (backward compatibility)
+  constexpr auto kPacketCounterMatchAction = "packetCounterMatchAction";
+  constexpr auto kCounterName = "counterName";
   if (actionJson.find(kPacketCounterMatchAction) != actionJson.items().end()) {
-    auto packetCounterAction = cfg::PacketCounterMatchAction();
-    packetCounterAction.counterName =
+    auto counter = cfg::TrafficCounter();
+    counter.name =
         actionJson[kPacketCounterMatchAction][kCounterName].asString();
-    matchAction.setPacketCounter(packetCounterAction);
+    counter.types = {cfg::CounterType::PACKETS};
+    matchAction.setTrafficCounter(counter);
+  }
+
+  if (actionJson.find(kSetDscpMatchAction) != actionJson.items().end()) {
+    auto setDscpMatchAction= cfg::SetDscpMatchAction();
+    setDscpMatchAction.dscpValue=
+        actionJson[kSetDscpMatchAction][kDscpValue].asInt();
+    matchAction.setSetDscp(setDscpMatchAction);
+  }
+  if (actionJson.find(kIngressMirror) != actionJson.items().end()) {
+    matchAction.setIngressMirror(actionJson[kIngressMirror].asString());
+  }
+  if (actionJson.find(kEgressMirror) != actionJson.items().end()) {
+    matchAction.setEgressMirror(actionJson[kEgressMirror].asString());
   }
   return matchAction;
 }

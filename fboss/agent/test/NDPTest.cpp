@@ -175,20 +175,29 @@ TxMatchFn checkICMPv6Pkt(MacAddress srcMac, IPAddressV6 srcIP,
     auto parsedSrcMac = PktUtil::readMac(&c);
     checkField(srcMac, parsedSrcMac, "src mac");
     auto vlanType = c.readBE<uint16_t>();
-    checkField(ETHERTYPE_VLAN, vlanType, "VLAN ethertype");
+    checkField(
+        static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_VLAN),
+        vlanType,
+        "VLAN ethertype");
     auto vlanTag = c.readBE<uint16_t>();
     checkField(static_cast<uint16_t>(vlan), vlanTag, "VLAN tag");
     auto ethertype = c.readBE<uint16_t>();
-    checkField(ETHERTYPE_IPV6, ethertype, "ethertype");
+    checkField(
+        static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_IPV6),
+        ethertype,
+        "ethertype");
     IPv6Hdr ipv6(c);
-    checkField(IP_PROTO_IPV6_ICMP, ipv6.nextHeader, "IPv6 protocol");
+    checkField(
+        static_cast<uint8_t>(IP_PROTO::IP_PROTO_IPV6_ICMP),
+        ipv6.nextHeader,
+        "IPv6 protocol");
     checkField(srcIP, ipv6.srcAddr, "src IP");
     checkField(dstIP, ipv6.dstAddr, "dst IP");
 
     Cursor ipv6PayloadStart(c);
     ICMPHdr icmp6(c);
     checkField(icmp6.computeChecksum(ipv6, c), icmp6.csum, "ICMPv6 checksum");
-    checkField(type, icmp6.type, "ICMPv6 type");
+    checkField(static_cast<uint8_t>(type), icmp6.type, "ICMPv6 type");
     checkField(0, icmp6.code, "ICMPv6 code");
 
     checkPayload(&c, ipv6.payloadLength - ICMPHdr::SIZE);
@@ -227,29 +236,41 @@ TxMatchFn checkNeighborAdvert(MacAddress srcMac, IPAddressV6 srcIP,
     return;
   };
   return checkICMPv6Pkt(srcMac, srcIP, dstMac, dstIP, vlan,
-                        ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT,
+                        ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT,
                         checkPayload);
 }
 
-TxMatchFn checkNeighborSolicitation(MacAddress srcMac, IPAddressV6 srcIP,
-                                    MacAddress dstMac, IPAddressV6 dstIP,
-                                    IPAddressV6 targetIP, VlanID vlan) {
+TxMatchFn checkNeighborSolicitation(
+    MacAddress srcMac,
+    IPAddressV6 srcIP,
+    MacAddress dstMac,
+    IPAddressV6 dstIP,
+    IPAddressV6 targetIP,
+    VlanID vlan,
+    bool hasOption = true) {
   auto checkPayload = [=](Cursor* cursor, uint32_t /*length*/) {
     auto reserved = cursor->read<uint32_t>();
     checkField(0, reserved, "NS reserved field");
     auto parsedTargetIP = PktUtil::readIPv6(cursor);
     checkField(targetIP, parsedTargetIP, "target IP");
 
-    auto optionType = cursor->read<uint8_t>();
-    checkField(1, optionType, "source MAC option type");
-    auto optionLength = cursor->read<uint8_t>();
-    checkField(1, optionLength, "source MAC option length");
-    auto srcMacOption = PktUtil::readMac(cursor);
-    checkField(srcMac, srcMacOption, "source MAC option value");
+    if (hasOption) {
+      auto optionType = cursor->read<uint8_t>();
+      checkField(1, optionType, "source MAC option type");
+      auto optionLength = cursor->read<uint8_t>();
+      checkField(1, optionLength, "source MAC option length");
+      auto srcMacOption = PktUtil::readMac(cursor);
+      checkField(srcMac, srcMacOption, "source MAC option value");
+    }
   };
-  return checkICMPv6Pkt(srcMac, srcIP, dstMac, dstIP, vlan,
-                        ICMPV6_TYPE_NDP_NEIGHBOR_SOLICITATION,
-                        checkPayload);
+  return checkICMPv6Pkt(
+      srcMac,
+      srcIP,
+      dstMac,
+      dstIP,
+      vlan,
+      ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_SOLICITATION,
+      checkPayload);
 }
 
 typedef std::vector<std::pair<IPAddressV6, uint8_t>> PrefixVector;
@@ -341,8 +362,14 @@ TxMatchFn checkRouterAdvert(MacAddress srcMac, IPAddressV6 srcIP,
       throw FbossError("mismatching advertised prefixes");
     }
   };
-  return checkICMPv6Pkt(srcMac, srcIP, dstMac, dstIP, vlan,
-                        ICMPV6_TYPE_NDP_ROUTER_ADVERTISEMENT, checkPayload);
+  return checkICMPv6Pkt(
+      srcMac,
+      srcIP,
+      dstMac,
+      dstIP,
+      vlan,
+      ICMPv6Type::ICMPV6_TYPE_NDP_ROUTER_ADVERTISEMENT,
+      checkPayload);
 }
 
 void sendNeighborAdvertisement(HwTestHandle* handle, StringPiece ipStr,
@@ -359,7 +386,7 @@ void sendNeighborAdvertisement(HwTestHandle* handle, StringPiece ipStr,
   IPv6Hdr ipv6(srcIP, dstIP);
   ipv6.trafficClass = 0xe0;
   ipv6.payloadLength = ICMPHdr::SIZE + plen;
-  ipv6.nextHeader = IP_PROTO_IPV6_ICMP;
+  ipv6.nextHeader = static_cast<uint8_t>(IP_PROTO::IP_PROTO_IPV6_ICMP);
   ipv6.hopLimit = 255;
 
   size_t totalLen = EthHdr::SIZE + IPv6Hdr::SIZE + ipv6.payloadLength;
@@ -372,7 +399,10 @@ void sendNeighborAdvertisement(HwTestHandle* handle, StringPiece ipStr,
     c->push(srcIP.bytes(), IPAddressV6::byteCount());
   };
 
-  ICMPHdr icmp6(ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT, 0, 0);
+  ICMPHdr icmp6(
+      static_cast<uint8_t>(ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT),
+      0,
+      0);
   icmp6.serializeFullPacket(&cursor, dstMac, srcMac, vlan, ipv6, plen, bodyFn);
 
   // Send the packet to the switch
@@ -402,14 +432,14 @@ TEST(NdpTest, UnsolicitedRequest) {
       "3a ff"
       // src addr (::0)
       "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
-      // dst addr (ff02::1:ff00:000a)
-      "ff 02 00 00 00 00 00 00 00 00 00 01 ff 00 00 0a"
+      // dst addr (2401:db00:2110:3004::a)
+      "24 01 db 00 21 10 30 04 00 00 00 00 00 00 00 0a"
       // type: neighbor solicitation
       "87"
       // code
       "00"
       // checksum
-      "2a 7e"
+      "d8 6c"
       // reserved
       "00 00 00 00"
       // target address (2401:db00:2110:3004::a)
@@ -744,7 +774,7 @@ TEST(NdpTest, FlushEntry) {
   EXPECT_TRUE(neighbor2Expire.wait());
 
   // Try flushing 2401:db00:2110:3004::c again (should be a no-op)
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
+  EXPECT_HW_CALL(sw, stateChanged(_)).Times(0);
   binAddr = toBinaryAddress(IPAddressV6("2401:db00:2110:3004::c"));
   numFlushed =
       thriftHandler.flushNeighborEntry(make_unique<BinaryAddress>(binAddr), 5);
@@ -830,7 +860,7 @@ TEST(NdpTest, PendingNdp) {
   // Verify that we don't ever overwrite a valid entry with a pending one.
   // Receive the same packet again, no state update and the entry should still
   // be valid
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
+  EXPECT_HW_CALL(sw, stateChanged(_)).Times(0);
 
   // Send the packet to the SwSwitch
   handle->rxPacket(make_unique<IOBuf>(pkt), PortID(1), vlanID);
@@ -1060,7 +1090,6 @@ TEST(NdpTest, NdpExpiration) {
         IPAddressV6("ff02::1:ff01:0"),
         targetIP,
         vlanID));
-
   // Send the packet to the SwSwitch
   handle->rxPacket(make_unique<IOBuf>(pkt), PortID(1), vlanID);
 
@@ -1180,30 +1209,45 @@ TEST(NdpTest, NdpExpiration) {
   EXPECT_EQ(entry3->isPending(), false);
 
   // We should send two more neighbor solicitations for entry 2 & 3
-  // before we expire them
-  EXPECT_PKT(sw, "neighbor solicitation", checkNeighborSolicitation(
-        MacAddress("02:01:02:03:04:05"),
-        IPAddressV6("fe80::0001:02ff:fe03:0405"),
-        MacAddress("33:33:ff:00:00:01"),
-        IPAddressV6("ff02::1:ff00:1"),
-        targetIP2,
-        VlanID(5)));
 
-  EXPECT_PKT(sw, "neighbor solicitation", checkNeighborSolicitation(
-        MacAddress("02:01:02:03:04:05"),
-        IPAddressV6("fe80::0001:02ff:fe03:0405"),
-        MacAddress("33:33:ff:00:00:02"),
-        IPAddressV6("ff02::1:ff00:2"),
-        targetIP3,
-        VlanID(5)));
+  // before we expire them, but this time they're unicast as they're being
+  // probed
+  EXPECT_HW_CALL(
+      sw,
+      sendPacketOutOfPortAsync_(
+          TxPacketMatcher::createMatcher(
+              "neighbor solicitation",
+              checkNeighborSolicitation(
+                  MacAddress("02:01:02:03:04:05"),
+                  IPAddressV6("2401:db00:2110:3004::"),
+                  MacAddress("02:10:20:30:40:23"),
+                  targetIP2,
+                  targetIP2,
+                  VlanID(5),
+                  false)),
+          PortID(1), _));
 
- // Wait for the second and third entries to expire.
- // We wait 2.5 seconds(plus change):
- // Up to 1.5 seconds for lifetime.
- // 1 more second for probe
+  EXPECT_HW_CALL(
+      sw,
+      sendPacketOutOfPortAsync_(
+          TxPacketMatcher::createMatcher(
+              "neighbor solicitation",
+              checkNeighborSolicitation(
+                  MacAddress("02:01:02:03:04:05"),
+                  IPAddressV6("2401:db00:2110:3004::"),
+                  MacAddress("02:10:20:30:40:24"),
+                  targetIP3,
+                  targetIP3,
+                  VlanID(5),
+                  false)),
+          PortID(1), _));
+
+  // Wait for the second and third entries to expire.
+  // We wait 2.5 seconds(plus change):
+  // Up to 1.5 seconds for lifetime.
+  // 1 more second for probe
   WaitForNdpEntryExpiration expire1(sw, targetIP2, vlanID);
   WaitForNdpEntryExpiration expire2(sw, targetIP3, vlanID);
-
   std::promise<bool> done;
   auto* evb = sw->getBackgroundEvb();
   evb->runInEventBaseThread([&]() {
@@ -1230,15 +1274,22 @@ TEST(NdpTest, NdpExpiration) {
     .WillRepeatedly(testing::Return(true));
 
   // We should see one more solicitation for entry 1 before we expire it
-  EXPECT_PKT(sw, "neighbor solicitation", checkNeighborSolicitation(
-        MacAddress("02:01:02:03:04:05"),
-        IPAddressV6("fe80::0001:02ff:fe03:0405"),
-        MacAddress("33:33:ff:01:00:00"),
-        IPAddressV6("ff02::1:ff01:0"),
-        targetIP,
-        vlanID));
 
- // Wait for the first entry to expire
+  EXPECT_HW_CALL(
+      sw,
+      sendPacketOutOfPortAsync_(
+          TxPacketMatcher::createMatcher(
+              "neighbor solicitation",
+              checkNeighborSolicitation(
+                  MacAddress("02:01:02:03:04:05"),
+                  IPAddressV6("2401:db00:2110:3004::"),
+                  MacAddress("02:10:20:30:40:22"),
+                  targetIP,
+                  targetIP,
+                  vlanID,
+                  false)),
+          PortID(1), _));
+  // Wait for the first entry to expire
   WaitForNdpEntryExpiration expire0(sw, targetIP, vlanID);
   std::promise<bool> done2;
   evb->runInEventBaseThread([&]() {
@@ -1436,7 +1487,7 @@ TEST(NdpTest, PortFlapRecover) {
   EXPECT_EQ(entry3->isPending(), false);
 
   // send a port down event to the switch for port 1
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(1));
+  EXPECT_HW_CALL(sw, stateChanged(_)).Times(testing::AtLeast(1));
   WaitForNdpEntryPending neigbor0Pending(sw, targetIP, vlanID);
   WaitForNdpEntryPending neigbor1Pending(sw, targetIP2, vlanID);
 
@@ -1467,7 +1518,7 @@ TEST(NdpTest, PortFlapRecover) {
   EXPECT_EQ(entry3->isPending(), false);
 
   // send a port up event to the switch for port 1
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(testing::AtLeast(1));
+  EXPECT_HW_CALL(sw, stateChanged(_)).Times(testing::AtLeast(1));
   sw->linkStateChanged(PortID(1), true);
 
   sendNeighborAdvertisement(handle.get(), targetIP.str(),

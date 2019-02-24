@@ -22,6 +22,7 @@ void BcmPort::prepareForGracefulExit() {}
 void BcmPort::setFEC(const std::shared_ptr<Port>& /*swPort*/) {}
 void BcmPort::setPause(const std::shared_ptr<Port>& /*swPort*/) {}
 void BcmPort::setTxSetting(const std::shared_ptr<Port>& /*swPort*/) {}
+void BcmPort::setLoopbackMode(const std::shared_ptr<Port>& /*swPort*/) {}
 
 bool BcmPort::isFECEnabled() {
   return false;
@@ -65,6 +66,10 @@ QueueConfig BcmPort::getCurrentQueueSettings() {
 void BcmPort::setupQueue(const std::shared_ptr<PortQueue>& /*queue*/) {
 }
 
+void BcmPort::attachIngressQosPolicy(const std::string& /*name*/) {}
+
+void BcmPort::detachIngressQosPolicy() {}
+
 void BcmPort::setPortResource(const std::shared_ptr<Port>& /*swPort*/) {}
 
 bool BcmPort::getDesiredFECEnabledStatus(
@@ -75,5 +80,4 @@ bool BcmPort::getDesiredFECEnabledStatus(
 void BcmPort::updateBcmStats(std::chrono::seconds /*now*/,
                              HwPortStats* /*curPortStats*/) {
 }
-
 }} // namespace facebook::fboss

@@ -27,8 +27,6 @@ struct PortQueueFields {
   using AQMMap = boost::container::flat_map<cfg::QueueCongestionBehavior,
                                             cfg::ActiveQueueManagement>;
 
-  explicit PortQueueFields(uint8_t id) : id(id) {}
-
   template<typename Fn>
   void forEachChild(Fn) {}
 
@@ -58,7 +56,10 @@ class PortQueue :
  public:
   using AQMMap = PortQueueFields::AQMMap;
 
-  explicit PortQueue(uint8_t id);
+  explicit PortQueue(uint8_t id) {
+    writableFields()->id = id;
+  }
+
   bool operator==(const PortQueue& queue) const {
     // TODO(joseph5wu) Add sharedBytes
     return getFields()->id == queue.getID() &&
@@ -68,11 +69,14 @@ class PortQueue :
            getFields()->scalingFactor == queue.getScalingFactor() &&
            getFields()->scheduling == queue.getScheduling() &&
            getFields()->aqms == queue.getAqms() &&
-           getFields()->packetsPerSec == queue.getPacketsPerSec();
+           getFields()->packetsPerSec == queue.getPacketsPerSec() &&
+           getFields()->name == queue.getName();
   }
   bool operator!=(const PortQueue& queue) const {
     return !(*this == queue);
   }
+
+  std::string toString() const;
 
   uint8_t getID() const {
     return getFields()->id;

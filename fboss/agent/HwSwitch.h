@@ -9,12 +9,12 @@
  */
 #pragma once
 
-#include "fboss/agent/HighresCounterUtil.h"
 #include "fboss/agent/types.h"
 #include "fboss/agent/if/gen-cpp2/FbossCtrl.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 #include <folly/IPAddress.h>
+#include <folly/Optional.h>
 
 #include <memory>
 #include <utility>
@@ -140,20 +140,41 @@ class HwSwitch {
   virtual std::unique_ptr<TxPacket> allocatePacket(uint32_t size) = 0;
 
   /*
-   * Send a packet, using switching logic to send it out the correct port(s)
+   * Send a packet, use switching logic to send it out the correct port(s)
    * for the specified VLAN and destination MAC.
    *
    * @return If the packet is successfully sent to HW.
    */
-  virtual bool sendPacketSwitched(std::unique_ptr<TxPacket> pkt) noexcept = 0;
+  virtual bool sendPacketSwitchedAsync(
+      std::unique_ptr<TxPacket> pkt) noexcept = 0;
 
   /*
-   * Send a packet, using switching logic to send it out the correct port(s)
+   * Send a packet, send it out the specified port, use
+   * VLAN and destination MAC from packet
+   *
+   * @return If the packet is successfully sent to HW.
+   */
+  virtual bool sendPacketOutOfPortAsync(
+      std::unique_ptr<TxPacket> pkt,
+      PortID portID,
+      folly::Optional<uint8_t> cos = folly::none) noexcept = 0;
+
+  /*
+   * Send a packet, use switching logic to send it out the correct port(s)
    * for the specified VLAN and destination MAC.
    *
    * @return If the packet is successfully sent to HW.
    */
-  virtual bool sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
+  virtual bool sendPacketSwitchedSync(
+      std::unique_ptr<TxPacket> pkt) noexcept = 0;
+
+  /*
+   * Send a packet, send it out the specified port, use
+   * VLAN and destination MAC from packet
+   *
+   * @return If the packet is successfully sent to HW.
+   */
+  virtual bool sendPacketOutOfPortSync(std::unique_ptr<TxPacket> pkt,
                                    PortID portID) noexcept = 0;
 
   /*
@@ -161,23 +182,6 @@ class HwSwitch {
    */
   virtual void updateStats(SwitchStats* switchStats) = 0;
 
-  /*
-   * Returns a hardware-specific sampler based on a namespace string and list of
-   * counters within that namespace.  This assumes that a single sampler
-   * instance will never need to handle counters from different namespaces.
-   *
-   * @return     How many counters were added from this namespace.
-   * @param[out] samplers         A vector of high-resolution samplers.  We will
-   *                              append new samplers to this list.
-   * @param[in]  namespaceString  A string respresentation of the current
-   *                              counter namespace.
-   * @param[in]  counterSet       The set of requested counters within the
-   *                              current namespace.
-   */
-  virtual int getHighresSamplers(HighresSamplerList* samplers,
-                                 const std::string& namespaceString,
-                                 const std::set<CounterRequest>& counterSet)
-                                 = 0;
 
   virtual void fetchL2Table(std::vector<L2EntryThrift> *l2Table) = 0;
 
@@ -224,7 +228,7 @@ class HwSwitch {
    * ports as first class citizens (hwPort?) and then move all of these
    * functions into the hwPort abstraction
    */
-   virtual bool getPortFECConfig(PortID /* unused */ ) const { return false; }
+   virtual bool getPortFECEnabled(PortID /* unused */ ) const { return false; }
 
   /*
    * Returns true if the arp/ndp entry for the passed in ip/intf has been hit
@@ -232,10 +236,17 @@ class HwSwitch {
    */
   virtual bool getAndClearNeighborHit(RouterID vrf,
                                       folly::IPAddress& ip) = 0;
- private:
-  // Forbidden copy constructor and assignment operator
-  HwSwitch(HwSwitch const &) = delete;
-  HwSwitch& operator=(HwSwitch const &) = delete;
+
+  /*
+   * Clear port stats for specified port
+   */
+  virtual void clearPortStats(
+      const std::unique_ptr<std::vector<int32_t>>& ports) = 0;
+
+   private:
+    // Forbidden copy constructor and assignment operator
+    HwSwitch(HwSwitch const&) = delete;
+    HwSwitch& operator=(HwSwitch const&) = delete;
 };
 
 }} // facebook::fboss

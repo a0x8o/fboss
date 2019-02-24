@@ -21,6 +21,7 @@
 #include <folly/logging/xlog.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
 #include "common/stats/ServiceData.h"
+#include "fboss/agent/AgentConfig.h"
 #include "fboss/agent/ApplyThriftConfig.h"
 #include "fboss/agent/HwSwitch.h"
 #include "fboss/agent/Platform.h"
@@ -28,6 +29,7 @@
 #include "fboss/agent/SwitchStats.h"
 #include "fboss/agent/ThriftHandler.h"
 #include "fboss/agent/TunManager.h"
+#include "fboss/agent/SetupThrift.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -57,10 +59,6 @@ DEFINE_int32(port, 5909, "The thrift server port");
 DEFINE_int32(stat_publish_interval_ms, 1000,
              "How frequently to publish thread-local stats back to the "
              "global store.  This should generally be less than 1 second.");
-DEFINE_int32(thrift_idle_timeout, 60, "Thrift idle timeout in seconds.");
-// Programming 16K routes can take 20+ seconds
-DEFINE_int32(thrift_task_expire_timeout, 30,
-    "Thrift task expire timeout in seconds.");
 DEFINE_bool(tun_intf, true,
             "Create tun interfaces to allow other processes to "
             "send and receive traffic via the switch ports");
@@ -69,10 +67,10 @@ DEFINE_bool(enable_lldp, true,
             "Run LLDP protocol in agent");
 DEFINE_bool(publish_boot_type, true,
             "Publish boot type on startup");
-DEFINE_bool(enable_nhops_prober, true,
-            "Enables prober for unresolved next hops");
 DEFINE_int32(flush_warmboot_cache_secs, 60,
     "Seconds to wait before flushing warm boot cache");
+DECLARE_int32(thrift_idle_timeout);
+
 using facebook::fboss::SwSwitch;
 using facebook::fboss::ThriftHandler;
 
@@ -89,8 +87,6 @@ void updateStats(SwSwitch *swSwitch) {
 FOLLY_INIT_LOGGING_CONFIG("fboss=DBG2; default:async=true");
 
 namespace facebook { namespace fboss {
-
-
 
 class Initializer {
  public:
@@ -134,9 +130,6 @@ class Initializer {
     }
     if (FLAGS_publish_boot_type) {
       flags |= SwitchFlags::PUBLISH_STATS;
-    }
-    if (FLAGS_enable_nhops_prober) {
-      flags |= SwitchFlags::ENABLE_NHOPS_PROBER;
     }
     return flags;
   }
@@ -261,16 +254,31 @@ class SignalHandler : public AsyncSignalHandler {
   StopServices stopServices_;
 };
 
+std::unique_ptr<AgentConfig> parseConfig(int argc, char** argv) {
+  // one pass over flags, but don't clear argc/argv. We only do this
+  // to extract the 'config' arg.
+  gflags::ParseCommandLineFlags(&argc, &argv, false);
+  return AgentConfig::fromDefaultFile();
+}
+
+void initFlagDefaults(const std::map<std::string, std::string>& defaults) {
+  for (auto item : defaults) {
+    // logging not initialized yet, need to use std::cerr
+    std::cerr << "Overriding default flag from config: " << item.first.c_str()
+              << "=" << item.second.c_str() << std::endl;
+    gflags::SetCommandLineOptionWithMode(
+        item.first.c_str(), item.second.c_str(), gflags::SET_FLAGS_DEFAULT);
+  }
+}
+
 int fbossMain(int argc, char** argv, PlatformInitFn initPlatform) {
+  setVersionInfo();
+
+  // Read the config and set default command line arguments
+  auto config = parseConfig(argc, argv);
+  initFlagDefaults(config->thrift.defaultCommandLineArgs);
 
   fbossInit(argc, argv);
-
-  // Internally we use a modified version of gflags that only shows VLOG
-  // messages if --minloglevel is set to 0.  We pretty much always want to see
-  // VLOG messages, so set minloglevel to 0 by default, unless overridden on
-  // the command line.
-  gflags::SetCommandLineOptionWithMode(
-      "minloglevel", "0", gflags::SET_FLAGS_DEFAULT);
 
   // Allow the fb303 setOption() call to update the command line flag
   // settings.  This allows us to change the log levels on the fly using
@@ -285,7 +293,7 @@ int fbossMain(int argc, char** argv, PlatformInitFn initPlatform) {
   freopen("/dev/null", "r", stdin);
 
   // Now that we have parsed the command line flags, create the Platform object
-  unique_ptr<Platform> platform = initPlatform();
+  unique_ptr<Platform> platform = initPlatform(std::move(config));
 
   // Create the SwSwitch and thrift handler
   SwSwitch sw(std::move(platform));
@@ -293,27 +301,14 @@ int fbossMain(int argc, char** argv, PlatformInitFn initPlatform) {
   auto handler =
       std::shared_ptr<ThriftHandler>(platformPtr->createHandler(&sw));
 
+  handler->setIdleTimeout(FLAGS_thrift_idle_timeout);
   EventBase eventBase;
 
   // Start the thrift server
-  ThriftServer server;
-  server.setTaskExpireTime(std::chrono::milliseconds(
-        FLAGS_thrift_task_expire_timeout * 1000));
-  server.getEventBaseManager()->setEventBase(&eventBase, false);
-  server.setInterface(handler);
-  server.setDuplex(true);
-  handler->setEventBaseManager(server.getEventBaseManager());
+  auto server = setupThriftServer(
+      eventBase, handler, FLAGS_port, true /*isDuplex*/, true /*setupSSL*/);
 
-  // When a thrift connection closes, we need to clean up the associated
-  // callbacks.
-  server.setServerEventHandler(handler);
-
-  SocketAddress address;
-  address.setFromLocalPort(FLAGS_port);
-  server.setAddress(address);
-  server.setIdleTimeout(std::chrono::seconds(FLAGS_thrift_idle_timeout));
-  handler->setIdleTimeout(FLAGS_thrift_idle_timeout);
-  server.setup();
+  handler->setSSLPolicy(server->getSSLPolicy());
 
   // Create an Initializer to initialize the switch in a background thread.
   Initializer init(&sw, platformPtr);
@@ -336,7 +331,7 @@ int fbossMain(int argc, char** argv, PlatformInitFn initPlatform) {
   };
   SignalHandler signalHandler(&eventBase, &sw, stopServices);
 
-  SCOPE_EXIT { server.cleanUp(); };
+  SCOPE_EXIT { server->cleanUp(); };
   XLOG(INFO) << "serving on localhost on port " << FLAGS_port;
 
   // Run the EventBase main loop

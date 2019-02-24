@@ -14,9 +14,13 @@ DEFAULT_SSH_TIMEOUT = 5
 @memoize_forever
 def _get_keyfiles():
     keyfiles = []
-    cert_path = ['/var/facebook/credentials/{user}/ssh/id_rsa-cert.pub'.
-                 format(user=os.getenv('USER', 'root')),
-                 '/root/.ssh/id_rsa-cert.pub']
+    cert_path = [
+        '/var/facebook/credentials/{user}/ssh/id_rsa-cert.pub'.
+        format(user=os.getenv('USER', 'root')),
+        '/root/.ssh/id_rsa-cert.pub',
+        # https://fburl.com/wiki/psdjjyxx
+        '/dev/shm/sandcastle_ssh/id_rsa-cert.pub',
+    ]
     for path in cert_path:
         if os.path.isfile(path):
             keyfiles.append(path)
@@ -39,6 +43,7 @@ class ParamikoClient(object):
 def connect_to_client(client, asset_name, username, password):
     keyfiles = _get_keyfiles()
     # timeout cannot be 0 for connect
+    print("Connect to client : ", asset_name)
     client.connect(hostname=asset_name, username=username,
                    password=password, key_filename=keyfiles,
                    timeout=DEFAULT_SSH_TIMEOUT,
@@ -79,3 +84,13 @@ def modify_file_path_on_device(asset_name, username, password,
             # pah and do a copy of file
             sftp.remove(new_file_path)
             sftp.rename(current_file_path, new_file_path)
+
+
+def is_device_ssh_reachable(hostname, username, password):
+    with ParamikoClient() as client:
+        try:
+            connect_to_client(client, hostname, username, password)
+        except Exception as err :
+            print("Failed to connect with error : ", str(err))
+            return False
+        return True

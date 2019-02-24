@@ -19,7 +19,6 @@ import ipaddress
 
 from fboss.cli.commands import arp
 from fboss.cli.commands import aggregate_port
-from fboss.cli.commands import config
 from fboss.cli.commands import commands as cmds
 from fboss.cli.commands import interface
 from fboss.cli.commands import info
@@ -30,8 +29,10 @@ from fboss.cli.commands import ndp
 from fboss.cli.commands import nic
 from fboss.cli.commands import port
 from fboss.cli.commands import route
+from fboss.cli.commands import agent
 from fboss.cli.commands.commands import FlushType
 from fboss.cli.utils.utils import AGENT_KEYWORD
+from fboss.cli.utils.utils import KEYWORD_CONFIG_SHOW, KEYWORD_CONFIG_RELOAD
 from thrift.Thrift import TApplicationException
 from thrift.transport.TTransport import TTransportException
 from neteng.fboss.ttypes import FbossBaseError
@@ -149,7 +150,8 @@ class GetConfigCli(object):
     @click.pass_obj
     def _agent(cli_opts):
         ''' Show controller running config '''
-        config.GetConfigCmd(cli_opts).run(AGENT_KEYWORD)
+        raise Exception(''' D13645809 reorganized commands:
+            fboss config agent => fboss agent config show ''')
 
 
 class IpCli(object):
@@ -195,7 +197,6 @@ class L2Cli(object):
 
     def __init__(self):
         self.l2.add_command(self._table, name='table')
-        self.l2.add_command(self._flush, name='flush')
 
     @click.group(cls=AliasedGroup)
     def l2():
@@ -207,15 +208,6 @@ class L2Cli(object):
     def _table(cli_opts):
         ''' Show the L2 table '''
         l2.L2TableCmd(cli_opts).run()
-
-    @click.command()
-    @click.option('-V', '--vlan', type=int, default=0,
-                    help='Only flush the IP from the specified VLAN')
-    @click.argument('ip')
-    @click.pass_obj
-    def _flush(cli_opts, ip, vlan):
-        ''' Flush an ARP entry by [IP]'''
-        cmds.NeighborFlushCmd(cli_opts).run(ip, vlan)
 
 
 class LldpCli(object):
@@ -269,8 +261,8 @@ class PortType(click.ParamType):
     def convert(self, value, param, ctx):
         try:
             if self.port_info_map is None:
-                client = FbossAgentClient(ctx.obj.hostname)
-                self.port_info_map = client.getAllPortInfo()
+                with FbossAgentClient(ctx.obj.hostname) as client:
+                    self.port_info_map = client.getAllPortInfo()
             if value.isdigit():
                 port = self.port_info_map[int(value)]
                 return port.portId
@@ -282,6 +274,114 @@ class PortType(click.ParamType):
         except (ValueError, KeyError):
             self.fail('%s is not a valid Port' % value, param, ctx)
 
+
+class Stats(object):
+    ''' Port stats sub-commands '''
+
+    def __init__(self):
+        self.stats.add_command(self._show, name='show')
+        self.stats.add_command(self._clear, name='clear')
+
+    @click.group(cls=AliasedGroup)
+    def stats():
+        ''' Show/clear Port stats '''
+        pass
+
+    @click.command()
+    @click.argument('ports', nargs=-1, type=PortType())
+    @click.option('--detail',
+                  is_flag=True,
+                  help='Display detailed port stats with lldp')
+    @click.pass_obj
+    def _show(cli_opts, detail, ports):
+        ''' Show port statistics '''
+        port.PortStatsCmd(cli_opts).run(detail, ports)
+
+    @click.command()
+    @click.argument('ports', nargs=-1, type=PortType())
+    @click.pass_obj
+    def _clear(cli_opts, ports):
+        ''' Clear stats'''
+        port.PortStatsClearCmd(cli_opts).run(ports)
+
+
+class PortState(object):
+    ''' Port state sub-commands '''
+
+    def __init__(self):
+        self.state.add_command(self._show, name='show')
+        self.state.add_command(self._enable, name='enable')
+        self.state.add_command(self._disable, name='disable')
+        self.state.add_command(self._flap, name='flap')
+
+    @click.group(cls=AliasedGroup)  # noqa: B902
+    def state():
+        ''' Port state commands '''
+        pass
+
+    @click.command()
+    @click.argument('ports', nargs=-1, type=PortType())
+    @click.option('--all', is_flag=True, help='Display Disabled ports')
+    @click.pass_obj
+    def _show(cli_opts, ports, all):  # noqa: B902
+        ''' Show port state for given [port(s)] '''
+        port.PortStatusCmd(cli_opts).run(detail=False, ports=ports,
+                verbose=False, internal=True, all=all)
+
+    @click.command()
+    @click.argument('ports', nargs=-1, type=PortType())
+    @click.pass_obj
+    def _enable(cli_opts, ports):  # noqa: B902
+        ''' Enable port state for given [port(s)] '''
+        port.PortSetStatusCmd(cli_opts).run(ports, True)
+
+    @click.command()
+    @click.argument('ports', nargs=-1, type=PortType())
+    @click.pass_obj
+    def _disable(cli_opts, ports):  # noqa: B902
+        ''' Disable port state for given [port(s)] '''
+        port.PortSetStatusCmd(cli_opts).run(ports, False)
+
+    @click.command()
+    @click.argument('ports', nargs=-1, type=PortType())
+    @click.option('--all', is_flag=True, help='Flap all Present but Down ports')
+    @click.pass_obj
+    def _flap(cli_opts, ports, all):  # noqa: B902
+        ''' Flap port state for given [port(s)] '''
+        port.PortFlapCmd(cli_opts).run(ports, all)
+
+
+class PortTransceiver(object):
+    ''' Port transceiver sub-commands '''
+
+    def __init__(self):
+        self.transceiver.add_command(self._transceiver, name='show')
+
+    @click.group(cls=AliasedGroup)  # noqa: B902
+    def transceiver():
+        ''' Port transceiver commands '''
+        pass
+
+    @click.command()
+    @click.argument('ports', nargs=-1, type=PortType())
+    @click.pass_obj
+    def _transceiver(cli_opts, ports):  # noqa: B902
+        ''' Show port transceiver for given [port(s)] '''
+        port.PortStatusCmd(cli_opts).run(detail=False, ports=ports,
+                verbose=True, internal=False, all=all)
+
+
+def raise_exception_port_command_reorg():
+    raise Exception(''' D13745157 reorganized/renamed commands:
+
+        fboss port status [--all]       => fboss port state show [--all]
+        fboss port enable               => fboss port state enable
+        fboss port disable              => fboss port state disable
+        fboss port flap [--all]         => fboss port state flap [--all]
+
+        fboss port status --verbose      => fboss port transceiver show  ''')
+
+
 class PortCli(object):
     ''' Port sub-commands '''
 
@@ -291,9 +391,11 @@ class PortCli(object):
         self.port.add_command(self._status, name='status')
         self.port.add_command(self._enable, name='enable')
         self.port.add_command(self._disable, name='disable')
-        self.port.add_command(self._stats, name='stats')
         self.port.add_command(self._description, name='description')
-        self.port.add_command(self._stats, name='all')
+
+        self.port.add_command(PortState().state)
+        self.port.add_command(PortTransceiver().transceiver)
+        self.port.add_command(Stats().stats)
 
     @click.group(cls=AliasedGroup)
     def port():
@@ -308,25 +410,26 @@ class PortCli(object):
         port.PortDetailsCmd(cli_opts).run(ports)
 
     @click.command()
-    @click.argument('ports', nargs=-1, required=True, type=PortType())
+    @click.argument('ports', nargs=-1, type=PortType())
+    @click.option('--all', is_flag=True, help='Flap all Present but Down ports')
     @click.pass_obj
-    def _flap(cli_opts, ports):
+    def _flap(cli_opts, ports, all):
         ''' Flap given [port(s)] '''
-        port.PortFlapCmd(cli_opts).run(ports)
+        raise_exception_port_command_reorg()
 
     @click.command()
     @click.argument('ports', nargs=-1, required=True, type=PortType())
     @click.pass_obj
     def _enable(cli_opts, ports):
         ''' Enable given [port(s)] '''
-        port.PortSetStatusCmd(cli_opts).run(ports, True)
+        raise_exception_port_command_reorg()
 
     @click.command()
     @click.argument('ports', nargs=-1, required=True, type=PortType())
     @click.pass_obj
     def _disable(cli_opts, ports):
         ''' Disable given [port(s)] '''
-        port.PortSetStatusCmd(cli_opts).run(ports, False)
+        raise_exception_port_command_reorg()
 
     @click.command()
     @click.argument('ports', nargs=-1, type=PortType())
@@ -339,17 +442,7 @@ class PortCli(object):
     @click.pass_obj
     def _status(cli_opts, detail, ports, verbose, internal, all):
         ''' Show port status '''
-        port.PortStatusCmd(cli_opts).run(detail, ports, verbose, internal, all)
-
-    @click.command()
-    @click.argument('ports', nargs=-1, type=PortType())
-    @click.option('--detail',
-                  is_flag=True,
-                  help='Display detailed port stats with lldp')
-    @click.pass_obj
-    def _stats(cli_opts, detail, ports):
-        ''' Show port statistics '''
-        port.PortStatsCmd(cli_opts).run(detail, ports)
+        raise_exception_port_command_reorg()
 
     @click.command()
     @click.argument('ports', nargs=-1, type=PortType())
@@ -378,11 +471,8 @@ class ReloadConfigCli(object):
     @click.pass_obj
     def reloadconfig(cli_opts):
         ''' Reload agent configuration file  '''
-        # Disable this command because it currently results in wedge_agent
-        # crash.  See T24768677.
-        print("reloadconfig command is currently disabled")
-        return
-        config.ReloadConfigCmd(cli_opts).run()
+        raise Exception(''' D13645809 reorganized commands:
+            fboss reloadconfig => fboss agent config reload ''')
 
 
 class RouteCli(object):
@@ -484,6 +574,43 @@ class VerbosityCli(object):
         cmds.VerbosityCmd(cli_opt).run(verbosity)
 
 
+class AgentConfig(object):
+    ''' Agent config sub-commands '''
+
+    def __init__(self):
+        self.config.add_command(self._show, name='show')
+        self.config.add_command(self._reload, name='reload')
+
+    @click.group(cls=AliasedGroup)  # noqa: B902
+    def config():
+        ''' Agent config commands'''
+        pass
+
+    @click.command()
+    @click.pass_obj
+    def _show(cli_opts):  # noqa: B902
+        ''' Show running config '''
+        agent.AgentConfigCmd(cli_opts).run(KEYWORD_CONFIG_SHOW)
+
+    @click.command()
+    @click.pass_obj
+    def _reload(cli_opts):  # noqa: B902
+        ''' Reload agent configuration file '''
+        agent.AgentConfigCmd(cli_opts).run(KEYWORD_CONFIG_RELOAD)
+
+
+class AgentCli(object):
+    ''' Agent sub-commands '''
+
+    def __init__(self):
+        self.agent.add_command(AgentConfig().config)
+
+    @click.group(cls=AliasedGroup)  # noqa: B902
+    def agent():
+        ''' agent commands '''
+        pass
+
+
 # -- Main Command Group -- #
 @click.group(cls=AliasedGroup)
 @click.option('--hostname', '-H', default='::1',
@@ -518,6 +645,7 @@ def add_modules(main_func):
     main_func.add_command(ReloadConfigCli().reloadconfig)
     main_func.add_command(RouteCli().route)
     main_func.add_command(VerbosityCli().set)
+    main_func.add_command(AgentCli().agent)
 
 if __name__ == '__main__':
 

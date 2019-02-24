@@ -26,6 +26,7 @@
 #include "fboss/agent/packet/IPv6Hdr.h"
 #include "fboss/agent/packet/NDP.h"
 #include "fboss/agent/packet/PktUtil.h"
+#include "fboss/agent/state/AggregatePort.h"
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/InterfaceMap.h"
 #include "fboss/agent/state/NdpResponseTable.h"
@@ -48,24 +49,26 @@ using std::shared_ptr;
 
 namespace facebook { namespace fboss {
 
-template<typename BodyFn>
-std::unique_ptr<TxPacket> createICMPv6Pkt(SwSwitch* sw,
-                                          folly::MacAddress dstMac,
-                                          folly::MacAddress srcMac,
-                                          VlanID vlan,
-                                          folly::IPAddressV6& dstIP,
-                                          folly::IPAddressV6& srcIP,
-                                          ICMPv6Type icmp6Type,
-                                          ICMPv6Code icmp6Code,
-                                          uint32_t bodyLength,
-                                          BodyFn serializeBody) {
+template <typename BodyFn>
+std::unique_ptr<TxPacket> createICMPv6Pkt(
+    SwSwitch* sw,
+    folly::MacAddress dstMac,
+    folly::MacAddress srcMac,
+    VlanID vlan,
+    const folly::IPAddressV6& dstIP,
+    const folly::IPAddressV6& srcIP,
+    ICMPv6Type icmp6Type,
+    ICMPv6Code icmp6Code,
+    uint32_t bodyLength,
+    BodyFn serializeBody) {
   IPv6Hdr ipv6(srcIP, dstIP);
   ipv6.trafficClass = 0xe0; // CS7 precedence (network control)
   ipv6.payloadLength = ICMPHdr::SIZE + bodyLength;
-  ipv6.nextHeader = IP_PROTO_IPV6_ICMP;
+  ipv6.nextHeader = static_cast<uint8_t>(IP_PROTO::IP_PROTO_IPV6_ICMP);
   ipv6.hopLimit = 255;
 
-  ICMPHdr icmp6(icmp6Type, icmp6Code, 0);
+  ICMPHdr icmp6(
+      static_cast<uint8_t>(icmp6Type), static_cast<uint8_t>(icmp6Code), 0);
 
   uint32_t pktLen = icmp6.computeTotalLengthV6(bodyLength);
   auto pkt = sw->allocatePacket(pktLen);
@@ -139,13 +142,17 @@ void IPv6Handler::handlePacket(unique_ptr<RxPacket> pkt,
              << " dst: " << ipv6.dstAddr.str() << " (" << dst << ")"
              << " nextHeader: " << static_cast<int>(ipv6.nextHeader);
 
+  // Additional data (such as FCS) may be appended after the IP payload
+  auto payload = folly::IOBuf::wrapBuffer(cursor.data(), ipv6.payloadLength);
+  cursor.reset(payload.get());
+
   // retrieve the current switch state
   auto state = sw_->getState();
   PortID port = pkt->getSrcPort();
 
   // NOTE: DHCPv6 solicit packet from client has hoplimit set to 1,
   // we need to handle it before send the ICMPv6 TTL exceeded
-  if (ipv6.nextHeader == IP_PROTO_UDP) {
+  if (ipv6.nextHeader == static_cast<uint8_t>(IP_PROTO::IP_PROTO_UDP)) {
     UDPHeader udpHdr;
     Cursor udpCursor(cursor);
     udpHdr.parse(sw_, port, &udpCursor);
@@ -209,7 +216,7 @@ void IPv6Handler::handlePacket(unique_ptr<RxPacket> pkt,
       sw_->portStats(portID)->pktDropped();
       return;
     }
-    if (ipv6.nextHeader == IP_PROTO_IPV6_ICMP) {
+    if (ipv6.nextHeader == static_cast<uint8_t>(IP_PROTO::IP_PROTO_IPV6_ICMP)) {
       pkt = handleICMPv6Packet(std::move(pkt), dst, src, ipv6, cursor);
       if (pkt == nullptr) {
         // packet has been handled
@@ -251,20 +258,21 @@ unique_ptr<RxPacket> IPv6Handler::handleICMPv6Packet(
   }
 
   ICMPHeaders hdr{dst, src, &ipv6, &icmp6};
-  switch (icmp6.type) {
-    case ICMPV6_TYPE_NDP_ROUTER_SOLICITATION:
+  ICMPv6Type type = static_cast<ICMPv6Type>(icmp6.type);
+  switch (type) {
+    case ICMPv6Type::ICMPV6_TYPE_NDP_ROUTER_SOLICITATION:
       handleRouterSolicitation(std::move(pkt), hdr, cursor);
       return nullptr;
-    case ICMPV6_TYPE_NDP_ROUTER_ADVERTISEMENT:
+    case ICMPv6Type::ICMPV6_TYPE_NDP_ROUTER_ADVERTISEMENT:
       handleRouterAdvertisement(std::move(pkt), hdr, cursor);
       return nullptr;
-    case ICMPV6_TYPE_NDP_NEIGHBOR_SOLICITATION:
+    case ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_SOLICITATION:
       handleNeighborSolicitation(std::move(pkt), hdr, cursor);
       return nullptr;
-    case ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT:
+    case ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT:
       handleNeighborAdvertisement(std::move(pkt), hdr, cursor);
       return nullptr;
-    case ICMPV6_TYPE_NDP_REDIRECT_MESSAGE:
+    case ICMPv6Type::ICMPV6_TYPE_NDP_REDIRECT_MESSAGE:
       sw_->portStats(pkt)->ipv6NdpPkt();
       // TODO: Do we need to bother handling this yet?
       sw_->portStats(pkt)->pktDropped();
@@ -300,23 +308,15 @@ void IPv6Handler::handleRouterSolicitation(unique_ptr<RxPacket> pkt,
   }
 
   MacAddress dstMac = hdr.src;
-  while (cursor.totalLength() != 0) {
-    auto optionType = cursor.read<uint8_t>();
-    auto optionLength = cursor.read<uint8_t>();
-    if (optionType == NDPOptionType::SRC_LL_ADDRESS) {
-      // target mac address
-      if (optionLength != NDPOptionLength::SRC_LL_ADDRESS_IEEE802) {
-        XLOG(DBG3) << "bad option length "
-                   << static_cast<unsigned int>(optionLength)
-                   << " for source MAC address in IPv6 router solicitation";
-        sw_->portStats(pkt)->pktDropped();
-        return;
-      }
-      dstMac = PktUtil::readMac(&cursor);
-    } else {
-      // Unknown option.  Just skip over it.
-      cursor.skip(optionLength * 8);
+  try {
+    auto ndpOptions = NDPOptions(cursor);
+    if (ndpOptions.sourceLinkLayerAddress) {
+      dstMac = *ndpOptions.sourceLinkLayerAddress;
     }
+  } catch (const HdrParseError& e) {
+    XLOG(WARNING) << e.what();
+    sw_->portStats(pkt)->pktDropped();
+    return;
   }
 
   // Send the response
@@ -333,7 +333,7 @@ void IPv6Handler::handleRouterSolicitation(unique_ptr<RxPacket> pkt,
   RWPrivateCursor respCursor(resp->buf());
   IPv6RouteAdvertiser::createAdvertisementPacket(
     intf.get(), &respCursor, dstMac, dstIP);
-  sw_->sendPacketSwitched(std::move(resp));
+  sw_->sendPacketSwitchedAsync(std::move(resp));
 }
 
 void IPv6Handler::handleRouterAdvertisement(
@@ -385,29 +385,78 @@ void IPv6Handler::handleNeighborSolicitation(unique_ptr<RxPacket> pkt,
     return;
   }
 
-  auto updater = sw_->getNeighborUpdater();
-  auto type = ICMPV6_TYPE_NDP_NEIGHBOR_SOLICITATION;
-
-  // Check to see if this IP address is in our NDP response table.
-  auto entry = vlan->getNdpResponseTable()->getEntry(targetIP);
-  if (!entry) {
-    updater->receivedNdpNotMine(vlan->getID(), hdr.ipv6->srcAddr, hdr.src,
-                                PortDescriptor::fromRxPacket(*pkt.get()),
-                                type, 0);
+  // exctract NDP options to update cache only  with value of
+  // Source LinkLayer Address option, if present
+  NDPOptions ndpOptions;
+  try {
+    ndpOptions.tryParse(cursor);
+  } catch (const HdrParseError& e) {
+    XLOG(DBG6) << e.what();
+    sw_->portStats(pkt)->ipv6NdpBad();
     return;
   }
 
-  updater->receivedNdpMine(vlan->getID(), hdr.ipv6->srcAddr, hdr.src,
-                           PortDescriptor::fromRxPacket(*pkt.get()),
-                           type, 0);
+  auto updater = sw_->getNeighborUpdater();
+  auto type = ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_SOLICITATION;
 
+  if ((!ndpOptions.sourceLinkLayerAddress.hasValue() &&
+       hdr.ipv6->dstAddr.isMulticast()) ||
+      (ndpOptions.sourceLinkLayerAddress.hasValue() &&
+       hdr.ipv6->srcAddr.isZero())) {
+    /* rfc 4861 -  must not be included when the source IP address is the
+      unspecified address.  must be included in multicast solicitations a
+    */
+    XLOG(DBG6) << "bad IPv6 neighbor solicitation request:"
+               << " either multicast solicitation is missing source link layer"
+               << " option or notification has source link layer address but"
+               << " source is unspecified";
+    sw_->portStats(pkt)->ipv6NdpBad();
+    return;
+  }
+
+  if (!AggregatePort::isIngressValid(state, pkt)) {
+    XLOG(INFO) << "Dropping invalid NS ingressing on port " << pkt->getSrcPort()
+               << " on vlan " << vlan << " for " << targetIP;
+    return;
+  }
+
+  auto entry = vlan->getNdpResponseTable()->getEntry(targetIP);
+  if (ndpOptions.sourceLinkLayerAddress.hasValue()) {
+    /* rfc 4861 - if the source address is not the unspecified address and,
+    on link layers that have addresses, the solicitation includes a Source
+    Link-Layer Address option, then the recipient should create or update
+    the Neighbor Cache entry for the IP Source Address of the solicitation.
+    */
+    if (!entry) {
+      // if this IP address not is in NDP response table.
+      updater->receivedNdpNotMine(
+          vlan->getID(),
+          hdr.ipv6->srcAddr,
+          ndpOptions.sourceLinkLayerAddress.value(),
+          PortDescriptor::fromRxPacket(*pkt.get()),
+          type,
+          0);
+      return;
+    }
+
+    updater->receivedNdpMine(
+        vlan->getID(),
+        hdr.ipv6->srcAddr,
+        ndpOptions.sourceLinkLayerAddress.value(),
+        PortDescriptor::fromRxPacket(*pkt.get()),
+        type,
+        0);
+  }
   // TODO: It might be nice to support duplicate address detection, and track
   // whether our IP is tentative or not.
 
   // Send the response
-  sendNeighborAdvertisement(pkt->getSrcVlan(),
-                            entry.value().mac, targetIP,
-                            hdr.src, hdr.ipv6->srcAddr);
+  sendNeighborAdvertisement(
+      pkt->getSrcVlan(),
+      entry.value().mac,
+      targetIP,
+      hdr.src,
+      hdr.ipv6->srcAddr);
 }
 
 void IPv6Handler::handleNeighborAdvertisement(unique_ptr<RxPacket> pkt,
@@ -421,26 +470,16 @@ void IPv6Handler::handleNeighborAdvertisement(unique_ptr<RxPacket> pkt,
   auto flags = cursor.read<uint32_t>();
   IPAddressV6 targetIP = PktUtil::readIPv6(&cursor);
 
-  // Check for options fields.  The target MAC address may be specified here.
-  // If it isn't, we use the source MAC from the ethernet header.
   MacAddress targetMac = hdr.src;
-  while (cursor.totalLength() != 0) {
-    auto optionType = cursor.read<uint8_t>();
-    auto optionLength = cursor.read<uint8_t>();
-    if (optionType == NDPOptionType::TARGET_LL_ADDRESS) {
-      // target mac address
-      if (optionLength != NDPOptionLength::TARGET_LL_ADDRESS_IEEE802) {
-        XLOG(DBG3) << "bad option length "
-                   << static_cast<unsigned int>(optionLength)
-                   << " for target MAC address in IPv6 neighbor advertisement";
-        sw_->portStats(pkt)->pktDropped();
-        return;
-      }
-      targetMac = PktUtil::readMac(&cursor);
-    } else {
-      // Unknown option.  Just skip over it.
-      cursor.skip(optionLength * 8);
+  try {
+    auto ndpOptions = NDPOptions(cursor);
+    if (ndpOptions.targetLinkLayerAddress) {
+      targetMac = *ndpOptions.targetLinkLayerAddress;
     }
+  } catch (const HdrParseError& e) {
+    XLOG(DBG3) << e.what();
+    sw_->portStats(pkt)->ipv6NdpBad();
+    return;
   }
 
   if (targetMac.isMulticast() || targetMac.isBroadcast()) {
@@ -463,7 +502,7 @@ void IPv6Handler::handleNeighborAdvertisement(unique_ptr<RxPacket> pkt,
              << targetMac << ")";
 
   auto updater = sw_->getNeighborUpdater();
-  auto type = ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT;
+  auto type = ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT;
 
   // Check to see if this IP address is in our NDP response table.
   auto entry = vlan->getNdpResponseTable()->getEntry(hdr.ipv6->dstAddr);
@@ -487,33 +526,43 @@ void IPv6Handler::sendICMPv6TimeExceeded(VlanID srcVlan,
                               folly::io::Cursor cursor) {
   auto state = sw_->getState();
 
-  // payload serialization function
-  // 4 bytes unused + ipv6 header + as much payload as possible to fit MTU
-  // this is upper limit of bodyLength
-  uint32_t bodyLengthLimit = IPV6_MIN_MTU - ICMPHdr::computeTotalLengthV6(0);
-  // this is when we add the whole input L3 packet
-  uint32_t fullPacketLength = ICMPHdr::ICMPV6_UNUSED_LEN + IPv6Hdr::SIZE
-                              + cursor.totalLength();
-  auto bodyLength = std::min(bodyLengthLimit, fullPacketLength);
+  /*
+   * The payload of ICMPv6TimeExceeded consists of:
+   *  - The unused field of the ICMP header;
+   *  - The original IPv6 header and its payload.
+   */
+  uint32_t icmpPayloadLength =
+      ICMPHdr::ICMPV6_UNUSED_LEN + IPv6Hdr::SIZE + cursor.totalLength();
+  // This payload and the IPv6/ICMPv6 headers must fit the IPv6 MTU
+  icmpPayloadLength =
+      std::min(icmpPayloadLength, IPV6_MIN_MTU - IPv6Hdr::SIZE - ICMPHdr::SIZE);
+
   auto serializeBody = [&](RWPrivateCursor* sendCursor) {
+    // ICMPv6 unused field
     sendCursor->writeBE<uint32_t>(0);
     v6Hdr.serialize(sendCursor);
-    auto remainingLength = bodyLength - IPv6Hdr::SIZE -
-                           ICMPHdr::ICMPV6_UNUSED_LEN;
+    auto remainingLength =
+        icmpPayloadLength - ICMPHdr::ICMPV6_UNUSED_LEN - IPv6Hdr::SIZE;
     sendCursor->push(cursor, remainingLength);
   };
 
   IPAddressV6 srcIp = getSwitchVlanIPv6(state, srcVlan);
-  auto icmpPkt = createICMPv6Pkt(sw_, dst, src, srcVlan,
-                             v6Hdr.srcAddr, srcIp,
-                             ICMPV6_TYPE_TIME_EXCEEDED,
-                             ICMPV6_CODE_TIME_EXCEEDED_HOPLIMIT_EXCEEDED,
-                             bodyLength, serializeBody);
+  auto icmpPkt = createICMPv6Pkt(
+      sw_,
+      dst,
+      src,
+      srcVlan,
+      v6Hdr.srcAddr,
+      srcIp,
+      ICMPv6Type::ICMPV6_TYPE_TIME_EXCEEDED,
+      ICMPv6Code::ICMPV6_CODE_TIME_EXCEEDED_HOPLIMIT_EXCEEDED,
+      icmpPayloadLength,
+      serializeBody);
   XLOG(DBG4) << "sending ICMPv6 Time Exceeded with srcMac  " << src
              << " dstMac: " << dst << " vlan: " << srcVlan
              << " dstIp: " << v6Hdr.srcAddr.str() << " srcIP: " << srcIp.str()
-             << " bodyLength: " << bodyLength;
-  sw_->sendPacketSwitched(std::move(icmpPkt));
+             << " bodyLength: " << icmpPayloadLength;
+  sw_->sendPacketSwitchedAsync(std::move(icmpPkt));
 }
 
 void IPv6Handler::sendICMPv6PacketTooBig(
@@ -546,8 +595,8 @@ void IPv6Handler::sendICMPv6PacketTooBig(
   IPAddressV6 srcIp = getSwitchVlanIPv6(state, srcVlan);
   auto icmpPkt = createICMPv6Pkt(sw_, dst, src, srcVlan,
                              v6Hdr.srcAddr, srcIp,
-                             ICMPV6_TYPE_PACKET_TOO_BIG,
-                             ICMPV6_CODE_PACKET_TOO_BIG,
+                             ICMPv6Type::ICMPV6_TYPE_PACKET_TOO_BIG,
+                             ICMPv6Code::ICMPV6_CODE_PACKET_TOO_BIG,
                              bodyLength, serializeBody);
 
   XLOG(DBG4) << "sending ICMPv6 Packet Too Big with srcMac  " << src
@@ -556,7 +605,7 @@ void IPv6Handler::sendICMPv6PacketTooBig(
           << " dstIp: " << v6Hdr.srcAddr.str()
           << " srcIP: " << srcIp.str()
           << " bodyLength: " << bodyLength;
-  sw_->sendPacketSwitched(std::move(icmpPkt));
+  sw_->sendPacketSwitchedAsync(std::move(icmpPkt));
   sw_->portStats(srcPort)->pktTooBig();
 }
 
@@ -580,45 +629,67 @@ bool IPv6Handler::checkNdpPacket(const ICMPHeaders& hdr,
   return true;
 }
 
-void IPv6Handler::sendNeighborSolicitation(SwSwitch* sw,
-                                           const IPAddressV6& targetIP,
-                                           const MacAddress& srcMac,
-                                           const VlanID vlanID) {
-  uint32_t bodyLength = 4 + 16 + 8;
-
-  auto serializeBody = [&](RWPrivateCursor* cursor) {
-    cursor->writeBE<uint32_t>(0); // reserved
-    cursor->push(targetIP.bytes(), 16);
-    cursor->write<uint8_t>(1); // Source link layer address option
-    cursor->write<uint8_t>(1); // Option l5ength = 1 (x8)
-    cursor->push(srcMac.bytes(), MacAddress::SIZE);
-  };
-
+void IPv6Handler::sendMulticastNeighborSolicitation(
+    SwSwitch* sw,
+    const IPAddressV6& targetIP,
+    const MacAddress& srcMac,
+    const VlanID& vlanID) {
   IPAddressV6 solicitedNodeAddr = targetIP.getSolicitedNodeAddress();
   MacAddress dstMac = MacAddress::createMulticast(solicitedNodeAddr);
   // For now, we always use our link local IP as the source.
   IPAddressV6 srcIP(IPAddressV6::LINK_LOCAL, srcMac);
-  auto pkt = createICMPv6Pkt(sw, dstMac, srcMac, vlanID,
-                             solicitedNodeAddr, srcIP,
-                             ICMPV6_TYPE_NDP_NEIGHBOR_SOLICITATION,
-                             ICMPV6_CODE_NDP_MESSAGE_CODE,
-                             bodyLength, serializeBody);
+
+  NDPOptions ndpOptions;
+  ndpOptions.sourceLinkLayerAddress.emplace(srcMac);
 
   XLOG(DBG4) << "sending neighbor solicitation for " << targetIP << " on vlan "
              << vlanID;
-  sw->sendPacketSwitched(std::move(pkt));
+
+  sendNeighborSolicitation(
+      sw,
+      solicitedNodeAddr,
+      dstMac,
+      srcIP,
+      srcMac,
+      targetIP,
+      vlanID,
+      folly::Optional<PortDescriptor>(),
+      ndpOptions);
 }
 
-void IPv6Handler::sendNeighborSolicitation(SwSwitch* sw,
-                                           const IPAddressV6& targetIP,
-                                           const shared_ptr<Vlan>& vlan) {
+/* unicast neighbor solicitation */
+void IPv6Handler::sendUnicastNeighborSolicitation(
+    SwSwitch* sw,
+    const folly::IPAddressV6& targetIP,
+    const folly::MacAddress& targetMac,
+    const folly::IPAddressV6& srcIP,
+    const folly::MacAddress& srcMac,
+    const VlanID& vlanID,
+    const folly::Optional<PortDescriptor>& portDescriptor) {
   auto state = sw->getState();
-  auto intfID = vlan->getInterfaceID();
-
-  if (!Interface::isIpAttached(targetIP, intfID, state)) {
-    XLOG(DBG0) << "Cannot reach " << targetIP << " on interface " << intfID;
+  auto vlan = state->getVlans()->getVlanIf(vlanID);
+  if (!Interface::isIpAttached(targetIP, vlan->getInterfaceID(), state)) {
+    XLOG(DBG2) << "unicast neighbor solicitation not sent, neighbor address: "
+               << targetIP << ", is not in the subnets of interface: "
+               << vlan->getInterfaceID() << " for vlan:" << vlanID;
     return;
   }
+
+  XLOG(DBG4) << "sending unicast neighbor solicitation to " << targetIP << "("
+             << targetMac << ")"
+             << " on vlan " << vlanID << " from " << srcIP << "(" << srcMac
+             << ")";
+
+  return sendNeighborSolicitation(
+      sw, targetIP, targetMac, srcIP, srcMac, targetIP, vlanID, portDescriptor);
+}
+
+void IPv6Handler::sendMulticastNeighborSolicitation(
+    SwSwitch* sw,
+    const IPAddressV6& targetIP,
+    const shared_ptr<Vlan>& vlan) {
+  auto state = sw->getState();
+  auto intfID = vlan->getInterfaceID();
 
   auto intf = state->getInterfaces()->getInterfaceIf(intfID);
   if (!intf) {
@@ -626,7 +697,8 @@ void IPv6Handler::sendNeighborSolicitation(SwSwitch* sw,
     return;
   }
 
-  sendNeighborSolicitation(sw, targetIP, intf->getMac(), vlan->getID());
+  sendMulticastNeighborSolicitation(
+      sw, targetIP, intf->getMac(), vlan->getID());
 }
 
 void IPv6Handler::resolveDestAndHandlePacket(
@@ -690,7 +762,7 @@ void IPv6Handler::resolveDestAndHandlePacket(
           auto entry = vlan->getNdpTable()->getEntryIf(target);
           if (nullptr == entry) {
             // No entry in NDP table, create a neighbor solicitation packet
-            sendNeighborSolicitation(
+            sendMulticastNeighborSolicitation(
                 sw_, target, intf->getMac(), vlan->getID());
             // Notify the updater that we sent a solicitation out
             sw_->getNeighborUpdater()->sentNeighborSolicitation(vlanID, target);
@@ -707,8 +779,9 @@ void IPv6Handler::resolveDestAndHandlePacket(
   sw_->portStats(pkt)->pktDropped();
 } // namespace fboss
 
-void IPv6Handler::sendNeighborSolicitations(
-    PortID ingressPort, const folly::IPAddressV6& targetIP) {
+void IPv6Handler::sendMulticastNeighborSolicitations(
+    PortID ingressPort,
+    const folly::IPAddressV6& targetIP) {
   // Don't send solicitations for multicast or broadcast addresses.
   if (targetIP.isMulticast() || targetIP.isLinkLocalBroadcast()) {
     return;
@@ -747,7 +820,8 @@ void IPv6Handler::sendNeighborSolicitations(
         auto entry = vlan->getNdpTable()->getEntryIf(target);
         if (entry == nullptr) {
           // No entry in NDP table, create a neighbor solicitation packet
-          sendNeighborSolicitation(sw_, target, intf->getMac(), vlan->getID());
+          sendMulticastNeighborSolicitation(
+              sw_, target, intf->getMac(), vlan->getID());
 
           // Notify the updater that we sent a solicitation out
           sw_->getNeighborUpdater()->sentNeighborSolicitation(vlanID, target);
@@ -781,29 +855,76 @@ void IPv6Handler::sendNeighborAdvertisement(VlanID vlan,
   XLOG(DBG4) << "sending neighbor advertisement to " << dstIP.str() << " ("
              << dstMac << "): for " << srcIP << " (" << srcMac << ")";
 
-  uint32_t flags = 0xa0000000; // router, override
+  uint32_t flags =
+      NeighborAdvertisementFlags::ROUTER | NeighborAdvertisementFlags::OVERRIDE;
   if (dstIP.isZero()) {
     // TODO: add a constructor that doesn't require string processing
     dstIP = IPAddressV6("ff01::1");
   } else {
-    // Set the solicited flag
-    flags |= 0x40000000;
+    flags |= NeighborAdvertisementFlags::SOLICITED;
   }
 
-  uint32_t bodyLength = 4 + 16 + 8;
+  NDPOptions ndpOptions;
+  ndpOptions.targetLinkLayerAddress.emplace(srcMac);
+
+  uint32_t bodyLength = ICMPHdr::ICMPV6_UNUSED_LEN + IPAddressV6::byteCount() +
+      ndpOptions.computeTotalLength();
+
   auto serializeBody = [&](RWPrivateCursor* cursor) {
     cursor->writeBE<uint32_t>(flags);
     cursor->push(srcIP.bytes(), IPAddressV6::byteCount());
-    cursor->write<uint8_t>(NDPOptionType::TARGET_LL_ADDRESS);
-    cursor->write<uint8_t>(NDPOptionLength::TARGET_LL_ADDRESS_IEEE802);
-    cursor->push(srcMac.bytes(), MacAddress::SIZE);
+    ndpOptions.serialize(cursor);
   };
 
   auto pkt = createICMPv6Pkt(sw_, dstMac, srcMac, vlan, dstIP, srcIP,
-                             ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT,
-                             ICMPV6_CODE_NDP_MESSAGE_CODE,
+                             ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT,
+                             ICMPv6Code::ICMPV6_CODE_NDP_MESSAGE_CODE,
                              bodyLength, serializeBody);
-  sw_->sendPacketSwitched(std::move(pkt));
+  sw_->sendPacketSwitchedAsync(std::move(pkt));
 }
 
+void IPv6Handler::sendNeighborSolicitation(
+    SwSwitch* sw,
+    const folly::IPAddressV6& dstIP,
+    const folly::MacAddress& dstMac,
+    const folly::IPAddressV6& srcIP,
+    const folly::MacAddress& srcMac,
+    const folly::IPAddressV6& neighborIP,
+    const VlanID& vlanID,
+    const folly::Optional<PortDescriptor>& portDescriptor,
+    const NDPOptions& ndpOptions) {
+  auto state = sw->getState();
+
+  uint32_t bodyLength = ICMPHdr::ICMPV6_UNUSED_LEN + IPAddressV6::byteCount() +
+      ndpOptions.computeTotalLength();
+
+  auto serializeBody = [&](RWPrivateCursor* cursor) {
+    cursor->writeBE<uint32_t>(0); // reserved
+    cursor->push(neighborIP.bytes(), IPAddressV6::byteCount());
+    ndpOptions.serialize(cursor);
+  };
+
+  auto pkt = createICMPv6Pkt(
+      sw,
+      dstMac,
+      srcMac,
+      vlanID,
+      dstIP,
+      srcIP,
+      ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_SOLICITATION,
+      ICMPv6Code::ICMPV6_CODE_NDP_MESSAGE_CODE,
+      bodyLength,
+      serializeBody);
+
+  if (portDescriptor.hasValue()) {
+    auto port = portDescriptor.value();
+    if (port.isPhysicalPort()) {
+      sw->sendPacketOutOfPortAsync(std::move(pkt), port.phyPortID());
+    } else {
+      sw->sendPacketOutOfPortAsync(std::move(pkt), port.aggPortID());
+    }
+  } else {
+    sw->sendPacketSwitchedAsync(std::move(pkt));
+  }
+}
 }} // facebook::fboss

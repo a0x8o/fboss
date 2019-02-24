@@ -8,19 +8,37 @@
  *
  */
 #include "fboss/agent/hw/bcm/BcmPortQueueManager.h"
+
+#include "fboss/agent/hw/bcm/BcmPlatform.h"
 #include "fboss/agent/hw/bcm/BcmStatsConstants.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
+
+#include "folly/logging/xlog.h"
 
 namespace facebook { namespace fboss {
 const std::vector<BcmCosQueueCounterType>&
 BcmPortQueueManager::getQueueCounterTypes() const {
   static const std::vector<BcmCosQueueCounterType> types = {
-    {cfg::StreamType::UNICAST, BcmCosQueueStatType::DROPPED_BYTES,
-     BcmCosQueueCounterScope::QUEUES, kOutCongestionDiscards()},
-    {cfg::StreamType::UNICAST, BcmCosQueueStatType::OUT_BYTES,
-     BcmCosQueueCounterScope::QUEUES, kOutBytes()},
-    {cfg::StreamType::UNICAST, BcmCosQueueStatType::DROPPED_PACKETS,
-     BcmCosQueueCounterScope::AGGREGATED, kOutCongestionDiscards()}
+      {cfg::StreamType::UNICAST,
+       BcmCosQueueStatType::DROPPED_PACKETS,
+       BcmCosQueueCounterScope::QUEUES,
+       kOutCongestionDiscards()},
+      {cfg::StreamType::UNICAST,
+       BcmCosQueueStatType::DROPPED_BYTES,
+       BcmCosQueueCounterScope::QUEUES,
+       kOutCongestionDiscardsBytes()},
+      {cfg::StreamType::UNICAST,
+       BcmCosQueueStatType::OUT_BYTES,
+       BcmCosQueueCounterScope::QUEUES,
+       kOutBytes()},
+      {cfg::StreamType::UNICAST,
+       BcmCosQueueStatType::DROPPED_PACKETS,
+       BcmCosQueueCounterScope::AGGREGATED,
+       kOutCongestionDiscards()},
+      {cfg::StreamType::UNICAST,
+       BcmCosQueueStatType::DROPPED_BYTES,
+       BcmCosQueueCounterScope::AGGREGATED,
+       kOutCongestionDiscardsBytes()},
   };
   return types;
 }
@@ -81,4 +99,8 @@ BcmPortQueueConfig BcmPortQueueManager::getCurrentQueueSettings() const {
                             std::move(multicastQueues));
 }
 
+const PortQueue& BcmPortQueueManager::getDefaultQueueSettings(
+    cfg::StreamType streamType) const {
+  return hw_->getPlatform()->getDefaultPortQueueSettings(streamType);
+}
 }} // facebook::fboss

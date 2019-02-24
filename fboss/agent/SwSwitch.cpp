@@ -28,6 +28,7 @@
 #include <exception>
 #include <tuple>
 #include "common/stats/ServiceData.h"
+#include "fboss/agent/AgentConfig.h"
 #include "fboss/agent/ApplyThriftConfig.h"
 #include "fboss/agent/ArpHandler.h"
 #include "fboss/agent/Constants.h"
@@ -38,9 +39,9 @@
 #include "fboss/agent/LacpTypes.h"
 #include "fboss/agent/LinkAggregationManager.h"
 #include "fboss/agent/LldpManager.h"
+#include "fboss/agent/MirrorManager.h"
 #include "fboss/agent/NeighborUpdater.h"
 #include "fboss/agent/Platform.h"
-#include "fboss/agent/PortRemediator.h"
 #include "fboss/agent/PortStats.h"
 #include "fboss/agent/PortUpdateHandler.h"
 #include "fboss/agent/RouteUpdateLogger.h"
@@ -49,6 +50,7 @@
 #include "fboss/agent/ThriftHandler.h"
 #include "fboss/agent/TunManager.h"
 #include "fboss/agent/TxPacket.h"
+#include "fboss/agent/AlpmUtils.h"
 #include "fboss/agent/Utils.h"
 #include "fboss/agent/capture/PktCaptureManager.h"
 #include "fboss/agent/gen-cpp2/switch_config_types_custom_protocol.h"
@@ -57,7 +59,6 @@
 #include "fboss/agent/packet/IPv6Hdr.h"
 #include "fboss/agent/packet/PktUtil.h"
 #include "fboss/agent/state/AggregatePort.h"
-#include "fboss/agent/state/RouteUpdater.h"
 #include "fboss/agent/state/StateDelta.h"
 #include "fboss/agent/state/StateUpdateHelpers.h"
 #include "fboss/agent/state/SwitchState.h"
@@ -86,7 +87,6 @@ using namespace apache::thrift::protocol;
 using namespace apache::thrift::async;
 
 
-DEFINE_string(config, "", "The path to the local JSON configuration file");
 DEFINE_int32(thread_heartbeat_ms, 1000, "Thread heartbeat interval (ms)");
 DEFINE_int32(
     distribution_timeout_ms,
@@ -129,9 +129,10 @@ facebook::fboss::PortStatus fillInPortStatus(
   status.speedMbps = static_cast<int>(port.getSpeed());
 
   try {
-    status.transceiverIdx = sw->getPlatform()->getPortMapping(port.getID());
+    status.transceiverIdx_ref().value_unchecked() =
+        sw->getPlatform()->getPortMapping(port.getID());
     status.__isset.transceiverIdx =
-      status.transceiverIdx.__isset.transceiverId;
+        status.transceiverIdx_ref().value_unchecked().__isset.transceiverId;
   } catch (const facebook::fboss::FbossError& err) {
     // No problem, we just don't set the other info
   }
@@ -155,17 +156,17 @@ class ChannelCloser : public CloseCallback {
 };
 
 SwSwitch::SwSwitch(std::unique_ptr<Platform> platform)
-  : hw_(platform->getHwSwitch()),
-    platform_(std::move(platform)),
-    portRemediator_(new PortRemediator(this)),
-    closer_(new ChannelCloser(this)),
-    arp_(new ArpHandler(this)),
-    ipv4_(new IPv4Handler(this)),
-    ipv6_(new IPv6Handler(this)),
-    nUpdater_(new NeighborUpdater(this)),
-    pcapMgr_(new PktCaptureManager(this)),
-    routeUpdateLogger_(new RouteUpdateLogger(this)),
-    portUpdateHandler_(new PortUpdateHandler(this)) {
+    : hw_(platform->getHwSwitch()),
+      platform_(std::move(platform)),
+      closer_(new ChannelCloser(this)),
+      arp_(new ArpHandler(this)),
+      ipv4_(new IPv4Handler(this)),
+      ipv6_(new IPv6Handler(this)),
+      nUpdater_(new NeighborUpdater(this)),
+      pcapMgr_(new PktCaptureManager(this)),
+      mirrorManager_(new MirrorManager(this)),
+      routeUpdateLogger_(new RouteUpdateLogger(this)),
+      portUpdateHandler_(new PortUpdateHandler(this)) {
   // Create the platform-specific state directories if they
   // don't exist already.
   utilCreateDir(platform_->getVolatileStateDir());
@@ -229,8 +230,6 @@ void SwSwitch::stop() {
   // this is not the case for ipv6_ and tunMgr_, which may be accessed in a
   // packet handling callback as well while stopping the switch.
   //
-  portRemediator_.reset();
-
   nUpdater_.reset();
 
   if (lldpManager_) {
@@ -244,7 +243,7 @@ void SwSwitch::stop() {
   // Need to destroy IPv6Handler as it is a state observer,
   // but we must do it after we've stopped TunManager.
   // Otherwise, we might attempt to call sendL3Packet which
-  // calls ipv6_->sendNeighborSolicitaion which will then segfault
+  // calls ipv6_->sendNeighborSolicitation which will then segfault
   ipv6_.reset();
 
   routeUpdateLogger_.reset();
@@ -293,7 +292,7 @@ void SwSwitch::setSwitchRunState(SwitchRunState runState) {
   logSwitchRunStateChange(oldState, runState);
 }
 
-SwSwitch::SwitchRunState SwSwitch::getSwitchRunState() const {
+SwitchRunState SwSwitch::getSwitchRunState() const {
   return runState_.load(std::memory_order_acquire);
 }
 
@@ -444,29 +443,14 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
         StateDelta(std::make_shared<SwitchState>(), initialStateDesired));
   });
 
-  // In ALPM mode we need to make sure that the first route added is
-  // the default route and that the route table always contains a default
-  // route
-  RouteUpdater updater(initialStateDesired->getRouteTables());
-  updater.addRoute(RouterID(0), folly::IPAddressV4("0.0.0.0"), 0,
-      StdClientIds2ClientID(StdClientIds::STATIC_INTERNAL),
-      RouteNextHopEntry(RouteForwardAction::DROP,
-        AdminDistance::MAX_ADMIN_DISTANCE));
-  updater.addRoute(RouterID(0), folly::IPAddressV6("::"), 0,
-      StdClientIds2ClientID(StdClientIds::STATIC_INTERNAL),
-      RouteNextHopEntry(RouteForwardAction::DROP,
-        AdminDistance::MAX_ADMIN_DISTANCE));
-  auto newRt = updater.updateDone();
-  if (newRt) {
-    // If null default routes from above got added,
+  auto alpmInitState = setupAlpmState(initialStateDesired);
+  if (alpmInitState) {
+    // If setupAlpmInitState caused a new switchState to get
+    // generated, applyIt
     // send a state update to h/w
-    auto newState = initialStateDesired->clone();
-    newState->resetRouteTables(std::move(newRt));
-    newState->publish();
-
     updateEventBase_.runInEventBaseThread(
-        [newState, initialStateDesired, this]() {
-          applyUpdate(initialStateDesired, newState);
+        [alpmInitState, initialStateDesired, this]() {
+          applyUpdate(initialStateDesired, alpmInitState);
         });
   }
 
@@ -546,8 +530,6 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
         stats()->neighborCacheEventBacklog(backlog);
       });
 
-  portRemediator_->init();
-
   setSwitchRunState(SwitchRunState::INITIALIZED);
 
   constructPushClient(pcap_pubsub_constants::PCAP_PUBSUB_PORT());
@@ -556,6 +538,8 @@ void SwSwitch::init(std::unique_ptr<TunManager> tunMgr, SwitchFlags flags) {
 void SwSwitch::initialConfigApplied(const steady_clock::time_point& startTime) {
   // notify the hw
   hw_->initialConfigApplied();
+  platform_->onInitialConfigApplied(this);
+
   setSwitchRunState(SwitchRunState::CONFIGURED);
 
   if (tunMgr_) {
@@ -843,49 +827,6 @@ void SwSwitch::handlePendingUpdates() {
     updates.pop_front();
     update->onSuccess();
   }
-}
-
-int SwSwitch::getHighresSamplers(HighresSamplerList* samplers,
-                                 const set<CounterRequest>& counters) {
-  int numCountersAdded = 0;
-
-  // Group the counters by namespace to make it easier to get samplers
-  map<string, set<CounterRequest>> groupedCounters;
-  for (const auto& c : counters) {
-    groupedCounters[c.namespaceName].insert(c);
-  }
-
-  for (const auto& namespaceGroup : groupedCounters) {
-    const auto& namespaceString = namespaceGroup.first;
-    const auto& counterSet = namespaceGroup.second;
-    unique_ptr<HighresSampler> sampler;
-
-    // Check for cross-platform samplers
-    if (namespaceString == DumbCounterSampler::kIdentifier) {
-      sampler = make_unique<DumbCounterSampler>(counterSet);
-    } else if (namespaceString == InterfaceRateSampler::kIdentifier) {
-      sampler = make_unique<InterfaceRateSampler>(counterSet);
-    }
-
-    if (sampler) {
-      if (sampler->numCounters() > 0) {
-        numCountersAdded += sampler->numCounters();
-        samplers->push_back(std::move(sampler));
-      } else {
-        XLOG(WARNING) << "Cannot use " << namespaceString;
-      }
-    } else {
-      // Otherwise, check if the hwSwitch knows which samplers to add
-      auto n = hw_->getHighresSamplers(samplers, namespaceString, counterSet);
-      if (n > 0) {
-        numCountersAdded += n;
-      } else {
-        XLOG(WARNING) << "No counters added for namespace: " << namespaceString;
-      }
-    }
-  }
-
-  return numCountersAdded;
 }
 
 void SwSwitch::setStateInternal(
@@ -1252,8 +1193,9 @@ std::unique_ptr<TxPacket> SwSwitch::allocateL3TxPacket(uint32_t l3Len) {
   return pkt;
 }
 
-void SwSwitch::sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
-                                   PortID portID) noexcept {
+void SwSwitch::sendPacketOutOfPortAsync(std::unique_ptr<TxPacket> pkt,
+                                        PortID portID,
+                                        folly::Optional<uint8_t> cos) noexcept {
   pcapMgr_->packetSent(pkt.get());
 
   Cursor c(pkt->buf());
@@ -1271,7 +1213,7 @@ void SwSwitch::sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
     publishTxPacket(pkt.get(), ethertype);
   }
 
-  if (!hw_->sendPacketOutOfPort(std::move(pkt), portID)) {
+  if (!hw_->sendPacketOutOfPortAsync(std::move(pkt), portID, cos)) {
     // Just log an error for now.  There's not much the caller can do about
     // send failures--even on successful return from sendPacket*() the
     // send may ultimately fail since it occurs asynchronously in the
@@ -1280,7 +1222,7 @@ void SwSwitch::sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
   }
 }
 
-void SwSwitch::sendPacketOutOfPort(
+void SwSwitch::sendPacketOutOfPortAsync(
     std::unique_ptr<TxPacket> pkt,
     AggregatePortID aggPortID) noexcept {
   auto aggPort = getState()->getAggregatePorts()->getAggregatePortIf(aggPortID);
@@ -1313,7 +1255,7 @@ void SwSwitch::sendPacketOutOfPort(
   for (auto elem : subportAndFwdStates) {
     std::tie(subport, fwdState) = elem;
     if (fwdState == AggregatePort::Forwarding::ENABLED) {
-      sendPacketOutOfPort(std::move(pkt), subport);
+      sendPacketOutOfPortAsync(std::move(pkt), subport);
       return;
     }
   }
@@ -1321,12 +1263,12 @@ void SwSwitch::sendPacketOutOfPort(
              << ": aggregate port has no enabled physical ports";
 }
 
-void SwSwitch::sendPacketSwitched(std::unique_ptr<TxPacket> pkt) noexcept {
+void SwSwitch::sendPacketSwitchedAsync(std::unique_ptr<TxPacket> pkt) noexcept {
   pcapMgr_->packetSent(pkt.get());
-  if (!hw_->sendPacketSwitched(std::move(pkt))) {
+  if (!hw_->sendPacketSwitchedAsync(std::move(pkt))) {
     // Just log an error for now.  There's not much the caller can do about
-    // send failures--even on successful return from sendPacketSwitched() the
-    // send may ultimately fail since it occurs asynchronously in the
+    // send failures--even on successful return from sendPacketSwitchedAsync()
+    // the send may ultimately fail since it occurs asynchronously in the
     // background.
     XLOG(ERR) << "failed to send L2 switched packet";
   }
@@ -1435,7 +1377,7 @@ void SwSwitch::sendL3Packet(
         } catch (...) {
           // We don't have dstAddr in our NDP table. Request solicitation for
           // it and let this packet be dropped.
-          IPv6Handler::sendNeighborSolicitation(
+          IPv6Handler::sendMulticastNeighborSolicitation(
               this, dstAddrV6, srcMac, vlanID);
           throw;
         } // try
@@ -1451,7 +1393,7 @@ void SwSwitch::sendL3Packet(
       // will do the RIB lookup and then probe for any unresolved nexthops
       // of the route.
       if (dstAddr.isV6()) {
-        ipv6_->sendNeighborSolicitations(PortID(0), dstAddr.asV6());
+        ipv6_->sendMulticastNeighborSolicitations(PortID(0), dstAddr.asV6());
       } else {
         ipv4_->resolveMac(state.get(), PortID(0), dstAddr.asV4());
       }
@@ -1470,7 +1412,7 @@ void SwSwitch::sendL3Packet(
     // the packet out to the HW. The HW will drop the packet if the vlan is
     // deleted.
     stats()->pktFromHost(l3Len);
-    sendPacketSwitched(std::move(pkt));
+    sendPacketSwitchedAsync(std::move(pkt));
   } catch (const std::exception& ex) {
     XLOG(ERR) << "Failed to send out L3 packet :" << folly::exceptionStr(ex);
   }
@@ -1486,35 +1428,38 @@ bool SwSwitch::sendPacketToHost(
   }
 }
 
-void SwSwitch::applyConfig(const std::string& reason) {
+void SwSwitch::applyConfig(const std::string& reason, bool reload) {
   // We don't need to hold a lock here. updateStateBlocking() does that for us.
   updateStateBlocking(
       reason,
       [&](const shared_ptr<SwitchState>& state) -> shared_ptr<SwitchState> {
-        std::string configFilename = FLAGS_config;
-        std::pair<shared_ptr<SwitchState>, std::string> rval;
-        if (!configFilename.empty()) {
-          XLOG(INFO) << "Loading config from local config file "
-                     << configFilename;
-          rval = applyThriftConfigFile(state, configFilename, platform_.get(),
-              &curConfig_);
-        } else {
-          // Loading config from default location. The message will be printed
-          // there.
-          rval = applyThriftConfigDefault(state, platform_.get(),
-              &curConfig_);
+        auto target = reload ? platform_->reloadConfig() : platform_->config();
+
+        const auto& newConfig = target->thrift.sw;
+        auto newState =
+          applyThriftConfig(state, &newConfig, platform_.get(), &curConfig_);
+
+        if (!newState) {
+          // if config is not updated, the new state will return null
+          // in such a case return here, to prevent possible crash.
+          XLOG(WARNING) << "Applying config did not cause state change";
+          return nullptr;
         }
-        if (!isValidStateUpdate(StateDelta(state, rval.first))) {
+
+        if (!isValidStateUpdate(StateDelta(state, newState))) {
           throw FbossError("Invalid config passed in, skipping");
         }
-        curConfigStr_ = rval.second;
-        apache::thrift::SimpleJSONSerializer::deserialize<cfg::SwitchConfig>(
-            curConfigStr_.c_str(), curConfig_);
 
-        // Set oper status of interfaces in SwitchState
-        auto& newState = rval.first;
-        for (auto const& port : *newState->getPorts()) {
-          port->setOperState(hw_->isPortUp(port->getID()));
+        curConfig_ = newConfig;
+        curConfigStr_ = target->swConfigRaw();
+        target->dumpConfig(platform_->getRunningConfigDumpFile());
+
+        // TODO(aeckert): this should be unneeded. Remove this
+        for (auto& port : *newState->getPorts()) {
+          if (!port->isPublished()) {
+            /* port has been changed */
+            port->setOperState(hw_->isPortUp(port->getID()));
+          }
         }
 
         return newState;
@@ -1527,21 +1472,8 @@ bool SwSwitch::isValidStateUpdate(
 }
 
 std::string SwSwitch::switchRunStateStr(
-  facebook::fboss::SwSwitch::SwitchRunState runState) const {
-  switch (runState) {
-    case facebook::fboss::SwSwitch::SwitchRunState::UNINITIALIZED:
-      return "UNINITIALIZED";
-    case facebook::fboss::SwSwitch::SwitchRunState::INITIALIZED:
-      return "INITIALIZED";
-    case facebook::fboss::SwSwitch::SwitchRunState::CONFIGURED:
-      return "CONFIGURED";
-    case facebook::fboss::SwSwitch::SwitchRunState::FIB_SYNCED:
-      return "FIB_SYNCED";
-    case facebook::fboss::SwSwitch::SwitchRunState::EXITING:
-      return "EXITING";
-    default:
-      return "Unknown";
-  }
+  facebook::fboss::SwitchRunState runState) const {
+  return _SwitchRunState_VALUES_TO_NAMES.find(runState)->second;
 }
 
 AdminDistance SwSwitch::clientIdToAdminDistance(int clientId) const {
@@ -1568,4 +1500,10 @@ AdminDistance SwSwitch::clientIdToAdminDistance(int clientId) const {
 
   return static_cast<AdminDistance>(distance->second);
 }
+
+void SwSwitch::clearPortStats(
+    const std::unique_ptr<std::vector<int32_t>>& ports) {
+  getHw()->clearPortStats(ports);
+}
+
 }} // facebook::fboss

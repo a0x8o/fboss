@@ -63,6 +63,7 @@ enum TransmitterTechnology {
   UNKNOWN = 0,
   COPPER = 1,
   OPTICAL = 2,
+  BACKPLANE = 3,
 }
 /*
  * QSFP and SFP units specify length as a byte;  a value of 255 indicates
@@ -139,6 +140,14 @@ struct TransceiverSettings {
   6: RateSelectSetting rateSelectSetting,
 }
 
+// maintained and populated by qsfp service
+struct TransceiverStats {
+  // duration between last read and last successful read
+  1: double readDownTime,
+  // duration between last write and last successful write
+  2: double writeDownTime,
+}
+
 struct TransceiverInfo {
   1: bool present,
   2: TransceiverType transceiver,
@@ -149,6 +158,7 @@ struct TransceiverInfo {
   10: optional Cable cable,
   12: list<Channel> channels,
   13: optional TransceiverSettings settings,
+  14: optional TransceiverStats stats,
 }
 
 typedef binary (cpp2.type = "folly::IOBuf") IOBuf

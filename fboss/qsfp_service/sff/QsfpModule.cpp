@@ -17,7 +17,6 @@
 #include "fboss/qsfp_service/sff/SffFieldInfo.h"
 #include "fboss/qsfp_service/StatsPublisher.h"
 #include "fboss/lib/usb/TransceiverI2CApi.h"
-#include "fboss/lib/usb/UsbError.h"
 
 #include <folly/io/IOBuf.h>
 #include <folly/logging/xlog.h>
@@ -34,6 +33,10 @@ DEFINE_int32(
     tx_enable_interval,
     300,
     "seconds between ensuring tx is enabled on down ports");
+DEFINE_int32(
+    reset_lpmode_interval,
+    300,
+    "seconds between flapping lpmode on down ports to try to recover");
 
 using std::memcpy;
 using std::mutex;
@@ -186,10 +189,12 @@ int QsfpModule::getQsfpDACGauge() const {
 bool QsfpModule::getSensorInfo(GlobalSensors& info) {
   info.temp.value = getQsfpSensor(SffField::TEMPERATURE,
                                   SffFieldInfo::getTemp);
-  info.temp.flags = getQsfpSensorFlags(SffField::TEMPERATURE_ALARMS);
+  info.temp.flags_ref().value_unchecked() =
+      getQsfpSensorFlags(SffField::TEMPERATURE_ALARMS);
   info.temp.__isset.flags = true;
   info.vcc.value = getQsfpSensor(SffField::VCC, SffFieldInfo::getVcc);
-  info.vcc.flags = getQsfpSensorFlags(SffField::VCC_ALARMS);
+  info.vcc.flags_ref().value_unchecked() =
+      getQsfpSensorFlags(SffField::VCC_ALARMS);
   info.vcc.__isset.flags = true;
   return true;
 }
@@ -208,16 +213,18 @@ void QsfpModule::getCableInfo(Cable &cable) {
   cable.transmitterTech = getQsfpTransmitterTechnology();
   cable.__isset.transmitterTech = true;
 
-  cable.singleMode = getQsfpCableLength(SffField::LENGTH_SM_KM);
-  cable.__isset.singleMode = (cable.singleMode != 0);
-  cable.om3 = getQsfpCableLength(SffField::LENGTH_OM3);
-  cable.__isset.om3 = (cable.om3 != 0);
-  cable.om2 = getQsfpCableLength(SffField::LENGTH_OM2);
-  cable.__isset.om2 = (cable.om2 != 0);
-  cable.om1 = getQsfpCableLength(SffField::LENGTH_OM1);
-  cable.__isset.om1 = (cable.om1 != 0);
-  cable.copper = getQsfpCableLength(SffField::LENGTH_COPPER);
-  cable.__isset.copper = (cable.copper != 0);
+  cable.singleMode_ref().value_unchecked() =
+      getQsfpCableLength(SffField::LENGTH_SM_KM);
+  cable.__isset.singleMode = (cable.singleMode_ref().value_unchecked() != 0);
+  cable.om3_ref().value_unchecked() = getQsfpCableLength(SffField::LENGTH_OM3);
+  cable.__isset.om3 = (cable.om3_ref().value_unchecked() != 0);
+  cable.om2_ref().value_unchecked() = getQsfpCableLength(SffField::LENGTH_OM2);
+  cable.__isset.om2 = (cable.om2_ref().value_unchecked() != 0);
+  cable.om1_ref().value_unchecked() = getQsfpCableLength(SffField::LENGTH_OM1);
+  cable.__isset.om1 = (cable.om1_ref().value_unchecked() != 0);
+  cable.copper_ref().value_unchecked() =
+      getQsfpCableLength(SffField::LENGTH_COPPER);
+  cable.__isset.copper = (cable.copper_ref().value_unchecked() != 0);
 
   if (!cable.__isset.copper) {
     // length and gauge fields currently only supported for copper
@@ -227,14 +234,14 @@ void QsfpModule::getCableInfo(Cable &cable) {
 
   auto overrideDacCableInfo = getDACCableOverride();
   if (overrideDacCableInfo) {
-    cable.length = overrideDacCableInfo->first;
-    cable.gauge = overrideDacCableInfo->second;
+    cable.length_ref().value_unchecked() = overrideDacCableInfo->first;
+    cable.gauge_ref().value_unchecked() = overrideDacCableInfo->second;
   } else {
-    cable.length = getQsfpDACLength();
-    cable.gauge = getQsfpDACGauge();
+    cable.length_ref().value_unchecked() = getQsfpDACLength();
+    cable.gauge_ref().value_unchecked() = getQsfpDACGauge();
   }
-  cable.__isset.length = (cable.length != 0);
-  cable.__isset.gauge = (cable.gauge != 0);
+  cable.__isset.length = (cable.length_ref().value_unchecked() != 0);
+  cable.__isset.gauge = (cable.gauge_ref().value_unchecked() != 0);
 }
 
 /*
@@ -411,8 +418,8 @@ bool QsfpModule::getSensorsPerChanInfo(std::vector<Channel>& channels) {
   const uint8_t *data = getQsfpValuePtr(dataAddress, offset, length);
 
   for (int channel = 0; channel < CHANNEL_COUNT; channel++) {
-    channels[channel].sensors.rxPwr.flags =
-      getQsfpFlags(data + byteOffset[channel], bitOffset[channel]);
+    channels[channel].sensors.rxPwr.flags_ref().value_unchecked() =
+        getQsfpFlags(data + byteOffset[channel], bitOffset[channel]);
     channels[channel].sensors.rxPwr.__isset.flags = true;
   }
 
@@ -421,8 +428,8 @@ bool QsfpModule::getSensorsPerChanInfo(std::vector<Channel>& channels) {
   data = getQsfpValuePtr(dataAddress, offset, length);
 
   for (int channel = 0; channel < CHANNEL_COUNT; channel++) {
-    channels[channel].sensors.txBias.flags =
-      getQsfpFlags(data + byteOffset[channel], bitOffset[channel]);
+    channels[channel].sensors.txBias.flags_ref().value_unchecked() =
+        getQsfpFlags(data + byteOffset[channel], bitOffset[channel]);
     channels[channel].sensors.txBias.__isset.flags = true;
   }
 
@@ -431,8 +438,8 @@ bool QsfpModule::getSensorsPerChanInfo(std::vector<Channel>& channels) {
   data = getQsfpValuePtr(dataAddress, offset, length);
 
   for (int channel = 0; channel < CHANNEL_COUNT; channel++) {
-    channels[channel].sensors.txPwr.flags =
-      getQsfpFlags(data + byteOffset[channel], bitOffset[channel]);
+    channels[channel].sensors.txPwr.flags_ref().value_unchecked() =
+        getQsfpFlags(data + byteOffset[channel], bitOffset[channel]);
     channels[channel].sensors.txPwr.__isset.flags = true;
   }
 
@@ -486,7 +493,9 @@ std::string QsfpModule::getQsfpString(SffField field) const {
   while (length > 0 && data[length - 1] == ' ') {
     --length;
   }
-  return std::string(reinterpret_cast<const char*>(data), length);
+
+  std::string value (reinterpret_cast<const char*>(data), length);
+  return validateQsfpString(value) ? value : "UNKNOWN";
 }
 
 double QsfpModule::getQsfpSensor(SffField field,
@@ -524,23 +533,17 @@ double QsfpModule::getQsfpCableLength(SffField field) const {
 TransmitterTechnology QsfpModule::getQsfpTransmitterTechnology() const {
   auto info = SffFieldInfo::getSffFieldAddress(qsfpFields,
       SffField::DEVICE_TECHNOLOGY);
-  try {
-    const uint8_t* data =
-        getQsfpValuePtr(info.dataAddress, info.offset, info.length);
+  const uint8_t* data =
+      getQsfpValuePtr(info.dataAddress, info.offset, info.length);
 
-    uint8_t transTech = *data >> DeviceTechnology::TRANSMITTER_TECH_SHIFT;
-    if (transTech == DeviceTechnology::UNKNOWN_VALUE) {
-      return TransmitterTechnology::UNKNOWN;
-    } else if (transTech <= DeviceTechnology::OPTICAL_MAX_VALUE) {
-      return TransmitterTechnology::OPTICAL;
-    } else {
-      return TransmitterTechnology::COPPER;
-    }
-  } catch (const std::exception& e) {
-    XLOG(INFO) << " Unable to get transmitter technology for QSFP "
-               << qsfpImpl_->getName() << ": " << e.what();
+  uint8_t transTech = *data >> DeviceTechnology::TRANSMITTER_TECH_SHIFT;
+  if (transTech == DeviceTechnology::UNKNOWN_VALUE) {
+    return TransmitterTechnology::UNKNOWN;
+  } else if (transTech <= DeviceTechnology::OPTICAL_MAX_VALUE) {
+    return TransmitterTechnology::OPTICAL;
+  } else {
+    return TransmitterTechnology::COPPER;
   }
-  return TransmitterTechnology::UNKNOWN;
 }
 
 QsfpModule::QsfpModule(
@@ -558,7 +561,7 @@ void QsfpModule::setQsfpIdprom() {
   int dataAddress;
 
   if (!present_) {
-    throw FbossError("QSFP IDProm set failed as QSFP is not present");
+    throw FbossError("Failed setting QSFP IDProm: QSFP is not present");
   }
 
   // Check if the data is ready
@@ -566,7 +569,8 @@ void QsfpModule::setQsfpIdprom() {
                       dataAddress, offset, length);
   getQsfpValue(dataAddress, offset, length, status);
   if (status[1] & (1 << 0)) {
-    throw FbossError("QSFP IDProm failed as QSFP is not ready");
+    StatsPublisher::bumpModuleErrors();
+    throw QsfpModuleError("Failed setting QSFP IDProm: QSFP is not ready");
   }
   flatMem_ = status[1] & (1 << 2);
   XLOG(DBG3) << "Detected QSFP " << qsfpImpl_->getName()
@@ -617,7 +621,7 @@ bool QsfpModule::cacheIsValid() const {
 TransceiverInfo QsfpModule::getTransceiverInfo() {
   auto cachedInfo = info_.rlock();
   if (!cachedInfo->hasValue()) {
-    throw FbossError("Still populating data...");
+    throw QsfpModuleError("Still populating data...");
   }
   return **cachedInfo;
 }
@@ -672,6 +676,11 @@ TransceiverInfo QsfpModule::parseDataLocked() {
   } else {
     info.channels.clear();
   }
+
+  if (getTransceiverStats(info.stats)) {
+    info.__isset.stats = true;
+  }
+
   return info;
 }
 
@@ -682,8 +691,7 @@ RawDOMData QsfpModule::getRawDOMData() {
     data.lower = IOBuf::wrapBufferAsValue(lowerPage_, MAX_QSFP_PAGE_SIZE);
     data.page0 = IOBuf::wrapBufferAsValue(page0_, MAX_QSFP_PAGE_SIZE);
     if (!flatMem_) {
-      data.__isset.page3 = true;
-      data.page3 = IOBuf::wrapBufferAsValue(page3_, MAX_QSFP_PAGE_SIZE);
+      data.page3_ref() = IOBuf::wrapBufferAsValue(page3_, MAX_QSFP_PAGE_SIZE);
     }
   }
   return data;
@@ -734,6 +742,11 @@ bool QsfpModule::customizationSupported() const {
 
 bool QsfpModule::shouldRefresh(time_t cooldown) const {
   return std::time(nullptr) - lastRefreshTime_ >= cooldown;
+}
+
+void QsfpModule::ensureOutOfReset() const {
+  qsfpImpl_->ensureOutOfReset();
+  XLOG(DBG3) << "Cleared the reset register of QSFP.";
 }
 
 cfg::PortSpeed QsfpModule::getPortSpeed() const {
@@ -793,98 +806,87 @@ void QsfpModule::refreshLocked() {
     return;
   }
 
-  try {
-    if (dirty_) {
-      // make sure data is up to date before trying to customize.
-      updateQsfpData(true);
-    }
-
-    if (customizeWanted) {
-      customizeTransceiverLocked(getPortSpeed());
-    }
-
-    if (customizeWanted || willRefresh) {
-      // update either if data is stale or if we customized this
-      // round. We update in the customization because we may have
-      // written fields, but only need a partial update because all of
-      // these fields are in the LOWER qsfp page. There are a small
-      // number of writable fields on other qsfp pages, but we don't
-      // currently use them.
-      updateQsfpData(false);
-    }
-
-    // assign
-    info_.wlock()->assign(parseDataLocked());
-  } catch (const UsbError& ex) {
-    XLOG(ERR) << "Error during refreshLocked(): " << ex.what();
+  if (dirty_) {
+    // make sure data is up to date before trying to customize.
+    ensureOutOfReset();
+    updateQsfpData(true);
   }
+
+  if (customizeWanted) {
+    customizeTransceiverLocked(getPortSpeed());
+  }
+
+  if (customizeWanted || willRefresh) {
+    // update either if data is stale or if we customized this
+    // round. We update in the customization because we may have
+    // written fields, but only need a partial update because all of
+    // these fields are in the LOWER qsfp page. There are a small
+    // number of writable fields on other qsfp pages, but we don't
+    // currently use them.
+    updateQsfpData(false);
+  }
+
+  // assign
+  info_.wlock()->assign(parseDataLocked());
 }
 
-int QsfpModule::getFieldValue(SffField fieldName,
-                              uint8_t* fieldValue) {
+void QsfpModule::getFieldValue(SffField fieldName,
+                               uint8_t* fieldValue) {
   lock_guard<std::mutex> g(qsfpModuleMutex_);
   int offset;
   int length;
   int dataAddress;
-
-  /* Determine if QSFP is present */
-  if (cacheIsValid()) {
-    try {
-      getQsfpFieldAddress(fieldName, dataAddress, offset, length);
-      getQsfpValue(dataAddress, offset, length, fieldValue);
-    } catch (const std::exception& ex) {
-      XLOG(ERR) << "Error reading field value for transceiver:"
-                << folly::to<std::string>(qsfpImpl_->getName()) << " "
-                << ex.what();
-    }
-  }
-  return -1;
+  getQsfpFieldAddress(fieldName, dataAddress, offset, length);
+  getQsfpValue(dataAddress, offset, length, fieldValue);
 }
 
 void QsfpModule::updateQsfpData(bool allPages) {
   // expects the lock to be held
-  if (present_) {
-    try {
-      XLOG(DBG2) << "Performing " << ((allPages) ? "full" : "partial")
-                 << " qsfp data cache refresh for transceiver "
-                 << folly::to<std::string>(qsfpImpl_->getName());
-      qsfpImpl_->readTransceiver(TransceiverI2CApi::ADDR_QSFP, 0,
-          sizeof(lowerPage_), lowerPage_);
-      lastRefreshTime_ = std::time(nullptr);
-      dirty_ = false;
-      setQsfpIdprom();
+  if (!present_) {
+    return;
+  }
+  try {
+    XLOG(DBG2) << "Performing " << ((allPages) ? "full" : "partial")
+               << " qsfp data cache refresh for transceiver "
+               << folly::to<std::string>(qsfpImpl_->getName());
+    qsfpImpl_->readTransceiver(TransceiverI2CApi::ADDR_QSFP, 0,
+        sizeof(lowerPage_), lowerPage_);
+    lastRefreshTime_ = std::time(nullptr);
+    dirty_ = false;
+    setQsfpIdprom();
 
-      if (!allPages) {
-        // Only the first page has fields that change often so provide
-        // an option to only fetch that page. Also the write path is
-        // particularly slow due to using an i2c bus, so writing the
-        // bytes needed to select later pages on non-flat memories can
-        // be quite expensive.
-        return;
-      }
-
-      // If we have flat memory, we don't have to set the page
-      if (!flatMem_) {
-        uint8_t page = 0;
-        qsfpImpl_->writeTransceiver(TransceiverI2CApi::ADDR_QSFP, 127,
-            sizeof(page), &page);
-      }
-      qsfpImpl_->readTransceiver(TransceiverI2CApi::ADDR_QSFP, 128,
-          sizeof(page0_), page0_);
-      if (!flatMem_) {
-        uint8_t page = 3;
-        qsfpImpl_->writeTransceiver(TransceiverI2CApi::ADDR_QSFP, 127,
-            sizeof(page), &page);
-        qsfpImpl_->readTransceiver(TransceiverI2CApi::ADDR_QSFP, 128,
-            sizeof(page3_), page3_);
-      }
-    } catch (const UsbError& ex) {
-      dirty_ = true;
-      XLOG(WARNING) << "Error reading data for transceiver:"
-                    << folly::to<std::string>(qsfpImpl_->getName()) << ": "
-                    << ex.what();
-      throw;
+    if (!allPages) {
+      // Only the first page has fields that change often so provide
+      // an option to only fetch that page. Also the write path is
+      // particularly slow due to using an i2c bus, so writing the
+      // bytes needed to select later pages on non-flat memories can
+      // be quite expensive.
+      return;
     }
+
+    // If we have flat memory, we don't have to set the page
+    if (!flatMem_) {
+      uint8_t page = 0;
+      qsfpImpl_->writeTransceiver(TransceiverI2CApi::ADDR_QSFP, 127,
+          sizeof(page), &page);
+    }
+    qsfpImpl_->readTransceiver(TransceiverI2CApi::ADDR_QSFP, 128,
+        sizeof(page0_), page0_);
+    if (!flatMem_) {
+      uint8_t page = 3;
+      qsfpImpl_->writeTransceiver(TransceiverI2CApi::ADDR_QSFP, 127,
+          sizeof(page), &page);
+      qsfpImpl_->readTransceiver(TransceiverI2CApi::ADDR_QSFP, 128,
+          sizeof(page3_), page3_);
+    }
+  } catch (const std::exception& ex) {
+    // No matter what kind of exception throws, we need to set the dirty_ flag
+    // to true.
+    dirty_ = true;
+    XLOG(ERR) << "Error update data for transceiver:"
+                  << folly::to<std::string>(qsfpImpl_->getName()) << ": "
+                  << ex.what();
+    throw;
   }
 }
 
@@ -899,33 +901,27 @@ void QsfpModule::customizeTransceiverLocked(cfg::PortSpeed speed) {
   /*
    * This must be called with a lock held on qsfpModuleMutex_
    */
-  try {
-    if (customizationSupported()) {
-      TransceiverSettings settings;
-      getTransceiverSettingsInfo(settings);
+  if (customizationSupported()) {
+    TransceiverSettings settings;
+    getTransceiverSettingsInfo(settings);
 
-      // We want this on regardless of speed
-      setPowerOverrideIfSupported(settings.powerControl);
+    // We want this on regardless of speed
+    setPowerOverrideIfSupported(settings.powerControl);
 
-      // make sure TX is enabled on the transceiver
-      ensureTxEnabled(FLAGS_tx_enable_interval);
+    // make sure TX is enabled on the transceiver
+    ensureTxEnabled(FLAGS_tx_enable_interval);
 
-      if (speed != cfg::PortSpeed::DEFAULT) {
-        setCdrIfSupported(speed, settings.cdrTx, settings.cdrRx);
-        setRateSelectIfSupported(
-          speed, settings.rateSelect, settings.rateSelectSetting);
-      }
-    } else {
-      XLOG(DBG1) << "Customization not supported on " << qsfpImpl_->getName();
+    if (speed != cfg::PortSpeed::DEFAULT) {
+      setCdrIfSupported(speed, settings.cdrTx, settings.cdrRx);
+      setRateSelectIfSupported(
+        speed, settings.rateSelect, settings.rateSelectSetting);
     }
-
-    lastCustomizeTime_ = std::time(nullptr);
-    needsCustomization_ = false;
-  } catch (const std::exception& e) {
-    XLOG(ERR) << " Unable to customize transceiver: "
-              << folly::to<std::string>(qsfpImpl_->getName()) << " "
-              << e.what();
+  } else {
+    XLOG(DBG1) << "Customization not supported on " << qsfpImpl_->getName();
   }
+
+  lastCustomizeTime_ = std::time(nullptr);
+  needsCustomization_ = false;
 }
 
 void QsfpModule::setCdrIfSupported(cfg::PortSpeed speed,
@@ -1088,12 +1084,14 @@ void QsfpModule::setPowerOverrideIfSupported(PowerControlState currentState) {
              << std::hex << (int)*ether << " Desired power control "
              << _PowerControlState_VALUES_TO_NAMES.find(desiredSetting)->second;
 
-  if (currentState == desiredSetting) {
+  if (currentState == desiredSetting &&
+      std::time(nullptr) - lastPowerClassReset_ < FLAGS_reset_lpmode_interval) {
     XLOG(INFO) << "Port: " << folly::to<std::string>(qsfpImpl_->getName())
                << " Power override already correctly set, doing nothing";
     return;
   }
 
+  uint8_t lowPower = uint8_t(PowerControl::POWER_LPMODE);
   uint8_t power = uint8_t(PowerControl::POWER_OVERRIDE);
   if (desiredSetting == PowerControlState::HIGH_POWER_OVERRIDE) {
     power = uint8_t(PowerControl::HIGH_POWER_OVERRIDE);
@@ -1101,10 +1099,21 @@ void QsfpModule::setPowerOverrideIfSupported(PowerControlState currentState) {
     power = uint8_t(PowerControl::POWER_LPMODE);
   }
 
-  getQsfpFieldAddress(SffField::POWER_CONTROL, dataAddress,
-                      offset, length);
-  qsfpImpl_->writeTransceiver(TransceiverI2CApi::ADDR_QSFP,
-      offset, sizeof(power), &power);
+  getQsfpFieldAddress(SffField::POWER_CONTROL, dataAddress, offset, length);
+
+  // first set to low power
+  qsfpImpl_->writeTransceiver(
+      TransceiverI2CApi::ADDR_QSFP, offset, sizeof(lowPower), &lowPower);
+
+  // then enable target power class
+  if (lowPower != power) {
+    qsfpImpl_->writeTransceiver(
+        TransceiverI2CApi::ADDR_QSFP, offset, sizeof(power), &power);
+  }
+
+  // update last time we reset the power class
+  lastPowerClassReset_ = std::time(nullptr);
+
   XLOG(INFO) << "Port " << portStr << ": QSFP set to power setting "
              << _PowerControlState_VALUES_TO_NAMES.find(desiredSetting)->second
              << " (" << int(power) << ")";
@@ -1133,6 +1142,15 @@ void QsfpModule::ensureTxEnabled(time_t cooldown) {
       TransceiverI2CApi::ADDR_QSFP, offset, 1, buf.data());
     lastTxEnable_ = std::time(nullptr);
   }
+}
+
+bool QsfpModule::getTransceiverStats(TransceiverStats& stats) {
+  auto transceiverStats = qsfpImpl_->getTransceiverStats();
+  if (!transceiverStats.hasValue()) {
+    return false;
+  }
+  stats = transceiverStats.value();
+  return true;
 }
 
 }} //namespace facebook::fboss

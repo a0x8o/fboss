@@ -21,12 +21,14 @@ DEFINE_string(script_pre_asic_init, "script_pre_asic_init",
 
 namespace facebook { namespace fboss {
 
+BcmPlatform::BcmPlatform() {}
+
 std::string BcmPlatform::getHwConfigDumpFile() const {
   return getVolatileStateDir() + "/" + FLAGS_hw_config_file;
 }
 
 std::string BcmPlatform::getScriptPreAsicInit() const {
-  return getVolatileStateDir() + "/" + FLAGS_script_pre_asic_init;
+  return getPersistentStateDir() + "/" + FLAGS_script_pre_asic_init;
 }
 
 bool BcmPlatform::isBcmShellSupported() const {

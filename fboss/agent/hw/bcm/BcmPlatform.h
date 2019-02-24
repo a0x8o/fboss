@@ -21,6 +21,7 @@ namespace facebook { namespace fboss {
 
 class BcmPlatformPort;
 class BcmWarmBootHelper;
+class PortQueue;
 
 /*
  * BcmPlatform specifies additional APIs that must be provided by platforms
@@ -30,7 +31,7 @@ class BcmPlatform : public Platform {
  public:
   typedef std::map<opennsl_port_t, BcmPlatformPort*> InitPortMap;
 
-  BcmPlatform() {}
+  BcmPlatform();
 
   /*
    * onUnitCreate() will be called by the BcmSwitch code immediately after
@@ -84,9 +85,13 @@ class BcmPlatform : public Platform {
    */
   virtual uint32_t getMMUCellBytes() const = 0;
 
-  virtual BcmWarmBootHelper* getWarmBootHelper() = 0;
+  virtual const PortQueue&
+  getDefaultPortQueueSettings(cfg::StreamType streamType) const = 0;
 
-  virtual bool isBufferStatsCollectionSupported() const = 0;
+  virtual const PortQueue&
+  getDefaultControlPlaneQueueSettings(cfg::StreamType streamType) const = 0;
+
+  virtual BcmWarmBootHelper* getWarmBootHelper() = 0;
 
   virtual bool isBcmShellSupported() const;
 
@@ -95,6 +100,8 @@ class BcmPlatform : public Platform {
   virtual bool areAclsSupported() const {
     return true;
   }
+
+  virtual bool v6MirrorTunnelSupported() const = 0;
 
  private:
   // Forbidden copy constructor and assignment operator

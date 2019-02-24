@@ -7,12 +7,13 @@
  *  of patent rights can be found in the PATENTS file in the same directory.
  *
  */
-#include <algorithm>
-#include <string>
 #include <folly/Memory.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
+#include <algorithm>
+#include <string>
 #include "fboss/agent/FbossError.h"
+#include "fboss/agent/IPv6Handler.h"
 #include "fboss/agent/SwSwitch.h"
 #include "fboss/agent/SwitchStats.h"
 #include "fboss/agent/TxPacket.h"
@@ -22,21 +23,21 @@
 #include "fboss/agent/packet/DHCPv4Packet.h"
 #include "fboss/agent/packet/EthHdr.h"
 #include "fboss/agent/packet/Ethertype.h"
+#include "fboss/agent/packet/ICMPHdr.h"
 #include "fboss/agent/packet/IPProto.h"
 #include "fboss/agent/packet/IPv4Hdr.h"
 #include "fboss/agent/packet/IPv6Hdr.h"
-#include "fboss/agent/packet/ICMPHdr.h"
 #include "fboss/agent/packet/PktUtil.h"
 #include "fboss/agent/state/ArpEntry.h"
 #include "fboss/agent/state/ArpResponseTable.h"
 #include "fboss/agent/state/ArpTable.h"
+#include "fboss/agent/state/Interface.h"
+#include "fboss/agent/state/RouteUpdater.h"
 #include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/state/Vlan.h"
 #include "fboss/agent/state/VlanMap.h"
-#include "fboss/agent/state/Interface.h"
 #include "fboss/agent/test/CounterCache.h"
 #include "fboss/agent/test/TestUtils.h"
-#include "fboss/agent/state/RouteUpdater.h"
 
 #include <boost/cast.hpp>
 #include <gtest/gtest.h>
@@ -71,6 +72,33 @@ unique_ptr<HwTestHandle> setupTestHandle() {
   vlans->getVlan(VlanID(1))->setArpResponseTable(respTable1);
   return createTestHandle(state);
 }
+
+std::string genICMPv6EchoRequest(int hopLimit, size_t payloadSize) {
+  auto hopLimitStr = folly::sformat("{0:02x}", hopLimit);
+  auto payloadLenStr = folly::sformat("{0:04x}", payloadSize + 8);
+  auto payload = std::string(payloadSize * 2, 'f');
+  return std::string(
+      // Version 6, traffic class, flow label
+      "60 00 00 00" +
+      // Payload length
+      payloadLenStr +
+      // Next Header: 58 (ICMPv6), Hop Limit (1)
+      "3a " + hopLimitStr +
+      // src addr (2401:db00:2110:3004::a)
+      "24 01 db 00 21 10 30 04 00 00 00 00 00 00 00 0a"
+      // dst addr (fe02::1:ff00:000a) (Non multicast address)
+      "fe 02 00 00 00 00 00 00 00 00 00 01 ff 00 00 0a"
+      // type: echo request
+      "80"
+      // code
+      "00"
+      // checksum (faked)
+      "42 42"
+      // identifier(2004), sequence (01)
+      "20 04 00 01" +
+      payload);
+}
+
 } // unnamed namespace
 
 typedef std::function<void(Cursor* cursor, uint32_t length)> PayloadCheckFn;
@@ -87,23 +115,32 @@ TxMatchFn checkICMPv4Pkt(MacAddress srcMac, IPAddressV4 srcIP,
     auto parsedSrcMac = PktUtil::readMac(&c);
     checkField(srcMac, parsedSrcMac, "src mac");
     auto vlanType = c.readBE<uint16_t>();
-    checkField(ETHERTYPE_VLAN, vlanType, "VLAN ethertype");
+    checkField(
+        static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_VLAN),
+        vlanType,
+        "VLAN ethertype");
     auto vlanTag = c.readBE<uint16_t>();
     checkField(static_cast<uint16_t>(vlan), vlanTag, "VLAN tag");
     auto ethertype = c.readBE<uint16_t>();
-    checkField(ETHERTYPE_IPV4, ethertype, "ethertype");
+    checkField(
+        static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_IPV4),
+        ethertype,
+        "ethertype");
 
     Cursor ipv4HdrStart(c);
     IPv4Hdr ipv4(c);
-    checkField(IP_PROTO_ICMP, ipv4.protocol, "IPv4 protocol");
+    checkField(
+        static_cast<uint8_t>(IP_PROTO::IP_PROTO_ICMP),
+        ipv4.protocol,
+        "IPv4 protocol");
     checkField(srcIP, ipv4.srcAddr, "src IP");
     checkField(dstIP, ipv4.dstAddr, "dst IP");
 
     ICMPHdr icmp4(c);
     checkField(icmp4.computeChecksum(c, c.length()), icmp4.csum,
         "ICMPv4 checksum");
-    checkField(type, icmp4.type, "ICMPv4 type");
-    checkField(code, icmp4.code, "ICMPv4 code");
+    checkField(static_cast<uint8_t>(type), icmp4.type, "ICMPv4 type");
+    checkField(static_cast<uint8_t>(code), icmp4.code, "ICMPv4 code");
 
     checkPayload(&c, ipv4.length - IPv4Hdr::minSize() - ICMPHdr::SIZE);
 
@@ -129,21 +166,30 @@ TxMatchFn checkICMPv6Pkt(MacAddress srcMac, IPAddressV6 srcIP,
     auto parsedSrcMac = PktUtil::readMac(&c);
     checkField(srcMac, parsedSrcMac, "src mac");
     auto vlanType = c.readBE<uint16_t>();
-    checkField(ETHERTYPE_VLAN, vlanType, "VLAN ethertype");
+    checkField(
+        static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_VLAN),
+        vlanType,
+        "VLAN ethertype");
     auto vlanTag = c.readBE<uint16_t>();
     checkField(static_cast<uint16_t>(vlan), vlanTag, "VLAN tag");
     auto ethertype = c.readBE<uint16_t>();
-    checkField(ETHERTYPE_IPV6, ethertype, "ethertype");
+    checkField(
+        static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_IPV6),
+        ethertype,
+        "ethertype");
     IPv6Hdr ipv6(c);
-    checkField(IP_PROTO_IPV6_ICMP, ipv6.nextHeader, "IPv6 protocol");
+    checkField(
+        static_cast<uint8_t>(IP_PROTO::IP_PROTO_IPV6_ICMP),
+        ipv6.nextHeader,
+        "IPv6 protocol");
     checkField(srcIP, ipv6.srcAddr, "src IP");
     checkField(dstIP, ipv6.dstAddr, "dst IP");
 
     Cursor ipv6PayloadStart(c);
     ICMPHdr icmp6(c);
     checkField(icmp6.computeChecksum(ipv6, c), icmp6.csum, "ICMPv6 checksum");
-    checkField(type, icmp6.type, "ICMPv6 type");
-    checkField(code, icmp6.code, "ICMPv6 code");
+    checkField(static_cast<uint8_t>(type), icmp6.type, "ICMPv6 type");
+    checkField(static_cast<uint8_t>(code), icmp6.code, "ICMPv6 code");
 
     checkPayload(&c, ipv6.payloadLength - ICMPHdr::SIZE);
 
@@ -177,8 +223,8 @@ TxMatchFn checkICMPv4TTLExceeded(MacAddress srcMac, IPAddressV4 srcIP,
     return;
   };
   return checkICMPv4Pkt(srcMac, srcIP, dstMac, dstIP, vlan,
-                        ICMPV4_TYPE_TIME_EXCEEDED,
-                        ICMPV4_CODE_TIME_EXCEEDED_TTL_EXCEEDED,
+                        ICMPv4Type::ICMPV4_TYPE_TIME_EXCEEDED,
+                        ICMPv4Code::ICMPV4_CODE_TIME_EXCEEDED_TTL_EXCEEDED,
                         checkPayload);
 }
 
@@ -188,9 +234,11 @@ TxMatchFn checkICMPv6TTLExceeded(MacAddress srcMac, IPAddressV6 srcIP,
                               size_t payloadLengthLimit) {
   auto checkPayload = [=](Cursor* cursor, uint32_t length) {
     if (length > payloadLengthLimit) {
-      throw FbossError("ICMPv4 TTL Exceeded payload too long, cursor length ",
-                       length, "but payloadLengthLimit is ",
-                       payloadLengthLimit);
+      throw FbossError(
+          "ICMPv6 TTL Exceeded payload too long, cursor length ",
+          length,
+          "but payloadLengthLimit is ",
+          payloadLengthLimit);
     }
     const uint8_t* cursorData = cursor->data();
     for(int i = 0; i < length; i++) {
@@ -201,8 +249,8 @@ TxMatchFn checkICMPv6TTLExceeded(MacAddress srcMac, IPAddressV6 srcIP,
     return;
   };
   return checkICMPv6Pkt(srcMac, srcIP, dstMac, dstIP, vlan,
-                        ICMPV6_TYPE_TIME_EXCEEDED,
-                        ICMPV6_CODE_TIME_EXCEEDED_HOPLIMIT_EXCEEDED,
+                        ICMPv6Type::ICMPV6_TYPE_TIME_EXCEEDED,
+                        ICMPv6Code::ICMPV6_CODE_TIME_EXCEEDED_HOPLIMIT_EXCEEDED,
                         checkPayload);
 }
 
@@ -237,8 +285,8 @@ TxMatchFn checkICMPv6PacketTooBig(
       dstMac,
       dstIP,
       vlan,
-      ICMPV6_TYPE_PACKET_TOO_BIG,
-      ICMPV6_CODE_PACKET_TOO_BIG,
+      ICMPv6Type::ICMPV6_TYPE_PACKET_TOO_BIG,
+      ICMPv6Code::ICMPV6_CODE_PACKET_TOO_BIG,
       checkPayload);
 }
 
@@ -249,56 +297,45 @@ TEST(ICMPTest, TTLExceededV4) {
   PortID portID(1);
   VlanID vlanID(1);
 
+  const std::string ipHdr =
+      // Version(4), IHL(5), DSCP(7), ECN(1), Total Length(20+8+8=36)
+      "45 1d 00 24"
+      // Identification(0x3456), Flags(0x1), Fragment offset(0x1345)
+      "34 56 53 45"
+      // TTL(1), Protocol(11), Checksum (0x1234, fake)
+      "01 11 12 34"
+      // Source IP (1.2.3.4)
+      "01 02 03 04"
+      // Destination IP (10.1.0.10)
+      "0a 01 00 0a";
+
+  const std::string udpHdr =
+      // UDP
+      // Source port (69), destination port (70)
+      "00 45 00 46"
+      // Length (16), checksum (0x1234, faked)
+      "00 10 12 34";
+
+  const std::string payload = "01 02 03 04 05 06 07 08";
+
   // create an IPv4 packet with TTL = 1
   auto pkt = PktUtil::parseHexData(
-    // dst mac, src mac
-    "00 02 00 00 00 01  02 00 02 01 02 03"
-    // 802.1q, VLAN 1
-    "81 00 00 01"
-    // IPv4
-    "08 00"
-    // Version(4), IHL(5), DSCP(7), ECN(1), Total Length(20)
-    "45 1d 00 14"
-    // Identification(0x3456), Flags(0x1), Fragment offset(0x1345)
-    "34 56 53 45"
-    // TTL(1), Protocol(11), Checksum (0x1234, fake)
-    "01 11 12 34"
-    // Source IP (1.2.3.4)
-    "01 02 03 04"
-    // Destination IP (10.1.0.10)
-    "0a 01 00 0a"
-    // Source port (69), destination port (70)
-    "00 45 00 46"
-    // Length (8), checksum (0x1234, faked)
-    "00 08 12 34"
-  );
-  PktUtil::padToLength(&pkt, 68);
+      // dst mac, src mac
+      "00 02 00 00 00 01  02 00 02 01 02 03"
+      // 802.1q, VLAN 1
+      "81 00 00 01"
+      // IPv4
+      "08 00" +
+      ipHdr + udpHdr + payload);
 
-  // a copy of origin packet to comparison (only IP packet included)
   auto icmpPayload = PktUtil::parseHexData(
-    // icmp padding for unused field
-    "00 00 00 00"
-    // Version(4), IHL(5), DSCP(7), ECN(1), Total Length(20)
-    "45 1d 00 14"
-    // Identification(0x3456), Flags(0x1), Fragment offset(0x1345)
-    "34 56 53 45"
-    // TTL(1), Protocol(11), Checksum (0x1234, fake)
-    "01 11 12 34"
-    // Source IP (1.2.3.4)
-    "01 02 03 04"
-    // Destination IP (10.1.0.10)
-    "0a 01 00 0a"
-    // Source port (69), destination port (70)
-    "00 45 00 46"
-    // Length (8), checksum (0x1234, faked)
-    "00 08 12 34"
-  );
-
+      // icmp padding for unused field
+      "00 00 00 00" + ipHdr + udpHdr + payload);
 
   // Cache the current stats
   CounterCache counters(sw);
 
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
+  EXPECT_HW_CALL(sw, stateChanged(_)).Times(0);
   EXPECT_PLATFORM_CALL(sw, getLocalMac()).
     WillRepeatedly(Return(kPlatformMac));
 
@@ -330,60 +367,46 @@ TEST(ICMPTest, TTLExceededV4IPExtraOptions) {
 
   // TODO: If actual parsing of IPv4 options is implemented at some point
   //       the bogus option bytes will need to be replaced with valid options
+  //
+  const std::string ethHdr =
+      // dst mac, src mac
+      "00 02 00 00 00 01  02 00 02 01 02 03"
+      // 802.1q, VLAN 1
+      "81 00 00 01"
+      // IPv4
+      "08 00";
 
   // create an IPv4 packet with TTL = 1 and ihl != 5
-  auto pkt = PktUtil::parseHexData(
-    // dst mac, src mac
-    "00 02 00 00 00 01  02 00 02 01 02 03"
-    // 802.1q, VLAN 1
-    "81 00 00 01"
-    // IPv4
-    "08 00"
-    // Version(4), IHL(15), DSCP(7), ECN(1), Total Length(60) <------ N.B. IHL
-    "4f 1d 00 3c"
-    // Identification(0x3456), Flags(0x1), Fragment offset(0x1345)
-    "34 56 53 45"
-    // TTL(1), Protocol(11), Checksum (0x1234, fake)
-    "01 11 12 34"
-    // Source IP (1.2.3.4)
-    "01 02 03 04"
-    // Destination IP (10.1.0.10)
-    "0a 01 00 0a"
-    // Maximum amount of options, bogus values here
-    "11 22 33 44 11 22 33 44 11 22 33 44 11 22 33 44 11 22 33 44"
-    "aa bb cc dd aa bb cc dd aa bb cc dd aa bb cc dd aa bb cc dd"
-    // Source port (69), destination port (70)
-    "00 45 00 46"
-    // Length (8), checksum (0x1234, faked)
-    "00 08 12 34"
-  );
-  PktUtil::padToLength(&pkt, 108);
+  const std::string ipHdr =
+      // Version(4), IHL(15), DSCP(7), ECN(1), Total Length(60 + 8 + * = 76)
+      "4f 1d 00 4c"
+      // Identification(0x3456), Flags(0x1), Fragment offset(0x1345)
+      "34 56 53 45"
+      // TTL(1), Protocol(11), Checksum (0x1234, fake)
+      "01 11 12 34"
+      // Source IP (1.2.3.4)
+      "01 02 03 04"
+      // Destination IP (10.1.0.10)
+      "0a 01 00 0a"
+      // Maximum amount of options, bogus values here
+      "11 22 33 44 11 22 33 44 11 22 33 44 11 22 33 44 11 22 33 44"
+      "aa bb cc dd aa bb cc dd aa bb cc dd aa bb cc dd aa bb cc dd";
 
-  // a copy of origin packet to comparison (only IP packet included)
+  const std::string udpHdr =
+      // UDP
+      // Source port (69), destination port (70)
+      "00 45 00 46"
+      // Length (16), checksum (0x1234, faked)
+      "00 10 12 34";
+
+  const std::string payload = "01 02 03 04 05 06 07 08";
+
+  auto pkt = PktUtil::parseHexData(ethHdr + ipHdr + udpHdr + payload);
   auto icmpPayload = PktUtil::parseHexData(
-    // icmp padding for unused field
-    "00 00 00 00"
-    // Version(4), IHL(15), DSCP(7), ECN(1), Total Length(60) <------ N.B. IHL
-    "4f 1d 00 3c"
-    // Identification(0x3456), Flags(0x1), Fragment offset(0x1345)
-    "34 56 53 45"
-    // TTL(1), Protocol(11), Checksum (0x1234, fake)
-    "01 11 12 34"
-    // Source IP (1.2.3.4)
-    "01 02 03 04"
-    // Destination IP (10.1.0.10)
-    "0a 01 00 0a"
-    // Maximum amount of options, bogus values here
-    "11 22 33 44 11 22 33 44 11 22 33 44 11 22 33 44 11 22 33 44"
-    "aa bb cc dd aa bb cc dd aa bb cc dd aa bb cc dd aa bb cc dd"
-    // Source port (69), destination port (70)
-    "00 45 00 46"
-    // Length (8), checksum (0x1234, faked)
-    "00 08 12 34"
+      // icmp padding for unused field
+      "00 00 00 00" + ipHdr + udpHdr + payload);
 
-  );
-
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
+  EXPECT_HW_CALL(sw, stateChanged(_)).Times(0);
   EXPECT_PLATFORM_CALL(sw, getLocalMac()).
     WillRepeatedly(Return(kPlatformMac));
 
@@ -443,88 +466,56 @@ TEST(ICMPTest, ExtraFrameCheckSequenceAtEnd) {
   pktWithChecksum->setSrcPort(portID);
   pktWithChecksum->setSrcVlan(vlanID);
 
-  EXPECT_THROW(
-    sw->packetReceivedThrowExceptionOnError(std::move(pktWithChecksum)),
-      std::out_of_range);
+  EXPECT_NO_THROW(
+      sw->packetReceivedThrowExceptionOnError(std::move(pktWithChecksum)));
   EXPECT_NO_THROW(
     sw->packetReceivedThrowExceptionOnError(std::move(pktWithoutChecksum)));
 }
 
-TEST(ICMPTest, TTLExceededV6) {
+void runTTLExceededV6Test(size_t requestedPayloadSize) {
   auto handle = setupTestHandle();
   auto sw = handle->getSw();
-
   PortID portID(1);
   VlanID vlanID(1);
 
-  // a testing IPv6 packet with hop limit 1
+  auto icmp6Pkt = genICMPv6EchoRequest(1, requestedPayloadSize);
+  constexpr size_t kMaxPayloadSize = IPv6Handler::IPV6_MIN_MTU - IPv6Hdr::SIZE -
+      ICMPHdr::SIZE - // IPv6 ICMP TTL Exceed
+      IPv6Hdr::SIZE - ICMPHdr::SIZE; // IPv6 ICMP Echo Request
+  size_t expectedPayloadSize = std::min(requestedPayloadSize, kMaxPayloadSize);
+
   auto pkt = PktUtil::parseHexData(
       // dst mac, src mac
       "33 33 ff 00 00 0a  02 05 73 f9 46 fc"
       // 802.1q, VLAN 5
       "81 00 00 05"
       // IPv6
-      "86 dd"
-      // Version 6, traffic class, flow label
-      "6e 00 00 00"
-      // Payload length: 24
-      "00 18"
-      // Next Header: 58 (ICMPv6), Hop Limit (1)
-      "3a 01"
-      // src addr (2401:db00:2110:3004::a)
-      "24 01 db 00 21 10 30 04 00 00 00 00 00 00 00 0a"
-      // dst addr (fe02::1:ff00:000a) (Non multicast address)
-      "fe 02 00 00 00 00 00 00 00 00 00 01 ff 00 00 0a"
-      // type: neighbor solicitation
-      "87"
-      // code
-      "00"
-      // checksum
-      "2a 7e"
-      // reserved
-      "00 00 00 00"
-      // target address (2401:db00:2110:3004::a)
-      "24 01 db 00 21 10 30 04 00 00 00 00 00 00 00 0a");
-
-  // keep a copy of the ip packet for icmp payload comparison
-  auto icmp6Payload = PktUtil::parseHexData(
-      // icmp6 padding for unused field
-      "00 00 00 00"
-      // Version 6, traffic class, flow label
-      "6e 00 00 00"
-      // Payload length: 24
-      "00 18"
-      // Next Header: 58 (ICMPv6), Hop Limit (1)
-      "3a 01"
-      // src addr (2401:db00:2110:3004::a)
-      "24 01 db 00 21 10 30 04 00 00 00 00 00 00 00 0a"
-      // dst addr (ff02::1:ff00:000a)
-      "fe 02 00 00 00 00 00 00 00 00 00 01 ff 00 00 0a"
-      // type: neighbor solicitation
-      "87"
-      // code
-      "00"
-      // checksum
-      "2a 7e"
-      // reserved
-      "00 00 00 00"
-      // target address (2401:db00:2110:3004::a)
-      "24 01 db 00 21 10 30 04 00 00 00 00 00 00 00 0a");
+      "86 dd" +
+      icmp6Pkt);
+  auto expectedPayload = PktUtil::parseHexData(
+      "00 00 00 00" + // icmp6 padding for unused field
+      icmp6Pkt);
+  expectedPayload.trimEnd(requestedPayloadSize - expectedPayloadSize);
 
   // Cache the current stats
   CounterCache counters(sw);
 
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
+  EXPECT_HW_CALL(sw, stateChanged(_)).Times(0);
   EXPECT_PLATFORM_CALL(sw, getLocalMac()).
     WillRepeatedly(Return(kPlatformMac));
 
   // We should get a ICMPv6 TTL exceeded back
-  EXPECT_PKT(sw, "ICMP TTL Exceeded",
-             checkICMPv6TTLExceeded(kPlatformMac,
-                                 IPAddressV6("2401:db00:2110:3001::0001"),
-                                 kPlatformMac,
-                                 IPAddressV6("2401:db00:2110:3004::a"),
-                                 VlanID(1), icmp6Payload.data(), 68));
+  EXPECT_PKT(
+      sw,
+      "ICMP TTL Exceeded",
+      checkICMPv6TTLExceeded(
+          kPlatformMac,
+          IPAddressV6("2401:db00:2110:3001::0001"),
+          kPlatformMac,
+          IPAddressV6("2401:db00:2110:3004::a"),
+          VlanID(1),
+          expectedPayload.data(),
+          expectedPayload.length()));
 
   handle->rxPacket(std::make_unique<folly::IOBuf>(pkt), portID, vlanID);
 
@@ -534,14 +525,26 @@ TEST(ICMPTest, TTLExceededV6) {
   counters.checkDelta(SwitchStats::kCounterPrefix + "ipv6.hop_exceeded.sum", 1);
 }
 
+TEST(ICMPTest, TTLExceededV6) {
+  runTTLExceededV6Test(8);
+}
+
+TEST(ICMPTest, TTLExceededV6MaxSize) {
+  runTTLExceededV6Test(1184);
+}
+
+TEST(ICMPTest, TTLExceededV6Truncated) {
+  runTTLExceededV6Test(1300);
+}
+
 TEST(ICMPTest, PacketTooBigV6) {
   cfg::SwitchConfig config = testConfigA();
   /*
    * sender is on interface with MTU 9000
    * receiver is on interface with MTU 1500
    */
-  config.interfaces[0].mtu = 9000;
-  config.interfaces[1].mtu = 1500;
+  config.interfaces[0].mtu_ref().value_unchecked() = 9000;
+  config.interfaces[1].mtu_ref().value_unchecked() = 1500;
   auto state = testState(config);
   auto handle = createTestHandle(state);
   auto sw = handle->getSw();
@@ -633,7 +636,7 @@ TEST(ICMPTest, PacketTooBigV6) {
   // Cache the current stats
   CounterCache counters(sw);
 
-  EXPECT_HW_CALL(sw, stateChangedMock(_)).Times(0);
+  EXPECT_HW_CALL(sw, stateChanged(_)).Times(0);
   EXPECT_PLATFORM_CALL(sw, getLocalMac()).WillRepeatedly(Return(kPlatformMac));
   EXPECT_PKT(
       sw,
@@ -653,7 +656,8 @@ TEST(ICMPTest, PacketTooBigV6) {
   counters.update();
   counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.pkts.sum", 1);
   counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.drops.sum", 1);
-  counters.checkDelta(SwitchStats::kCounterPrefix + "trapped.ptb.sum", 1);
+  counters.checkDelta(
+      SwitchStats::kCounterPrefix + "trapped.packet_too_big.sum", 1);
 }
 
 } // namespace

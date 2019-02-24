@@ -12,12 +12,14 @@
 #include "fboss/agent/types.h"
 
 FBOSS_STRONG_TYPE(int, BcmAclStatHandle);
+FBOSS_STRONG_TYPE(int, BcmQosPolicyHandle);
 
 namespace facebook {
 namespace fboss {
 
 using BcmAclEntryHandle = int;
 using BcmAclRangeHandle = uint32_t;
+using BcmMirrorHandle = int;
 
 } // namespace fboss
 } // namespace facebook

@@ -21,4 +21,6 @@ void fbossInit(int argc, char** argv) {
 
 void fbossFinalize() {}
 
+void setVersionInfo() {}
+
 }} // facebook::fboss

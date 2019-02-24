@@ -34,8 +34,10 @@ list(APPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/external.install")
 
 include_directories(${CMAKE_SOURCE_DIR})
 include_directories(${CMAKE_BUILD_DIR})
+link_directories(${CMAKE_CURRENT_SOURCE_DIR}/external.install/lib)
 
 find_package(folly CONFIG REQUIRED)
+find_package(fizz CONFIG REQUIRED)
 find_package(wangle CONFIG REQUIRED)
 find_package(FBThrift CONFIG REQUIRED)
 
@@ -54,16 +56,28 @@ add_thrift_cpp2_library(
   common/network/if/Address.thrift
 )
 add_thrift_cpp2_library(
-  highres_cpp2
-  fboss/agent/if/highres.thrift
-  SERVICES
-    FbossHighresClient
-)
-add_thrift_cpp2_library(
   switch_config_cpp2
   fboss/agent/switch_config.thrift
   OPTIONS
     json
+)
+add_thrift_cpp2_library(
+  agent_config_cpp2
+  fboss/agent/agent_config.thrift
+  OPTIONS
+    json
+  DEPENDS
+    platform_config_cpp2
+    switch_config_cpp2
+)
+add_thrift_cpp2_library(
+  platform_config_cpp2
+  fboss/agent/platform_config.thrift
+  OPTIONS
+    json
+  DEPENDS
+    bcm_config_cpp2
+    external_phy_cpp2
 )
 add_thrift_cpp2_library(
   switch_state_cpp2
@@ -71,6 +85,14 @@ add_thrift_cpp2_library(
   OPTIONS
     json
     optionals
+  DEPENDS
+    switch_config_cpp2
+)
+add_thrift_cpp2_library(
+  external_phy_cpp2
+  fboss/lib/phy/external_phy.thrift
+  OPTIONS
+    json
   DEPENDS
     switch_config_cpp2
 )
@@ -105,7 +127,6 @@ add_thrift_cpp2_library(
     fb303_cpp2
     network_address_cpp2
     optic_cpp2
-    highres_cpp2
     transceiver_cpp2
 )
 add_thrift_cpp2_library(
@@ -116,6 +137,12 @@ add_thrift_cpp2_library(
   DEPENDS
     fboss_cpp2
     ctrl_cpp2
+)
+add_thrift_cpp2_library(
+  bcm_config_cpp2
+  fboss/agent/hw/bcm/bcm_config.thrift
+  OPTIONS
+    json
 )
 add_thrift_cpp2_library(
   packettrace_cpp2
@@ -164,6 +191,7 @@ find_library(PCAP pcap)
 find_library(NETLINK3 nl-3)
 find_library(NETLINKROUTE3 nl-route-3)
 find_library(CURL curl)
+find_library(SODIUM sodium)
 
 find_library(OPENNSL opennsl
              PATHS ${CMAKE_SOURCE_DIR}/external/OpenNSL/bin/wedge-trident)
@@ -208,11 +236,11 @@ add_executable(qsfp_service
 
 add_library(fboss_agent STATIC
     common/stats/ServiceData.cpp
-
+    fboss/agent/AgentConfig.cpp
+    fboss/agent/AlpmUtils.cpp
     fboss/agent/ApplyThriftConfig.cpp
     fboss/agent/ArpCache.cpp
     fboss/agent/ArpHandler.cpp
-    fboss/agent/BmcRestClient.cpp
     fboss/agent/capture/PcapFile.cpp
     fboss/agent/capture/PcapPkt.cpp
     fboss/agent/capture/PcapQueue.cpp
@@ -221,23 +249,26 @@ add_library(fboss_agent STATIC
     fboss/agent/capture/PktCaptureManager.cpp
     fboss/agent/DHCPv4Handler.cpp
     fboss/agent/DHCPv6Handler.cpp
-    fboss/agent/HighresCounterSubscriptionHandler.cpp
-    fboss/agent/HighresCounterUtil.cpp
     fboss/agent/hw/BufferStatsLogger.cpp
     fboss/agent/hw/bcm/BcmAclRange.cpp
     fboss/agent/hw/bcm/BcmAclTable.cpp
     fboss/agent/hw/bcm/BcmAPI.cpp
+    fboss/agent/hw/bcm/BcmConfig.cpp
     fboss/agent/hw/bcm/BcmControlPlaneQueueManager.cpp
     fboss/agent/hw/bcm/BcmCosQueueManager.cpp
     fboss/agent/hw/bcm/BcmEgress.cpp
     fboss/agent/hw/bcm/BcmHost.cpp
     fboss/agent/hw/bcm/BcmHostKey.cpp
     fboss/agent/hw/bcm/BcmIntf.cpp
+    fboss/agent/hw/bcm/BcmMirrorTable.cpp
     fboss/agent/hw/bcm/BcmPlatform.cpp
     fboss/agent/hw/bcm/BcmPort.cpp
     fboss/agent/hw/bcm/BcmPortGroup.cpp
     fboss/agent/hw/bcm/BcmPortQueueManager.cpp
     fboss/agent/hw/bcm/BcmPortTable.cpp
+    fboss/agent/hw/bcm/BcmQosMap.cpp
+    fboss/agent/hw/bcm/BcmQosPolicy.cpp
+    fboss/agent/hw/bcm/BcmQosPolicyTable.cpp
     fboss/agent/hw/bcm/BcmRoute.cpp
     fboss/agent/hw/bcm/BcmRtag7LoadBalancer.cpp
     fboss/agent/hw/bcm/BcmRtag7Module.cpp
@@ -246,8 +277,8 @@ add_library(fboss_agent STATIC
     fboss/agent/hw/bcm/BcmStats.cpp
     fboss/agent/hw/bcm/BcmStatUpdater.cpp
     fboss/agent/hw/bcm/BcmSwitch.cpp
-    fboss/agent/hw/bcm/BcmSwitchEventCallback.cpp
     fboss/agent/hw/bcm/BcmSwitchEventUtils.cpp
+    fboss/agent/hw/bcm/BcmTrunk.cpp
     fboss/agent/hw/bcm/BcmTrunkStats.cpp
     fboss/agent/hw/bcm/BcmTrunkTable.cpp
     fboss/agent/hw/bcm/BcmTxPacket.cpp
@@ -263,10 +294,12 @@ add_library(fboss_agent STATIC
     fboss/agent/hw/bcm/oss/BcmCosQueueManager.cpp
     fboss/agent/hw/bcm/oss/BcmEgress.cpp
     fboss/agent/hw/bcm/oss/BcmHost.cpp
+    fboss/agent/hw/bcm/oss/BcmMirror.cpp
     fboss/agent/hw/bcm/oss/BcmPort.cpp
     fboss/agent/hw/bcm/oss/BcmPortGroup.cpp
     fboss/agent/hw/bcm/oss/BcmPortQueueManager.cpp
     fboss/agent/hw/bcm/oss/BcmPortTable.cpp
+    fboss/agent/hw/bcm/oss/BcmQosMap.cpp
     fboss/agent/hw/bcm/oss/BcmRtag7LoadBalancer.cpp
     fboss/agent/hw/bcm/oss/BcmRtag7Module.cpp
     fboss/agent/hw/bcm/oss/BcmStatUpdater.cpp
@@ -277,6 +310,7 @@ add_library(fboss_agent STATIC
     fboss/agent/hw/bcm/oss/BcmWarmBootCache.cpp
     fboss/agent/hw/bcm/oss/BcmWarmBootHelper.cpp
     fboss/agent/hw/bcm/oss/BcmTableStats.cpp
+    fboss/agent/hw/bcm/oss/BcmBstStatsMgr.cpp
     fboss/agent/hw/bcm/BcmAddressFBConvertors.cpp
     fboss/agent/hw/mock/MockHwSwitch.cpp
     fboss/agent/hw/mock/MockPlatform.cpp
@@ -291,7 +325,6 @@ add_library(fboss_agent STATIC
     fboss/agent/lldp/LinkNeighborDB.cpp
     fboss/agent/ndp/IPv6RouteAdvertiser.cpp
     fboss/agent/HwSwitch.cpp
-    fboss/agent/I2c.cpp
     fboss/agent/IPHeaderV4.cpp
     fboss/agent/IPv4Handler.cpp
     fboss/agent/IPv6Handler.cpp
@@ -304,15 +337,18 @@ add_library(fboss_agent STATIC
     fboss/agent/LldpManager.cpp
     fboss/agent/LoadBalancerConfigApplier.cpp
     fboss/agent/Main.cpp
+    fboss/agent/SetupThrift.cpp
+    fboss/agent/MirrorManager.cpp
+    fboss/agent/MirrorManagerImpl.cpp
     fboss/agent/ndp/IPv6RouteAdvertiser.cpp
     fboss/agent/NdpCache.cpp
     fboss/agent/NeighborListenerClient.cpp
     fboss/agent/NeighborUpdater.cpp
-    fboss/agent/NexthopToRouteCount.cpp
-    fboss/agent/oss/ApplyThriftConfig.cpp
     fboss/agent/oss/Main.cpp
+    fboss/agent/oss/SetupThrift.cpp
     fboss/agent/oss/RouteUpdateLogger.cpp
     fboss/agent/oss/SwSwitch.cpp
+    fboss/agent/oss/Utils.cpp
     fboss/agent/packet/ArpHdr.cpp
     fboss/agent/packet/DHCPv4Packet.cpp
     fboss/agent/packet/DHCPv6Packet.cpp
@@ -321,9 +357,12 @@ add_library(fboss_agent STATIC
     fboss/agent/packet/IPv4Hdr.cpp
     fboss/agent/packet/IPv6Hdr.cpp
     fboss/agent/packet/LlcHdr.cpp
+    fboss/agent/packet/NDP.cpp
     fboss/agent/packet/NDPRouterAdvertisement.cpp
     fboss/agent/packet/PktUtil.cpp
+    fboss/agent/packet/SflowStructs.cpp
     fboss/agent/Platform.cpp
+    fboss/agent/PlatformPort.cpp
     fboss/agent/platforms/wedge/oss/GalaxyPlatform.cpp
     fboss/agent/platforms/wedge/oss/GalaxyPort.cpp
     fboss/agent/platforms/wedge/oss/WedgePlatform.cpp
@@ -334,9 +373,11 @@ add_library(fboss_agent STATIC
     fboss/agent/platforms/wedge/oss/Wedge100Port.cpp
     fboss/agent/platforms/wedge/oss/WedgePlatformInit.cpp
     fboss/agent/platforms/wedge/oss/WedgeProductInfo.cpp
+    fboss/agent/platforms/wedge/oss/WedgeTomahawkPlatform.cpp
     fboss/agent/platforms/wedge/wedge_agent.cpp
     fboss/agent/platforms/wedge/WedgePlatform.cpp
     fboss/agent/platforms/wedge/Wedge40Platform.cpp
+    fboss/agent/platforms/wedge/FakeWedge40Platform.cpp
     fboss/agent/platforms/wedge/Wedge100Platform.cpp
     fboss/agent/platforms/wedge/GalaxyLCPlatform.cpp
     fboss/agent/platforms/wedge/GalaxyFCPlatform.cpp
@@ -344,10 +385,8 @@ add_library(fboss_agent STATIC
     fboss/agent/platforms/wedge/Wedge100Port.cpp
     fboss/agent/platforms/wedge/WedgeProductInfo.cpp
     fboss/agent/platforms/wedge/WedgePlatformInit.cpp
-    fboss/agent/PortRemediator.cpp
     fboss/agent/PortStats.cpp
     fboss/agent/PortUpdateHandler.cpp
-    fboss/agent/RestClient.cpp
     fboss/agent/RouteUpdateLogger.cpp
     fboss/agent/RouteUpdateLoggingPrefixTracker.cpp
     fboss/agent/state/AclEntry.cpp
@@ -358,10 +397,16 @@ add_library(fboss_agent STATIC
     fboss/agent/state/ArpResponseTable.cpp
     fboss/agent/state/ArpTable.cpp
     fboss/agent/state/ControlPlane.cpp
+    fboss/agent/state/ForwardingInformationBase.cpp
+    fboss/agent/state/ForwardingInformationBaseContainer.cpp
+    fboss/agent/state/ForwardingInformationBaseDelta.cpp
+    fboss/agent/state/ForwardingInformationBaseMap.cpp
     fboss/agent/state/Interface.cpp
     fboss/agent/state/InterfaceMap.cpp
     fboss/agent/state/LoadBalancer.cpp
     fboss/agent/state/LoadBalancerMap.cpp
+    fboss/agent/state/Mirror.cpp
+    fboss/agent/state/MirrorMap.cpp
     fboss/agent/state/MatchAction.cpp
     fboss/agent/state/NdpEntry.cpp
     fboss/agent/state/NdpResponseTable.cpp
@@ -371,6 +416,8 @@ add_library(fboss_agent STATIC
     fboss/agent/state/Port.cpp
     fboss/agent/state/PortMap.cpp
     fboss/agent/state/PortQueue.cpp
+    fboss/agent/state/QosPolicy.cpp
+    fboss/agent/state/QosPolicyMap.cpp
     fboss/agent/state/Route.cpp
     fboss/agent/state/RouteDelta.cpp
     fboss/agent/state/RouteNextHop.cpp
@@ -402,6 +449,8 @@ add_library(fboss_agent STATIC
     fboss/lib/usb/GalaxyI2CBus.cpp
     fboss/lib/usb/BaseWedgeI2CBus.cpp
     fboss/lib/usb/BaseWedgeI2CBus.h
+    fboss/lib/RestClient.cpp
+    fboss/lib/BmcRestClient.cpp
     fboss/lib/usb/CP2112.cpp
     fboss/lib/usb/CP2112.h
     fboss/lib/usb/PCA9548.cpp
@@ -426,6 +475,8 @@ add_library(fboss_agent STATIC
 )
 target_link_libraries(
   fboss_agent PUBLIC
+    agent_config_cpp2
+    switch_config_cpp2
     switch_state_cpp2
     sflow_cpp2
     ctrl_cpp2
@@ -446,6 +497,7 @@ target_link_libraries(
     ${NETLINK3}
     ${NETLINKROUTE3}
     ${CURL}
+    ${SODIUM}
 )
 
 target_link_libraries(wedge_agent fboss_agent)

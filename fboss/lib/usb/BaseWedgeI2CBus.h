@@ -45,13 +45,14 @@ class BaseWedgeI2CBus : public TransceiverI2CApi {
   void read(uint8_t i2cAddress, int offset, int len, uint8_t* buf);
   void write(uint8_t i2cAddress, int offset, int len, const uint8_t* buf);
 
+  bool isPresent(unsigned int module) override;
+
  protected:
   enum : unsigned int {
     NO_PORT = 0,
   };
 
   virtual void initBus() = 0;
-  virtual void verifyBus(bool autoReset = true) = 0;
   virtual void selectQsfpImpl(unsigned int module) = 0;
 
   std::unique_ptr<CP2112Intf> dev_;

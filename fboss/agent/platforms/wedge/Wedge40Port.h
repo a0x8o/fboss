@@ -17,9 +17,8 @@ class Wedge40Port : public WedgePort {
  public:
   Wedge40Port(PortID id,
              WedgePlatform* platform,
-             folly::Optional<TransceiverID> frontPanelPort,
-             folly::Optional<ChannelID> channel) :
-      WedgePort(id, platform, frontPanelPort, channel) {}
+              folly::Optional<FrontPanelResources> frontPanel) :
+      WedgePort(id, platform, frontPanel) {}
 
   LaneSpeeds supportedLaneSpeeds() const override {
     LaneSpeeds speeds;
@@ -35,6 +34,7 @@ class Wedge40Port : public WedgePort {
   void remedy();
   void prepareForGracefulExit() override;
   void linkStatusChanged(bool up, bool adminUp) override;
+  void externalState(PlatformPort::ExternalState) override;
   bool shouldDisableFEC() const override {
     return false;
   }

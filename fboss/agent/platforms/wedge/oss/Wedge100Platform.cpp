@@ -13,11 +13,6 @@
 
 namespace facebook { namespace fboss {
 
-std::map<std::string, std::string> Wedge100Platform::loadConfig() {
-  std::map<std::string, std::string> config;
-  return config;
-}
-
 folly::ByteRange Wedge100Platform::defaultLed0Code() {
   return folly::ByteRange();
 }

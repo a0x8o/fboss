@@ -44,8 +44,11 @@ uint32_t getAdvertisementPacketBodySize(uint32_t items_count)  {
   return bodyLength;
 }
 
-template<typename F>
-void foreachAddrToAdvertise(const facebook::fboss::Interface* intf, F f) {
+using Prefix = std::pair<IPAddressV6, uint8_t>;
+
+std::set<Prefix> getPrefixesToAdvertise(
+    const facebook::fboss::Interface* intf) {
+  std::set<Prefix> prefixes;
   for (const auto& addr : intf->getAddresses()) {
     if (!addr.first.isV6()) {
       continue;
@@ -57,10 +60,10 @@ void foreachAddrToAdvertise(const facebook::fboss::Interface* intf, F f) {
     if (mask == 128) {
       continue;
     }
-    f(addr);
+    prefixes.emplace(addr.first.asV6().mask(mask), mask);
   }
+  return prefixes;
 }
-
 }
 
 namespace facebook { namespace fboss {
@@ -154,7 +157,7 @@ void IPv6RAImpl::sendRouteAdvertisement() {
   RWPrivateCursor cursor(pkt->buf());
   cursor.push(buf_.data(), buf_.length());
 
-  sw_->sendPacketSwitched(std::move(pkt));
+  sw_->sendPacketSwitchedAsync(std::move(pkt));
 }
 
 IPv6RouteAdvertiser::IPv6RouteAdvertiser(SwSwitch* sw,
@@ -197,13 +200,8 @@ IPv6RouteAdvertiser& IPv6RouteAdvertiser::operator=(
 
 /* static */ uint32_t IPv6RouteAdvertiser::getPacketSize(
     const Interface* intf) {
-  uint32_t count = 0;
-  foreachAddrToAdvertise(intf, [&](
-    const std::pair<folly::IPAddress, uint8_t> &) {
-      ++count;
-    });
-
-  auto bodyLength = getAdvertisementPacketBodySize(count);
+  auto prefixCount = getPrefixesToAdvertise(intf).size();
+  auto bodyLength = getAdvertisementPacketBodySize(prefixCount);
 
   return ICMPHdr::computeTotalLengthV6(bodyLength);
 }
@@ -232,16 +230,8 @@ IPv6RouteAdvertiser& IPv6RouteAdvertiser::operator=(
   std::chrono::seconds retransTimer(0);
   uint32_t prefixValidLifetime = ndpConfig->prefixValidLifetimeSeconds;
   uint32_t prefixPreferredLifetime = ndpConfig->prefixPreferredLifetimeSeconds;
-
-  // Build the list of prefixes to advertise
-  typedef std::pair<IPAddressV6, uint8_t> Prefix;
   uint32_t mtu = intf->getMtu();
-  std::set<Prefix> prefixes;
-  foreachAddrToAdvertise(intf, [&](
-    const std::pair<folly::IPAddress, uint8_t> & addr) {
-      uint8_t mask = addr.second;
-      prefixes.emplace(addr.first.asV6().mask(mask), mask);
-    });
+  auto prefixes = getPrefixesToAdvertise(intf);
 
   auto serializeBody = [&](RWPrivateCursor* cur) {
     cur->writeBE<uint8_t>(hopLimit);
@@ -281,10 +271,13 @@ IPv6RouteAdvertiser& IPv6RouteAdvertiser::operator=(
   IPv6Hdr ipv6(srcIP, dstIP);
   ipv6.trafficClass = 0xe0; // CS7 precedence (network control)
   ipv6.payloadLength = ICMPHdr::SIZE + bodyLength;
-  ipv6.nextHeader = IP_PROTO_IPV6_ICMP;
+  ipv6.nextHeader = static_cast<uint8_t>(IP_PROTO::IP_PROTO_IPV6_ICMP);
   ipv6.hopLimit = 255;
 
-  ICMPHdr icmp6(ICMPV6_TYPE_NDP_ROUTER_ADVERTISEMENT, 0, 0);
+  ICMPHdr icmp6(
+      static_cast<uint8_t>(ICMPv6Type::ICMPV6_TYPE_NDP_ROUTER_ADVERTISEMENT),
+      0,
+      0);
 
   icmp6.serializeFullPacket(cursor, dstMac, intf->getMac(), intf->getVlanID(),
                             ipv6, bodyLength, serializeBody);

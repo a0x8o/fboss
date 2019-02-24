@@ -31,6 +31,7 @@
 #include "fboss/agent/state/Interface.h"
 #include "fboss/agent/state/InterfaceMap.h"
 #include "fboss/agent/state/LoadBalancerMap.h"
+#include "fboss/agent/state/MirrorMap.h"
 #include "fboss/agent/state/NdpTable.h"
 #include "fboss/agent/state/NeighborEntry.h"
 #include "fboss/agent/state/Port.h"
@@ -100,6 +101,17 @@ shared_ptr<InterfaceMap> BcmWarmBootCache::reconstructInterfaceMap() const {
     intfMap->addInterface(dumpedInterface);
   }
   return intfMap;
+}
+
+void BcmWarmBootCache::reconstructPortVlans(
+  std::shared_ptr<SwitchState>* state) const {
+  for (auto port : *dumpedSwSwitchState_->getPorts()) {
+    auto newPort = (*state)->getPorts()->getPort(port->getID());
+    for (auto vlanMember : port->getVlans()) {
+      VlanID vlanID(vlanMember.first);
+      newPort->addVlan(vlanID, vlanMember.second.tagged);
+    }
+  }
 }
 
 shared_ptr<VlanMap> BcmWarmBootCache::reconstructVlanMap() const {
@@ -211,9 +223,18 @@ BcmWarmBootCache::reconstructAclMap() const {
   return dumpedSwSwitchState_->getAcls();
 }
 
+std::shared_ptr<QosPolicyMap> BcmWarmBootCache::reconstructQosPolicies() const {
+  return dumpedSwSwitchState_->getQosPolicies();
+}
+
 std::shared_ptr<LoadBalancerMap> BcmWarmBootCache::reconstructLoadBalancers()
     const {
   return dumpedSwSwitchState_->getLoadBalancers();
+}
+
+std::shared_ptr<MirrorMap> BcmWarmBootCache::reconstructMirrors()
+    const {
+  return dumpedSwSwitchState_->getMirrors();
 }
 
 void BcmWarmBootCache::programmed(Range2BcmHandlerItr itr) {
@@ -232,6 +253,15 @@ void BcmWarmBootCache::programmed(Range2BcmHandlerItr itr) {
 void BcmWarmBootCache::programmed(AclEntry2AclStatItr itr) {
   XLOG(DBG1) << "Programmed acl stat=" << itr->second.stat;
   itr->second.claimed = true;
+}
+
+BcmWarmBootCache::AclEntry2AclStatItr BcmWarmBootCache::findAclStat(
+    const BcmAclEntryHandle& bcmAclEntry) {
+  auto aclStatItr = aclEntry2AclStat_.find(bcmAclEntry);
+  if (aclStatItr != aclEntry2AclStat_.end() && aclStatItr->second.claimed) {
+    return aclEntry2AclStat_.end();
+  }
+  return aclStatItr;
 }
 
 const BcmWarmBootCache::EgressIds& BcmWarmBootCache::getPathsForEcmp(
@@ -454,6 +484,9 @@ void BcmWarmBootCache::populate(folly::Optional<folly::dynamic> warmBootState) {
     this->priority2BcmAclEntryHandle_);
 
   populateRtag7State();
+  populateMirrors();
+  populateMirroredPorts();
+  populateIngressQosMaps();
 }
 
 bool BcmWarmBootCache::fillVlanPortInfo(Vlan* vlan) {
@@ -781,6 +814,10 @@ void BcmWarmBootCache::clear() {
     removeBcmAclRange(aclRangeItr.second.first);
   }
   aclRange2BcmAclRangeHandle_.clear();
+
+  /* remove unclaimed mirrors and mirrored ports/acls, if any */
+  removeUnclaimedMirrors();
+  ingressQosMaps_.clear();
 }
 
 void BcmWarmBootCache::populateRtag7State() {
@@ -837,4 +874,140 @@ void BcmWarmBootCache::programmed(
   CHECK_EQ(numErased, 1);
 }
 
+BcmWarmBootCache::MirrorEgressPath2HandleCitr BcmWarmBootCache::findMirror(
+    opennsl_gport_t port,
+    const folly::Optional<MirrorTunnel>& tunnel) const {
+  return mirrorEgressPath2Handle_.find(std::make_pair(port, tunnel));
+}
+
+BcmWarmBootCache::MirrorEgressPath2HandleCitr BcmWarmBootCache::mirrorsBegin()
+    const {
+  return mirrorEgressPath2Handle_.begin();
+}
+BcmWarmBootCache::MirrorEgressPath2HandleCitr BcmWarmBootCache::mirrorsEnd()
+    const {
+  return mirrorEgressPath2Handle_.end();
+}
+
+void BcmWarmBootCache::programmedMirror(MirrorEgressPath2HandleCitr itr) {
+  const auto key = itr->first;
+  const auto port = key.first;
+  const auto& tunnel = key.second;
+  if (tunnel) {
+    XLOG(DBG1) << "Programmed ERSPAN mirror egressing through: " << port
+               << " with "
+               << "proto=" << tunnel->greProtocol
+               << "source ip=" << tunnel->srcIp.str()
+               << "source mac=" << tunnel->srcMac.toString()
+               << "destination ip=" << tunnel->dstIp.str()
+               << "destination mac=" << tunnel->dstMac.toString()
+               << ", removing from warm boot cache";
+  } else {
+    XLOG(DBG1) << "Programmed SPAN mirror egressing through: " << port
+               << ", removing from warm boot cache";
+  }
+  mirrorEgressPath2Handle_.erase(itr);
+}
+
+BcmWarmBootCache::MirroredPort2HandleCitr BcmWarmBootCache::mirroredPortsBegin()
+    const {
+  return mirroredPort2Handle_.begin();
+}
+
+BcmWarmBootCache::MirroredPort2HandleCitr BcmWarmBootCache::mirroredPortsEnd()
+    const {
+  return mirroredPort2Handle_.end();
+}
+
+BcmWarmBootCache::MirroredPort2HandleCitr BcmWarmBootCache::findMirroredPort(
+    opennsl_gport_t port,
+    MirrorDirection direction) const {
+  return mirroredPort2Handle_.find(std::make_pair(port, direction));
+}
+
+void BcmWarmBootCache::programmedMirroredPort(MirroredPort2HandleCitr itr) {
+  mirroredPort2Handle_.erase(itr);
+}
+
+BcmWarmBootCache::MirroredAcl2HandleCitr BcmWarmBootCache::mirroredAclsBegin()
+    const {
+  return mirroredAcl2Handle_.begin();
+}
+
+BcmWarmBootCache::MirroredAcl2HandleCitr BcmWarmBootCache::mirroredAclsEnd()
+    const {
+  return mirroredAcl2Handle_.end();
+}
+
+BcmWarmBootCache::MirroredAcl2HandleCitr BcmWarmBootCache::findMirroredAcl(
+    BcmAclEntryHandle entry,
+    MirrorDirection direction) const {
+  return mirroredAcl2Handle_.find(std::make_pair(entry, direction));
+}
+
+void BcmWarmBootCache::programmedMirroredAcl(MirroredAcl2HandleCitr itr) {
+  mirroredAcl2Handle_.erase(itr);
+}
+
+void BcmWarmBootCache::removeUnclaimedMirrors() {
+  XLOG(DBG1) << "Unclaimed mirrored port count=" << mirroredPort2Handle_.size()
+             << ", unclaimed mirrored acl count=" << mirroredAcl2Handle_.size()
+             << ", unclaimed mirror count=" << mirrorEgressPath2Handle_.size();
+  std::for_each(
+      mirroredPort2Handle_.begin(),
+      mirroredPort2Handle_.end(),
+      [this](const auto& mirroredPort2Handle) {
+        this->stopUnclaimedPortMirroring(
+            mirroredPort2Handle.first.first,
+            mirroredPort2Handle.first.second,
+            mirroredPort2Handle.second);
+      });
+
+  std::for_each(
+      mirroredAcl2Handle_.begin(),
+      mirroredAcl2Handle_.end(),
+      [this](const auto& mirroredAcl2Handle) {
+        this->stopUnclaimedAclMirroring(
+            mirroredAcl2Handle.first.first,
+            mirroredAcl2Handle.first.second,
+            mirroredAcl2Handle.second);
+      });
+
+  std::for_each(
+      mirrorEgressPath2Handle_.begin(),
+      mirrorEgressPath2Handle_.end(),
+      [this](const auto& mirrorEgressPath2Handle) {
+        this->removeUnclaimedMirror(mirrorEgressPath2Handle.second);
+      });
+}
+
+void BcmWarmBootCache::reconstructPortMirrors(
+    std::shared_ptr<SwitchState>* state) {
+  auto* ports = (*state)->getPorts()->modify(state);
+  for (const auto& cachedPort : *dumpedSwSwitchState_->getPorts()) {
+    auto id = cachedPort->getID();
+    auto port = ports->getPort(id);
+    if (cachedPort->getIngressMirror()) {
+      port->setIngressMirror(cachedPort->getIngressMirror());
+    }
+    if (cachedPort->getEgressMirror()) {
+      port->setEgressMirror(cachedPort->getEgressMirror());
+    }
+  }
+}
+
+BcmWarmBootCache::IngressQosMapsItr BcmWarmBootCache::findIngressQosMap(
+    const std::set<QosRule>& qosRules) {
+  return std::find_if(
+      ingressQosMaps_.begin(),
+      ingressQosMaps_.end(),
+      [&](const std::unique_ptr<BcmQosMap>& qosMap) -> bool {
+        return qosMap->rulesMatch(qosRules);
+      });
+}
+
+void BcmWarmBootCache::programmed(IngressQosMapsItr itr) {
+  XLOG(DBG1) << "Programmed QosMap, removing from warm boot cache.";
+  ingressQosMaps_.erase(itr);
+}
 }}

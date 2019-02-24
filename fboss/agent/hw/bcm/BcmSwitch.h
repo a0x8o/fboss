@@ -13,11 +13,13 @@
 #include "fboss/agent/types.h"
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include <folly/dynamic.h>
-
+#include <folly/io/async/EventBase.h>
+#include <folly/Optional.h>
 #include <gtest/gtest_prod.h>
 
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <boost/container/flat_map.hpp>
 
 extern "C" {
@@ -40,11 +42,11 @@ class BcmHostTable;
 class BcmIntfTable;
 class BcmPlatform;
 class BcmPortTable;
+class BcmQosPolicyTable;
 class BcmRouteTable;
 class BcmRxPacket;
 class BcmStatUpdater;
 class BcmSwitchEventCallback;
-class BcmTableStats;
 class BcmTrunkTable;
 class BcmUnit;
 class BcmWarmBootCache;
@@ -58,9 +60,14 @@ class MockRxPacket;
 class Interface;
 class Port;
 class PortStats;
+class QosPolicy;
 class Vlan;
 class VlanMap;
-class BufferStatsLogger;
+class Mirror;
+class BcmMirror;
+class BcmMirrorTable;
+class ControlPlane;
+class BcmBstStatsMgr;
 
 /*
  * Virtual interface to BcmSwitch, primarily for mocking/testing
@@ -98,6 +105,8 @@ class BcmSwitchIf : public HwSwitch {
 
   virtual const BcmAclTable* getAclTable() const = 0;
 
+  virtual const BcmQosPolicyTable* getQosPolicyTable() const = 0;
+
   virtual const BcmTrunkTable* getTrunkTable() const = 0;
 
   virtual BcmStatUpdater* getStatUpdater() const = 0;
@@ -116,7 +125,13 @@ class BcmSwitchIf : public HwSwitch {
 
   virtual BcmWarmBootCache* getWarmBootCache() const = 0;
 
-  virtual void dumpState() const = 0;
+  virtual const BcmMirrorTable* getBcmMirrorTable() const = 0;
+
+  virtual BcmMirrorTable* writableBcmMirrorTable() const = 0;
+
+  virtual std::string gatherSdkState() const = 0;
+
+  virtual void dumpState(const std::string& path) const = 0;
 };
 
 /*
@@ -125,10 +140,6 @@ class BcmSwitchIf : public HwSwitch {
  */
 class BcmSwitch : public BcmSwitchIf {
  public:
-   enum HashMode {
-     FULL_HASH, // Full hash - use src IP, dst IP, src port, dst port
-     HALF_HASH  // Half hash - user src IP, dst IP
-   };
    enum class MmuState {
     UNKNOWN,
     MMU_LOSSLESS,
@@ -147,7 +158,6 @@ class BcmSwitch : public BcmSwitchIf {
    */
    explicit BcmSwitch(
        BcmPlatform* platform,
-       HashMode hashMode = FULL_HASH,
        uint32_t featuresDesired = (PACKET_RX_DESIRED | LINKSCAN_DESIRED));
 
    /*
@@ -200,11 +210,23 @@ class BcmSwitch : public BcmSwitchIf {
   }
   MmuState getMmuState() const { return mmuState_; }
   uint64_t getMMUCellBytes() const { return mmuCellBytes_; }
+  uint64_t getMMUBufferBytes() const { return mmuBufferBytes_; }
 
   std::unique_ptr<TxPacket> allocatePacket(uint32_t size) override;
-  bool sendPacketSwitched(std::unique_ptr<TxPacket> pkt) noexcept override;
-  bool sendPacketOutOfPort(std::unique_ptr<TxPacket> pkt,
-                           PortID portID) noexcept override;
+  bool sendPacketSwitchedAsync(std::unique_ptr<TxPacket> pkt) noexcept override;
+  bool sendPacketOutOfPortAsync(
+      std::unique_ptr<TxPacket> pkt,
+      PortID portID,
+      folly::Optional<uint8_t> cos = folly::none) noexcept override;
+
+  bool sendPacketSwitchedSync(std::unique_ptr<TxPacket> pkt) noexcept override;
+  bool sendPacketOutOfPortSync(
+      std::unique_ptr<TxPacket> pkt,
+      PortID portID) noexcept override;
+  bool sendPacketOutOfPortSync(
+      std::unique_ptr<TxPacket> pkt,
+      PortID portID,
+      uint8_t cos) noexcept;
   std::unique_ptr<PacketTraceInfo> getPacketTrace(
       std::unique_ptr<MockRxPacket> pkt) override;
 
@@ -239,14 +261,14 @@ class BcmSwitch : public BcmSwitchIf {
   const BcmHostTable* getHostTable() const override {
     return hostTable_.get();
   }
+  const BcmQosPolicyTable* getQosPolicyTable() const override {
+    return qosPolicyTable_.get();
+  }
   const BcmAclTable* getAclTable() const override {
     return aclTable_.get();
   }
   BcmStatUpdater* getStatUpdater() const override {
     return bcmStatUpdater_.get();
-  }
-  BufferStatsLogger* getBufferStatsLogger() {
-    return bufferStatsLogger_.get();
   }
   const BcmTrunkTable* getTrunkTable() const override {
     return trunkTable_.get();
@@ -309,20 +331,6 @@ class BcmSwitch : public BcmSwitchIf {
   void updateStats(SwitchStats* switchStats) override;
 
   /*
-   * Get Broadcom-specific samplers.
-   *
-   * @return     The number of requested counters we can handle.
-   * @param[out] samplers         A vector of high-resolution samplers.  We will
-   *                              append new samplers to this list.
-   * @param[in]  namespaceString  A string respresentation of the current
-   *                              counter namespace.
-   * @param[in]  counterSet       The set of requested Broadcom counters.
-   */
-  int getHighresSamplers(HighresSamplerList* samplers,
-                         const std::string& namespaceString,
-                         const std::set<CounterRequest>& counterSet) override;
-
-  /*
    * Wrapper functions to register and unregister a BCM event callbacks.  These
    * just forward the call.
    */
@@ -344,11 +352,21 @@ class BcmSwitch : public BcmSwitchIf {
   }
 
   BcmRouteTable* writableRouteTable() const { return routeTable_.get(); }
+  const BcmRouteTable* routeTable() const { return routeTable_.get(); }
+
+  const BcmMirrorTable* getBcmMirrorTable() const override {
+    return mirrorTable_.get();
+  }
+  BcmMirrorTable* writableBcmMirrorTable() const override {
+    return mirrorTable_.get();
+  }
+
+  std::string gatherSdkState() const override;
 
   /**
    * Log the hardware state for the switch
    */
-  void dumpState() const override;
+  void dumpState(const std::string& path) const override;
 
   /*
    * Handle a fatal crash.
@@ -362,20 +380,9 @@ class BcmSwitch : public BcmSwitchIf {
   bool getAndClearNeighborHit(RouterID vrf,
                               folly::IPAddress& ip) override;
 
-  bool getPortFECConfig(PortID port) const override;
+  bool getPortFECEnabled(PortID port) const override;
 
   bool isValidStateUpdate(const StateDelta& delta) const override;
-
-  bool startBufferStatCollection();
-  bool stopBufferStatCollection();
-  bool startFineGrainedBufferStatLogging();
-  bool stopFineGrainedBufferStatLogging();
-  bool isBufferStatCollectionEnabled() const {
-    return bufferStatsEnabled_;
-  }
-  bool isFineGrainedBufferStatLoggingEnabled() const {
-    return fineGrainedBufferStatsEnabled_;
-  }
 
   opennsl_gport_t getCpuGPort() const;
   /*
@@ -389,6 +396,11 @@ class BcmSwitch : public BcmSwitchIf {
   BootType getBootType() const {
     return bootType_;
   }
+
+  BcmBstStatsMgr *getBstStatsMgr() const {
+    return bstStatsMgr_.get();
+  }
+
   /*
    * Friend tests. We want the abilty to test private methods
    * without comprimising encapsulation for code generally.
@@ -466,6 +478,8 @@ class BcmSwitch : public BcmSwitchIf {
       const StateDelta& delta,
       std::shared_ptr<SwitchState>* appliedState);
 
+  void processQosChanges(const StateDelta& delta);
+
   void processAclChanges(const StateDelta& delta);
   void processChangedAcl(const std::shared_ptr<AclEntry>& oldAcl,
                          const std::shared_ptr<AclEntry>& newAcl);
@@ -503,6 +517,7 @@ class BcmSwitch : public BcmSwitchIf {
 
   void processControlPlaneChanges(const StateDelta& delta);
 
+  void processMirrorChanges(const StateDelta& delta);
   /*
    * linkStateChangedHwNotLocked is in the call chain started by link scan
    * thread while invoking our link state handler. Link scan thread
@@ -519,8 +534,7 @@ class BcmSwitch : public BcmSwitchIf {
    * holding that lock.
    * Back traces from deadlocked process here https://phabricator.fb.com/P20042479
    */
-  void linkStateChangedHwNotLocked(opennsl_port_t port,
-      opennsl_port_info_t* info);
+  void linkStateChangedHwNotLocked(opennsl_port_t port, bool up);
 
   /*
    * For any actions that require a lock or might need to
@@ -560,11 +574,6 @@ class BcmSwitch : public BcmSwitchIf {
    * Update global statistics.
    */
   void updateGlobalStats();
-
-  /**
-   * ECMP hash setup
-   */
-  void ecmpHashSetup();
 
   /*
    * Drop IPv6 Router Advertisements.
@@ -618,11 +627,6 @@ class BcmSwitch : public BcmSwitchIf {
   void configureRxRateLimiting();
 
   /*
-   * Configures any additional ecmp hash sets if applicable.
-   */
-  void configureAdditionalEcmpHashSets();
-
-  /*
    * Stop linkscan thread. This should only be done on shutdown.
    */
   void stopLinkscanThread();
@@ -647,15 +651,12 @@ class BcmSwitch : public BcmSwitchIf {
 
   void initFieldProcessor() const;
 
+  void initMirrorModule() const;
+
   /**
    * Setup COS manager
    */
   void setupCos();
-
-  /*
-   * Create buffer stats logger
-   */
-  std::unique_ptr<BufferStatsLogger> createBufferStatsLogger();
 
   /*
    * Setup linkscan unless its explicitly disabled via featuresDesired_ flag
@@ -665,6 +666,11 @@ class BcmSwitch : public BcmSwitchIf {
    * Setup packet RX unless its explicitly disabled via featuresDesired_ flag
    */
   void setupPacketRx();
+
+  /*
+   * Setup port mirrors
+   */
+  void restorePortSettings(const std::shared_ptr<SwitchState>& state);
 
  /*
   * Check if state, speed update for this port port would
@@ -684,6 +690,43 @@ class BcmSwitch : public BcmSwitchIf {
   void exportDeviceBufferUsage();
 
   /*
+   * Clear statistics for a list of ports.
+   */
+  void clearPortStats(const std::unique_ptr<std::vector<int32_t>>& ports) override;
+
+  /*
+   * Return true if any of the port's queue names changed, false otherwise.
+   */
+  bool isPortQueueNameChanged(
+      const std::shared_ptr<Port>& oldPort,
+      const std::shared_ptr<Port>& newPort);
+
+  /*
+   * Process changes to port queues
+   */
+  void processChangedPortQueues(
+      const std::shared_ptr<Port>& oldPort,
+      const std::shared_ptr<Port>& newPort);
+
+  /*
+   * Process enabled port queues
+   */
+  void processEnabledPortQueues(const std::shared_ptr<Port>& port);
+
+  /*
+   * Returns true if a CPU queue name has changed, false otherwise.
+   */
+  bool isControlPlaneQueueNameChanged(
+      const std::shared_ptr<ControlPlane>& oldCPU,
+      const std::shared_ptr<ControlPlane>& newCPU);
+
+  /*
+   * Process changes to control plane queues
+   */
+  void processChangedControlPlaneQueues(
+      const std::shared_ptr<ControlPlane>& oldCPU,
+      const std::shared_ptr<ControlPlane>& newCPU);
+  /*
    * Member variables
    */
   BcmPlatform* platform_{nullptr};
@@ -691,10 +734,7 @@ class BcmSwitch : public BcmSwitchIf {
   int unit_{-1};
   uint32_t flags_{0};
   uint32_t featuresDesired_{PACKET_RX_DESIRED | LINKSCAN_DESIRED};
-  HashMode hashMode_;
   MmuState mmuState_{MmuState::UNKNOWN};
-  bool bufferStatsEnabled_{false};
-  bool fineGrainedBufferStatsEnabled_{false};
   uint64_t mmuBufferBytes_{0};
   uint64_t mmuCellBytes_{0};
   std::unique_ptr<BcmWarmBootCache> warmBootCache_;
@@ -703,15 +743,19 @@ class BcmSwitch : public BcmSwitchIf {
   std::unique_ptr<BcmIntfTable> intfTable_;
   std::unique_ptr<BcmHostTable> hostTable_;
   std::unique_ptr<BcmRouteTable> routeTable_;
+  std::unique_ptr<BcmQosPolicyTable> qosPolicyTable_;
   std::unique_ptr<BcmAclTable> aclTable_;
   std::unique_ptr<BcmStatUpdater> bcmStatUpdater_;
   std::unique_ptr<BcmCosManager> cosManager_;
-  std::unique_ptr<BcmTableStats> bcmTableStats_;
-  std::unique_ptr<BufferStatsLogger> bufferStatsLogger_;
   std::unique_ptr<BcmTrunkTable> trunkTable_;
   std::unique_ptr<BcmSflowExporterTable> sFlowExporterTable_;
   std::unique_ptr<BcmControlPlane> controlPlane_;
   std::unique_ptr<BcmRtag7LoadBalancer> rtag7LoadBalancer_;
+  std::unique_ptr<BcmMirrorTable> mirrorTable_;
+  std::unique_ptr<BcmBstStatsMgr> bstStatsMgr_;
+
+  std::unique_ptr<std::thread> linkScanBottomHalfThread_;
+  folly::EventBase linkScanBottomHalfEventBase_;
 
   /*
    * TODO - Right now we setup copp using logic embedded in code.
@@ -723,6 +767,7 @@ class BcmSwitch : public BcmSwitchIf {
   std::vector<std::shared_ptr<AclEntry>> coppAclEntries_;
   std::unique_ptr<BcmUnit> unitObject_;
   BootType bootType_{BootType::UNINITIALIZED};
+  int64_t bstStatsUpdateTime_{0};
 
   /*
    * Lock to synchronize access to all BCM* data structures

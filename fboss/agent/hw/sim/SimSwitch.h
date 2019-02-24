@@ -11,6 +11,8 @@
 
 #include "fboss/agent/HwSwitch.h"
 
+#include <folly/Optional.h>
+
 namespace facebook { namespace fboss {
 
 class SimPlatform;
@@ -23,11 +25,15 @@ class SimSwitch : public HwSwitch {
   HwInitResult init(Callback* callback) override;
   std::shared_ptr<SwitchState> stateChanged(const StateDelta& delta) override;
   std::unique_ptr<TxPacket> allocatePacket(uint32_t size) override;
-  bool sendPacketSwitched(std::unique_ptr<TxPacket> pkt) noexcept override;
-  bool sendPacketOutOfPort(
+  bool sendPacketSwitchedAsync(std::unique_ptr<TxPacket> pkt) noexcept override;
+  bool sendPacketOutOfPortAsync(
+      std::unique_ptr<TxPacket> pkt,
+      PortID portID,
+      folly::Optional<uint8_t> cos = folly::none) noexcept override;
+  bool sendPacketSwitchedSync(std::unique_ptr<TxPacket> pkt) noexcept override;
+  bool sendPacketOutOfPortSync(
       std::unique_ptr<TxPacket> pkt,
       PortID portID) noexcept override;
-
   void gracefulExit(folly::dynamic& /*switchState*/) override {}
 
   folly::dynamic toFollyDynamic() const override;
@@ -38,13 +44,6 @@ class SimSwitch : public HwSwitch {
 
   // TODO
   void updateStats(SwitchStats* /*switchStats*/) override {}
-
-  int getHighresSamplers(
-      HighresSamplerList* /*samplers*/,
-      const std::string& /*namespaceString*/,
-      const std::set<CounterRequest>& /*counterSet*/) override {
-    return 0;
-  }
 
   void fetchL2Table(std::vector<L2EntryThrift>* /*l2Table*/) override {
     return;
@@ -75,6 +74,9 @@ class SimSwitch : public HwSwitch {
   bool isValidStateUpdate(const StateDelta& /*delta*/) const override {
     return true;
   }
+
+  void clearPortStats(
+      const std::unique_ptr<std::vector<int32_t>>& /*ports*/) override {}
 
  private:
   // Forbidden copy constructor and assignment operator

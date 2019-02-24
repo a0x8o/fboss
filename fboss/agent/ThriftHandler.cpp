@@ -15,7 +15,6 @@
 #include "common/stats/ServiceData.h"
 #include "fboss/agent/AddressUtil.h"
 #include "fboss/agent/ArpHandler.h"
-#include "fboss/agent/HighresCounterSubscriptionHandler.h"
 #include "fboss/agent/IPv6Handler.h"
 #include "fboss/agent/LinkAggregationManager.h"
 #include "fboss/agent/LldpManager.h"
@@ -101,8 +100,7 @@ fromFwdNextHops(RouteNextHopSet const& nexthops) {
   nhs.reserve(nexthops.size());
   for (auto const& nexthop : nexthops) {
     auto addr = network::toBinaryAddress(nexthop.addr());
-    addr.__isset.ifName = true;
-    addr.ifName = util::createTunIntfName(nexthop.intf());
+    addr.ifName_ref() = util::createTunIntfName(nexthop.intf());
     nhs.emplace_back(std::move(addr));
   }
   return nhs;
@@ -264,8 +262,9 @@ void ThriftHandler::updateUnicastRoutesImpl(
     for (const auto& route : *routes) {
       folly::IPAddress network = toIPAddress(route.dest.ip);
       uint8_t mask = static_cast<uint8_t>(route.dest.prefixLength);
-      auto adminDistance = route.__isset.adminDistance ? route.adminDistance :
-        clientIdToAdmin;
+      auto adminDistance = route.__isset.adminDistance
+          ? route.adminDistance_ref().value_unchecked()
+          : clientIdToAdmin;
       std::vector<NextHopThrift> nhts;
       if (route.nextHops.empty() && !route.nextHopAddrs.empty()) {
         nhts = util::thriftNextHopsFromAddresses(route.nextHopAddrs);
@@ -481,7 +480,8 @@ void ThriftHandler::fillPortStats(PortInfoThrift& portInfo, int numPortQs) {
   for (int i=0; i<numPortQs; i++) {
     auto queue = folly::to<std::string>("queue", i, ".");
     QueueStats stats;
-    stats.congestionDiscards = getSumStat(queue, "out_congestion_discards");
+    stats.congestionDiscards =
+        getSumStat(queue, "out_congestion_discards_bytes");
     stats.outBytes = getSumStat(queue, "out_bytes");
     portInfo.output.unicast.push_back(stats);
   }
@@ -504,17 +504,15 @@ void ThriftHandler::getPortInfoHelper(
     pq.mode = cfg::_QueueScheduling_VALUES_TO_NAMES.find(
         queue->getScheduling())->second;
     if (queue->getScheduling() == cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN) {
-      pq.weight = queue->getWeight();
-      pq.__isset.weight = true;
+      pq.weight_ref() = queue->getWeight();
     }
     if (queue->getReservedBytes()) {
-      pq.reservedBytes = queue->getReservedBytes().value();
-      pq.__isset.reservedBytes = true;
+      pq.reservedBytes_ref() = queue->getReservedBytes().value();
     }
     if (queue->getScalingFactor()) {
-      pq.scalingFactor = cfg::_MMUScalingFactor_VALUES_TO_NAMES.find(
-          queue->getScalingFactor().value())->second;
-      pq.__isset.scalingFactor = true;
+      pq.scalingFactor_ref() = cfg::_MMUScalingFactor_VALUES_TO_NAMES
+                                   .find(queue->getScalingFactor().value())
+                                   ->second;
     }
     if (!queue->getAqms().empty()) {
       std::vector<ActiveQueueManagement> aqms;
@@ -522,9 +520,9 @@ void ThriftHandler::getPortInfoHelper(
         ActiveQueueManagement aqmThrift;
         switch (aqm.second.detection.getType()) {
           case cfg::QueueCongestionDetection::Type::linear:
-            aqmThrift.detection.linear.minimumLength =
+            aqmThrift.detection.linear_ref().value_unchecked().minimumLength =
                 aqm.second.detection.get_linear().minimumLength;
-            aqmThrift.detection.linear.maximumLength =
+            aqmThrift.detection.linear_ref().value_unchecked().maximumLength =
                 aqm.second.detection.get_linear().maximumLength;
             aqmThrift.detection.__isset.linear = true;
             break;
@@ -535,8 +533,11 @@ void ThriftHandler::getPortInfoHelper(
         aqmThrift.behavior = QueueCongestionBehavior(aqm.first);
         aqms.push_back(aqmThrift);
       }
-      pq.aqms.swap(aqms);
+      pq.aqms_ref().value_unchecked().swap(aqms);
       pq.__isset.aqms = true;
+    }
+    if (queue->getName()) {
+      pq.name = queue->getName().value();
     }
     portInfo.portQueues.push_back(pq);
   }
@@ -545,7 +546,7 @@ void ThriftHandler::getPortInfoHelper(
       PortAdminState(port->getAdminState() == cfg::PortState::ENABLED);
   portInfo.operState =
       PortOperState(port->getOperState() == Port::OperState::UP);
-  portInfo.fecEnabled = sw_->getHw()->getPortFECConfig(port->getID());
+  portInfo.fecEnabled = sw_->getHw()->getPortFECEnabled(port->getID());
 
   auto pause = port->getPause();
   portInfo.txPause = pause.tx;
@@ -577,6 +578,11 @@ void ThriftHandler::getAllPortInfo(map<int32_t, PortInfoThrift>& portInfoMap) {
     auto& portInfo = portInfoMap[portId];
     getPortInfoHelper(portInfo, port);
   }
+}
+
+void ThriftHandler::clearPortStats(unique_ptr<vector<int32_t>> ports) {
+  ensureConfigured();
+  sw_->clearPortStats(ports);
 }
 
 void ThriftHandler::getPortStats(PortInfoThrift& portInfo, int32_t portId) {
@@ -673,7 +679,8 @@ void ThriftHandler::setPortState(int32_t portNum, bool enable) {
 
 void ThriftHandler::getRouteTable(std::vector<UnicastRoute>& routes) {
   ensureConfigured();
-  for (const auto& routeTable : (*sw_->getAppliedState()->getRouteTables())) {
+  auto appliedState = sw_->getAppliedState();
+  for (const auto& routeTable : (*appliedState->getRouteTables())) {
     for (const auto& ipv4 : *(routeTable->getRibV4()->routes())) {
       UnicastRoute tempRoute;
       if (!ipv4->isResolved()) {
@@ -684,6 +691,7 @@ void ThriftHandler::getRouteTable(std::vector<UnicastRoute>& routes) {
       tempRoute.dest.ip = toBinaryAddress(ipv4->prefix().network);
       tempRoute.dest.prefixLength = ipv4->prefix().mask;
       tempRoute.nextHopAddrs = util::fromFwdNextHops(fwdInfo.getNextHopSet());
+      tempRoute.nextHops = util::fromRouteNextHopSet(fwdInfo.getNextHopSet());
       routes.emplace_back(std::move(tempRoute));
     }
     for (const auto& ipv6 : *(routeTable->getRibV6()->routes())) {
@@ -696,6 +704,7 @@ void ThriftHandler::getRouteTable(std::vector<UnicastRoute>& routes) {
       tempRoute.dest.ip = toBinaryAddress(ipv6->prefix().network);
       tempRoute.dest.prefixLength = ipv6->prefix().mask;
       tempRoute.nextHopAddrs = util::fromFwdNextHops(fwdInfo.getNextHopSet());
+      tempRoute.nextHops = util::fromRouteNextHopSet(fwdInfo.getNextHopSet());
       routes.emplace_back(std::move(tempRoute));
     }
   }
@@ -831,16 +840,13 @@ static LinkNeighborThrift thriftLinkNeighbor(const LinkNeighbor& n,
   tn.ttlSecondsLeft =
     duration_cast<seconds>(n.getExpirationTime() - now).count();
   if (!n.getSystemName().empty()) {
-    tn.systemName = n.getSystemName();
-    tn.__isset.systemName = true;
+    tn.systemName_ref() = n.getSystemName();
   }
   if (!n.getSystemDescription().empty()) {
-    tn.systemDescription = n.getSystemDescription();
-    tn.__isset.systemDescription = true;
+    tn.systemDescription_ref() = n.getSystemDescription();
   }
   if (!n.getPortDescription().empty()) {
-    tn.portDescription = n.getPortDescription();
-    tn.__isset.portDescription = true;
+    tn.portDescription_ref() = n.getPortDescription();
   }
   return tn;
 }
@@ -999,7 +1005,7 @@ void ThriftHandler::txPkt(int32_t port, unique_ptr<fbstring> data) {
   RWPrivateCursor cursor(pkt->buf());
   cursor.push(StringPiece(*data));
 
-  sw_->sendPacketOutOfPort(std::move(pkt), PortID(port));
+  sw_->sendPacketOutOfPortAsync(std::move(pkt), PortID(port));
 }
 
 void ThriftHandler::txPktL2(unique_ptr<fbstring> data) {
@@ -1009,7 +1015,7 @@ void ThriftHandler::txPktL2(unique_ptr<fbstring> data) {
   RWPrivateCursor cursor(pkt->buf());
   cursor.push(StringPiece(*data));
 
-  sw_->sendPacketSwitched(std::move(pkt));
+  sw_->sendPacketSwitchedAsync(std::move(pkt));
 }
 
 void ThriftHandler::txPktL3(unique_ptr<fbstring> payload) {
@@ -1096,7 +1102,7 @@ void ThriftHandler::ensureFibSynced(StringPiece function) {
   }
 
   if (!function.empty()) {
-    VLOG_EVERY_MS(1, 1000) << "failing thrift prior to FIB Sync: " << function;
+    XLOG_EVERY_MS(DBG1, 1000) << "failing thrift prior to FIB Sync: " << function;
   }
   throw FbossError("switch is still initializing, FIB not synced yet");
 }
@@ -1109,61 +1115,6 @@ void ThriftHandler::connectionDestroyed(TConnectionContext* ctx) {
   if (listeners_) {
     listeners_->clients.erase(ctx);
   }
-
-  // If there is an ongoing high-resolution counter subscription, kill it. Don't
-  // grab a write lock if there are no active calls
-  if (!as_const(highresKillSwitches_)->empty()) {
-    SYNCHRONIZED(highresKillSwitches_) {
-      auto killSwitchIter = highresKillSwitches_.find(ctx);
-
-      if (killSwitchIter != highresKillSwitches_.end()) {
-        killSwitchIter->second->set();
-        highresKillSwitches_.erase(killSwitchIter);
-      }
-    }
-  }
-}
-
-void ThriftHandler::async_tm_subscribeToCounters(
-    ThriftCallback<bool> callback, unique_ptr<CounterSubscribeRequest> req) {
-
-  // Grab the requested samplers from the underlying switch implementation
-  auto samplers = make_unique<HighresSamplerList>();
-  auto numCounters = sw_->getHighresSamplers(samplers.get(), req->counterSet);
-
-  if (numCounters > 0) {
-    // Grab the connection context and create a kill switch
-    auto ctx = callback->getConnectionContext()->getConnectionContext();
-    auto killSwitch = std::make_shared<Signal>();
-    SYNCHRONIZED(highresKillSwitches_) {
-      highresKillSwitches_[ctx] = killSwitch;
-    }
-
-    // Create the sender
-    auto client = ctx->getDuplexClient<FbossHighresClientAsyncClient>();
-    auto eventBase = callback->getEventBase();
-    auto sender = std::make_shared<SampleSender>(std::move(client), killSwitch,
-                                                 eventBase, numCounters);
-
-    // Create the sample producer and send it on its way
-    auto producer = make_unique<SampleProducer>(
-        std::move(samplers), std::move(sender), std::move(killSwitch),
-        eventBase, *req.get(), numCounters);
-    auto wrappedProducer = folly::makeMoveWrapper(std::move(producer));
-    auto veryNice = req->veryNice;
-    std::thread producerThread([wrappedProducer, veryNice]() mutable {
-      if (veryNice) {
-        incNiceValue(20);
-      }
-      (*wrappedProducer)->produce();
-    });
-    producerThread.detach();
-
-    callback->result(true);
-  } else {
-    XLOG(ERR) << "None of the requested counters were valid.";
-    callback->result(false);
-  }
 }
 
 int32_t ThriftHandler::getIdleTimeout() {
@@ -1174,7 +1125,8 @@ int32_t ThriftHandler::getIdleTimeout() {
 }
 
 void ThriftHandler::reloadConfig() {
-  return sw_->applyConfig("reload config initiated by thrift call");
+  ensureConfigured();
+  return sw_->applyConfig("reload config initiated by thrift call", true);
 }
 
 void ThriftHandler::getLacpPartnerPair(
@@ -1202,4 +1154,23 @@ void ThriftHandler::getAllLacpPartnerPairs(
   lagManager->populatePartnerPairs(lacpPartnerPairs);
 }
 
+SwitchRunState ThriftHandler::getSwitchRunState() {
+  return sw_->getSwitchRunState();
+}
+
+SSLType ThriftHandler::getSSLPolicy() {
+  SSLType sslType = SSLType::PERMITTED;
+
+  if (sslPolicy_ == apache::thrift::SSLPolicy::DISABLED) {
+    sslType = SSLType::DISABLED;
+  } else if (sslPolicy_ == apache::thrift::SSLPolicy::PERMITTED) {
+    sslType = SSLType::PERMITTED;
+  } else if (sslPolicy_ == apache::thrift::SSLPolicy::REQUIRED) {
+    sslType = SSLType::REQUIRED;
+  } else {
+    throw FbossError("Invalid SSL Policy");
+  }
+
+  return sslType;
+}
 }} // facebook::fboss

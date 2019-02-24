@@ -9,17 +9,20 @@
  */
 #include "fboss/agent/platforms/wedge/WedgePlatform.h"
 
+#include <folly/logging/xlog.h>
 #include <folly/Memory.h>
 #include <folly/Subprocess.h>
-#include <glog/logging.h>
+
 #include "fboss/lib/usb/UsbError.h"
 #include "fboss/lib/usb/WedgeI2CBus.h"
 #include "fboss/agent/SwSwitch.h"
 #include "fboss/agent/SysError.h"
 #include "fboss/agent/hw/bcm/BcmAPI.h"
+#include "fboss/agent/hw/bcm/BcmConfig.h"
 #include "fboss/agent/hw/bcm/BcmSwitch.h"
 #include "fboss/agent/hw/bcm/BcmWarmBootHelper.h"
 #include "fboss/agent/state/Port.h"
+#include "fboss/agent/state/SwitchState.h"
 #include "fboss/agent/platforms/wedge/WedgePort.h"
 #include "fboss/qsfp_service/lib/QsfpCache.h"
 
@@ -49,18 +52,10 @@ WedgePlatform::WedgePlatform(std::unique_ptr<WedgeProductInfo> productInfo)
     : productInfo_(std::move(productInfo)),
       qsfpCache_(std::make_unique<QsfpCache>()) {}
 
-void WedgePlatform::init() {
-  auto config = loadConfig();
-  BcmAPI::init(config);
+void WedgePlatform::initImpl() {
+  BcmAPI::init(loadConfig());
   initLocalMac();
-  auto mode = getMode();
-  bool isLc = (mode == WedgePlatformMode::GALAXY_LC);
-  bool isMinipackFsw = (mode == WedgePlatformMode::MINIPACK);
-  // HACK - looking at mode == LC or isDu or minipack fsw to determine HASH mode
-  // How to set up hashing should really come from config - T21721301
-  auto hashMode = (isLc || isDu() || isMinipackFsw) ?
-                  BcmSwitch::HALF_HASH : BcmSwitch::FULL_HASH;
-  hw_.reset(new BcmSwitch(this, hashMode));
+  hw_.reset(new BcmSwitch(this));
 }
 
 WedgePlatform::~WedgePlatform() {}
@@ -80,6 +75,12 @@ void WedgePlatform::onHwInitialized(SwSwitch* sw) {
   // could populate with initial ports here, but should get taken care
   // of through state changes sent to the stateUpdated method.
   initLEDs();
+  // Make sure the initial status of the LEDs reflects the current port
+  // settings.
+  for (const auto& entry : *portMapping_) {
+    bool up = hw_->isPortUp(entry.first);
+    entry.second->linkStatusChanged(up, true);
+  }
   qsfpCache_->init(sw->getQsfpCacheEvb());
   sw->registerStateObserver(this, "WedgePlatform");
 }
@@ -94,6 +95,9 @@ void WedgePlatform::stateUpdated(const StateDelta& delta) {
       if (platformPort->supportsTransceiver()) {
         changedPorts[newPort->getID()] = platformPort->toThrift(newPort);
       }
+
+      // notify platform port of the change
+      platformPort->portChanged(entry.getNew());
     }
   }
   qsfpCache_->portsChanged(changedPorts);

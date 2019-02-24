@@ -18,7 +18,10 @@
 #include <unistd.h>
 #include "fboss/agent/RxPacket.h"
 #include "fboss/agent/SwSwitch.h"
+#include "fboss/agent/SwitchStats.h"
 #include "fboss/agent/TxPacket.h"
+#include "fboss/agent/state/Port.h"
+#include "fboss/agent/gen-cpp2/switch_config_types.h"
 
 using folly::MacAddress;
 using folly::io::RWPrivateCursor;
@@ -26,15 +29,42 @@ using folly::ByteRange;
 using folly::StringPiece;
 using std::shared_ptr;
 
+/**
+ * False if the given LLDP tag has an Expected value configured, and
+ * the value received was not as expected.
+ *
+ * True otherwise.
+ */
+bool
+checkTag(facebook::fboss::PortID id,
+         const facebook::fboss::Port::LLDPValidations& lldpmap,
+         facebook::fboss::cfg::LLDPTag tag, const std::string& val) {
+  auto res = lldpmap.find(tag);
+
+  if (res == lldpmap.end()) {
+    return true;
+  }
+
+  auto expect = res->second;
+  if (expect.compare(val) == 0) {
+    return true;
+  }
+
+  XLOG(WARNING) << "Port " << id
+                << ", LLDP tag " << std::to_string(static_cast<int>(tag))
+                << ", expected: \"" << expect << "\", got: \"" << val
+                << "\"";
+  return false;
+}
 
 namespace facebook { namespace fboss {
 
 const MacAddress LldpManager::LLDP_DEST_MAC("01:80:c2:00:00:0e");
 
 LldpManager::LldpManager(SwSwitch* sw)
-  : folly::AsyncTimeout(sw->getBackgroundEvb()),
-    sw_(sw),
-    interval_(LLDP_INTERVAL) {}
+    : folly::AsyncTimeout(sw->getBackgroundEvb()),
+      sw_(sw),
+      intervalMsecs_(LLDP_INTERVAL) {}
 
 LldpManager::~LldpManager() {}
 
@@ -55,11 +85,16 @@ void LldpManager::handlePacket(
     folly::MacAddress src,
     folly::io::Cursor cursor) {
   LinkNeighbor neighbor;
+
+  sw_->stats()->LldpRecvdPkt();
+
   bool ret = neighbor.parseLldpPdu(pkt->getSrcPort(), pkt->getSrcVlan(),
                                    src, ETHERTYPE_LLDP, &cursor);
+
   if (!ret) {
     // LinkNeighbor will have already logged a message about the error.
     // Just ignore the packet.
+    sw_->stats()->LldpBadPkt();
     return;
   }
 
@@ -67,25 +102,50 @@ void LldpManager::handlePacket(
              << " chassis=" << neighbor.humanReadableChassisId()
              << " port=" << neighbor.humanReadablePortId()
              << " name=" << neighbor.getSystemName();
+
+  auto plport = sw_->getPlatform()->getPlatformPort(pkt->getSrcPort());
+  auto port = sw_->getState()->getPorts()->getPortIf(pkt->getSrcPort());
+  PortID pid = pkt->getSrcPort();
+
+  XLOG(DBG4) << "Port " << pid
+             << ", local name: " << port->getName()
+             << ", local desc: " << port->getDescription()
+             << ", LLDP systemname: " << neighbor.getSystemName()
+             << ", LLDP hrPort: " << neighbor.humanReadablePortId()
+             << ", LLDP dsc: " << neighbor.getPortDescription();
+
+  auto lldpmap = port->getLLDPValidations();
+  if (!(checkTag (pid, lldpmap,
+            cfg::LLDPTag::SYSTEM_NAME, neighbor.getSystemName())
+       && checkTag (pid, lldpmap,
+                    cfg::LLDPTag::PORT_DESC,
+                    neighbor.getPortDescription()))) {
+    sw_->stats()->LldpValidateMisMatch();
+    // TODO(pjakma): Figure out how to mock plport
+    if (plport) {
+      plport->externalState(PlatformPort::ExternalState::CABLING_ERROR);
+    }
+    XLOG(DBG4) << "LLDP expected/recvd value mismatch!";
+  }
   db_.update(neighbor);
 }
 
 void LldpManager::timeoutExpired() noexcept {
   try {
-    sendLldpOnAllPorts(true);
+    sendLldpOnAllPorts();
   } catch (const std::exception& ex) {
     XLOG(ERR) << "Failed to send LLDP on all ports. Error:"
               << folly::exceptionStr(ex);
   }
-  scheduleTimeout(interval_);
+  scheduleTimeout(intervalMsecs_);
 }
 
-void LldpManager::sendLldpOnAllPorts(bool checkPortStatusFlag) {
+void LldpManager::sendLldpOnAllPorts() {
   // send lldp frames through all the ports here.
   std::shared_ptr<SwitchState> state = sw_->getState();
   for (const auto& port : *state->getPorts()) {
-    if (checkPortStatusFlag == false || port->isPortUp()) {
-      sendLldpInfo(sw_, state, port);
+    if (port->isPortUp()) {
+      sendLldpInfo(port);
     } else {
       XLOG(DBG5) << "Skipping LLDP send as this port is disabled "
                  << port->getID();
@@ -99,12 +159,12 @@ uint16_t tlvHeader(uint16_t type, uint16_t length) {
   return (type << 9) | length;
 }
 
-void writeTl(uint16_t type, uint16_t length, RWPrivateCursor* cursor) {
-  uint16_t typeLength = tlvHeader(type, length);
+void writeTl(LldpTlvType type, uint16_t length, RWPrivateCursor* cursor) {
+  uint16_t typeLength = tlvHeader(static_cast<uint16_t>(type), length);
   cursor->writeBE<uint16_t>(typeLength);
 }
 
-void writeTlv(uint16_t type, uint8_t subType, const ByteRange& buf,
+void writeTlv(LldpTlvType type, uint8_t subType, const ByteRange& buf,
               RWPrivateCursor* cursor) {
   uint16_t length = buf.size() + 1;
   writeTl(type, length, cursor);
@@ -112,82 +172,143 @@ void writeTlv(uint16_t type, uint8_t subType, const ByteRange& buf,
   cursor->push(buf.data(), (size_t)buf.size());
 }
 
-void writeTlv(uint16_t type, uint16_t value,
+void writeTlv(LldpTlvType type, LldpChassisIdType subType,
+              const ByteRange& buf, RWPrivateCursor* cursor) {
+  writeTlv(type, static_cast<uint8_t>(subType), buf, cursor);
+}
+
+void writeTlv(LldpTlvType type, LldpPortIdType subType,
+              const ByteRange& buf, RWPrivateCursor* cursor) {
+  writeTlv(type, static_cast<uint8_t>(subType), buf, cursor);
+}
+
+void writeTlv(LldpTlvType type, uint16_t value,
               RWPrivateCursor* cursor) {
   writeTl(type, 2, cursor);
   cursor->writeBE<uint16_t>(value);
 }
 
-void writeTlv(uint16_t type, uint32_t value, RWPrivateCursor* cursor) {
+void writeTlv(LldpTlvType type, uint32_t value, RWPrivateCursor* cursor) {
   writeTl(type, 4, cursor);
   cursor->writeBE<uint32_t>(value);
 }
 
-void writeTlv(uint16_t type, const ByteRange& value,
+void writeTlv(LldpTlvType type, const ByteRange& value,
               RWPrivateCursor* cursor) {
   writeTl(type, value.size(), cursor);
   cursor->push(value.data(), value.size());
 }
 
-void LldpManager::sendLldpInfo(
-    SwSwitch* sw,
-    const std::shared_ptr<SwitchState>& /*swState*/,
-    const std::shared_ptr<Port>& port) {
-  MacAddress cpuMac = sw->getPlatform()->getLocalMac();
-  const size_t kMaxLen = 64;
-  char hostname[kMaxLen];
+uint32_t
+LldpManager::LldpPktSize(const std::string& hostname,
+                         const std::string& portname,
+                         const std::string& portdesc,
+                         const std::string& sysDesc) {
+  return
+   // ethernet header
+   (6 * 2) + 2 + 2
+   // LLDP TLVs
+   // Chassis MAC
+   + 2 + 1 + 6
+   // Port ID: Name
+   + 2 + portname.size() + 1
+   // TTL
+   + 2 + 2
+   // Add Port-Description length
+   + 2 + portdesc.size() + 1
+   // system name
+   + 2 + hostname.size() + 1
+   // System description
+   + 2 + sysDesc.size() + 1
+   // Capabilities
+   + 2 + 2 + 2
+   // End of LLDPDU
+   + 2
+   ;
 
-  if (0 == gethostname(hostname, kMaxLen)) {
+}
+
+std::unique_ptr<TxPacket>
+LldpManager::createLldpPkt(SwSwitch* sw,
+                           const MacAddress macaddr,
+                           VlanID vlanid,
+                           const std::string& hostname,
+                           const std::string& portname,
+                           const std::string& portdesc,
+                           const uint16_t ttl,
+                           const uint16_t capabilities) {
+
+  static std::string lldpSysDescStr("FBOSS");
+  uint32_t frameLen
+    = LldpPktSize (hostname, portname, portdesc, lldpSysDescStr);
+
+  auto pkt = sw->allocatePacket(frameLen);
+  RWPrivateCursor cursor(pkt->buf());
+  pkt->writeEthHeader(&cursor, LLDP_DEST_MAC,
+                      macaddr, vlanid, ETHERTYPE_LLDP);
+  // now write chassis ID TLV
+  writeTlv(LldpTlvType::CHASSIS, LldpChassisIdType::MAC_ADDRESS,
+           ByteRange(macaddr.bytes(), 6), &cursor);
+
+  // now write port ID TLV
+  /* using StringPiece here to bridge chars in string to unsigned chars in
+   * ByteRange.
+   */
+  writeTlv(LldpTlvType::PORT, LldpPortIdType::INTERFACE_NAME,
+           StringPiece(portname), &cursor);
+
+  // now write TTL TLV
+  writeTlv(LldpTlvType::TTL, ttl, &cursor);
+
+  // now write optional TLVs
+  // system name TLV
+  if (hostname.size() > 0) {
+    writeTlv(LldpTlvType::SYSTEM_NAME,
+             StringPiece(hostname), &cursor);
+  }
+
+  // Port description
+  writeTlv(LldpTlvType::PORT_DESC, StringPiece(portdesc), &cursor);
+
+  // system description TLV
+  writeTlv(
+    LldpTlvType::SYSTEM_DESCRIPTION, StringPiece(lldpSysDescStr), &cursor
+  );
+
+  // system capability TLV
+  uint32_t enabledCapabilities = (capabilities << 16) | capabilities;
+  writeTlv(LldpTlvType::SYSTEM_CAPABILITY, enabledCapabilities, &cursor);
+
+  // now write PDU End TLV
+  writeTl(LldpTlvType::PDU_END, PDU_END_TLV_LENGTH, &cursor);
+
+  // Fill the padding with 0s
+  memset(cursor.writableData(), 0, cursor.length());
+
+  return pkt;
+}
+
+void LldpManager::sendLldpInfo(const std::shared_ptr<Port>& port) {
+  MacAddress cpuMac = sw_->getPlatform()->getLocalMac();
+  PortID thisPortID = port->getID();
+
+  const size_t kMaxLen = 64;
+  std::array<char, kMaxLen> hostname;
+  if (0 == gethostname(hostname.data(), kMaxLen)) {
     // make sure it is null terminated
     hostname[kMaxLen - 1] = '\0';
   } else {
     hostname[0] = '\0';
   }
 
-  // The minimum packet length is 64.We use 68 on the assumption that
-  // the packet will go out untagged, which will remove 4 bytes.
-  uint32_t frameLen = 98;
-  auto pkt = sw->allocatePacket(frameLen);
-  PortID thisPortID = port->getID();
-  RWPrivateCursor cursor(pkt->buf());
-  pkt->writeEthHeader(&cursor, LLDP_DEST_MAC,
-                      cpuMac, port->getIngressVlan(), ETHERTYPE_LLDP);
-  // now write chassis ID TLV
-  writeTlv(CHASSIS_TLV_TYPE, CHASSIS_TLV_SUB_TYPE_MAC,
-           ByteRange(cpuMac.bytes(), 6), &cursor);
+  auto pkt = LldpManager::createLldpPkt(sw_, cpuMac, port->getIngressVlan(),
+                                        std::string(hostname.data()),
+                                        port->getName(), port->getDescription(),
+                                        TTL_TLV_VALUE,
+                                        SYSTEM_CAPABILITY_ROUTER);
 
-  // now write port ID TLV
-  /* using StringPiece here to bridge chars in string to unsigned chars in
-   * ByteRange.
-   */
-  writeTlv(PORT_TLV_TYPE, PORT_TLV_SUB_TYPE_INTERFACE,
-           StringPiece(port->getName()), &cursor);
-
-  // now write TTL TLV
-  writeTlv(TTL_TLV_TYPE, (uint16_t) TTL_TLV_VALUE, &cursor);
-
-  // now write optional TLVs
-  // system name TLV
-  if (strlen(hostname) > 0) {
-    writeTlv(SYSTEM_NAME_TLV_TYPE,
-             StringPiece(hostname), &cursor);
-  }
-
-  // system description TLV
-  writeTlv(SYSTEM_DESCRIPTION_TLV_TYPE, StringPiece("FBOSS"), &cursor);
-
-  // system capability TLV
-  uint16_t capability = SYSTEM_CAPABILITY_ROUTER;
-  uint32_t systemAndEnabledCapability = (capability << 16) | capability;
-  writeTlv(SYSTEM_CAPABILITY_TLV_TYPE, systemAndEnabledCapability, &cursor);
-
-  // now write PDU End TLV
-  writeTl(PDU_END_TLV_TYPE, PDU_END_TLV_LENGTH, &cursor);
-
-  // Fill the padding with 0s
-  memset(cursor.writableData(), 0, cursor.length());
   // this LLDP packet HAS to exit out of the port specified here.
-  sw->sendPacketOutOfPort(std::move(pkt), thisPortID);
+  sw_->sendPacketOutOfPortAsync(std::move(pkt), thisPortID);
   XLOG(DBG4) << "sent LLDP "
              << " on port " << port->getID() << " with CPU MAC "
              << cpuMac.toString() << " port id " << port->getName()

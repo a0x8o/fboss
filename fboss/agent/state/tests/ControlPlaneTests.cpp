@@ -28,75 +28,62 @@ std::vector<cfg::PortQueue> getConfigCPUQueues() {
   std::vector<cfg::PortQueue> cpuQueues;
   cfg::PortQueue high;
   high.id = 9;
-  high.name = "cpuQueue-high";
-  high.__isset.name = true;
+  high.name_ref() = "cpuQueue-high";
   high.streamType = cfg::StreamType::MULTICAST;
   high.scheduling = cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN;
-  high.weight = 4;
-  high.__isset.weight = true;
+  high.weight_ref() = 4;
   cpuQueues.push_back(high);
 
   cfg::PortQueue mid;
   mid.id = 2;
-  mid.name = "cpuQueue-mid";
-  mid.__isset.name = true;
+  mid.name_ref() = "cpuQueue-mid";
   mid.streamType = cfg::StreamType::MULTICAST;
   mid.scheduling = cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN;
-  mid.weight = 2;
-  mid.__isset.weight = true;
+  mid.weight_ref() = 2;
   cpuQueues.push_back(mid);
 
   cfg::PortQueue defaultQ;
   defaultQ.id = 1;
-  defaultQ.name = "cpuQueue-default";
-  defaultQ.__isset.name = true;
+  defaultQ.name_ref() = "cpuQueue-default";
   defaultQ.streamType = cfg::StreamType::MULTICAST;
   defaultQ.scheduling = cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN;
-  defaultQ.weight = 1;
-  defaultQ.__isset.weight = true;
-  defaultQ.packetsPerSec = 200;
-  defaultQ.__isset.packetsPerSec = true;
-  defaultQ.reservedBytes = 1040;
-  defaultQ.__isset.reservedBytes = true;
-  defaultQ.sharedBytes = 10192;
-  defaultQ.__isset.sharedBytes = true;
+  defaultQ.weight_ref() = 1;
+  defaultQ.packetsPerSec_ref() = 200;
+  defaultQ.reservedBytes_ref() = 1040;
+  defaultQ.sharedBytes_ref() = 10192;
   cpuQueues.push_back(defaultQ);
 
   cfg::PortQueue low;
   low.id = 0;
-  low.name = "cpuQueue-low";
-  low.__isset.name = true;
+  low.name_ref() = "cpuQueue-low";
   low.streamType = cfg::StreamType::MULTICAST;
   low.scheduling = cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN;
-  low.weight = 1;
-  low.__isset.weight = true;
-  low.packetsPerSec = 100;
-  low.__isset.packetsPerSec = true;
-  low.reservedBytes = 1040;
-  low.__isset.reservedBytes = true;
-  low.sharedBytes = 10192;
-  low.__isset.sharedBytes = true;
+  low.weight_ref() = 1;
+  low.packetsPerSec_ref() = 100;
+  low.reservedBytes_ref() = 1040;
+  low.sharedBytes_ref() = 10192;
   cpuQueues.push_back(low);
   return cpuQueues;
 }
 
 QueueConfig genCPUQueues() {
   QueueConfig queues;
-  shared_ptr<PortQueue> high = make_shared<PortQueue>(9);
+  shared_ptr<PortQueue> high = make_shared<PortQueue>(static_cast<uint8_t>(9));
   high->setName("cpuQueue-high");
   high->setStreamType(cfg::StreamType::MULTICAST);
   high->setScheduling(cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN);
   high->setWeight(4);
   queues.push_back(high);
 
-  shared_ptr<PortQueue> mid = make_shared<PortQueue>(2);
+  shared_ptr<PortQueue> mid = make_shared<PortQueue>(static_cast<uint8_t>(2));
   mid->setName("cpuQueue-mid");
   mid->setStreamType(cfg::StreamType::MULTICAST);
   mid->setScheduling(cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN);
   mid->setWeight(2);
   queues.push_back(mid);
 
-  shared_ptr<PortQueue> defaultQ = make_shared<PortQueue>(1);
+  shared_ptr<PortQueue> defaultQ = make_shared<PortQueue>(
+    static_cast<uint8_t>(1));
   defaultQ->setName("cpuQueue-default");
   defaultQ->setStreamType(cfg::StreamType::MULTICAST);
   defaultQ->setScheduling(cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN);
@@ -106,7 +93,7 @@ QueueConfig genCPUQueues() {
   defaultQ->setSharedBytes(10192);
   queues.push_back(defaultQ);
 
-  shared_ptr<PortQueue> low = make_shared<PortQueue>(0);
+  shared_ptr<PortQueue> low = make_shared<PortQueue>(static_cast<uint8_t>(0));
   low->setName("cpuQueue-low");
   low->setStreamType(cfg::StreamType::MULTICAST);
   low->setScheduling(cfg::QueueScheduling::WEIGHTED_ROUND_ROBIN);
@@ -146,6 +133,9 @@ shared_ptr<ControlPlane> generateControlPlane() {
   };
   controlPlane->resetRxReasonToQueue(reasons);
 
+  folly::Optional<std::string> qosPolicy("qp1");
+  controlPlane->resetQosPolicy(qosPolicy);
+
   return controlPlane;
 }
 
@@ -154,7 +144,7 @@ shared_ptr<SwitchState> genCPUSwitchState() {
   auto cpu = make_shared<ControlPlane>();
   // the default unconfigured cpu queue settings will be obtained during init.
   QueueConfig cpuQueues;
-  for (int i = 0; i < kNumCPUQueues; i++) {
+  for (uint8_t i = 0; i < kNumCPUQueues; i++) {
     auto queue = std::make_shared<PortQueue>(i);
     queue->setStreamType(cfg::StreamType::MULTICAST);
     cpuQueues.push_back(queue);
@@ -288,7 +278,7 @@ TEST(ControlPlane, changeLowPrioQueue) {
   auto newCfgCpuQueues = getConfigCPUQueues();
   // change low queue pps from 100 to 1000. the last one is low queue
   auto& lowQueue = newCfgCpuQueues.at(newCfgCpuQueues.size() - 1);
-  lowQueue.packetsPerSec = 1000;
+  lowQueue.packetsPerSec_ref().value_unchecked() = 1000;
   cfg::SwitchConfig newConfig;
   newConfig.cpuQueues = newCfgCpuQueues;
   auto stateV2 = publishAndApplyConfig(stateV1, &newConfig, platform.get());
